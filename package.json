@@ -1,0 +1,46 @@
+{
+  "name": "@wundervault/mcp-server",
+  "version": "1.6.4",
+  "description": "MCP server for Wundervault zero-knowledge secret management",
+  "files": [
+    "dist",
+    "README.md",
+    "README-AGENTS.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "postinstall": "chmod +x dist/agent.js dist/index.js 2>/dev/null || true"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "secrets",
+    "vault",
+    "zero-knowledge",
+    "ai-agents"
+  ],
+  "author": "Wundervault",
+  "license": "AGPL-3.0-or-later",
+  "homepage": "https://wundervault.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wundervault/wundervault-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wundervault/wundervault-mcp/issues"
+  },
+  "type": "module",
+  "bin": {
+    "wundervault-mcp": "dist/index.js",
+    "wundervault-agent": "dist/agent.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.39",
+    "typescript": "^5.9.3",
+    "vitest": "^1.6.1"
+  }
+}
