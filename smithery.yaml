@@ -1,0 +1,29 @@
+# Smithery configuration for @wundervault/mcp-server
+# https://smithery.ai/docs
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - agentVaultApiKey
+      - agentKey
+    properties:
+      agentVaultUrl:
+        type: string
+        default: "https://wundervault.com"
+        description: "Wundervault API base URL."
+      agentVaultApiKey:
+        type: string
+        description: "Agent API key, format wv_agent_<AGENT_ID>|<KEY_SUFFIX> (from your Wundervault dashboard, Settings -> Agents)."
+      agentKey:
+        type: string
+        description: "Base64 URL-safe agent encryption key (issued during agent onboarding)."
+  commandFunction: |
+    (config) => ({
+      command: 'wundervault-mcp',
+      env: {
+        WUNDERVault_AGENT_VAULT_URL: config.agentVaultUrl || 'https://wundervault.com',
+        WUNDERVault_AGENT_VAULT_API_KEY: config.agentVaultApiKey,
+        WUNDERVault_AGENT_KEY: config.agentKey
+      }
+    })
