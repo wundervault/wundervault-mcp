@@ -1,6 +1,7 @@
 {
   "name": "@wundervault/mcp-server",
-  "version": "1.6.6",
+  "mcpName": "io.github.wundervault/wundervault-mcp",
+  "version": "1.6.7",
   "description": "MCP server for Wundervault zero-knowledge secret management",
   "files": [
     "dist",
