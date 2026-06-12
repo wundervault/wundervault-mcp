@@ -29,7 +29,10 @@ export function runWithSecret(
       return {
         exitCode: 1,
         stdout: '',
-        stderr: `Exec rejected: file-writing operations are not permitted (matched: ${pattern}).`,
+        stderr: `Exec rejected: redirecting/writing a secret to a file is not permitted (matched: ${pattern}). `
+          + `This guards against exfiltrating a secret to disk. To deliver a secret into a config file, `
+          + `use the vault_entry_inject_env tool (writes one named entry, scrubbed) instead of a shell redirect. `
+          + `For setup/teardown that needs the secret (e.g. 'npm config set …'), set pre_command/post_command in the entry's exec_config.`,
       };
     }
   }
@@ -75,8 +78,11 @@ export function runWithSecret(
   }
 
   // Scrub accidental echo from output
-  stdout = stdout.replaceAll(plaintext, '[SECRET_REDACTED]');
-  stderr = stderr.replaceAll(plaintext, '[SECRET_REDACTED]');
+  // Only redact when a secret was actually injected (replaceAll('') would corrupt output).
+  if (plaintext) {
+    stdout = stdout.replaceAll(plaintext, '[SECRET_REDACTED]');
+    stderr = stderr.replaceAll(plaintext, '[SECRET_REDACTED]');
+  }
 
   return { exitCode, stdout, stderr };
 }
@@ -149,9 +155,13 @@ export function runWithSecretRemote(
     return { exitCode: 1, stdout: '', stderr: `Invalid remote user: only alphanumeric, dots, dashes allowed.` };
   }
 
-  // Single-quote the secret for safe shell assignment; handle embedded single-quotes
+  // Single-quote the secret for safe shell assignment; handle embedded single-quotes.
+  // When no env var is being injected (SSH-only remote exec, e.g. running a command
+  // with just a vaulted SSH key), omit the export line entirely.
   const escapedSecret = plaintext.replace(/'/g, `'\\''`);
-  const stdinScript = `export ${secretEnvKey}='${escapedSecret}'\n${command}\n`;
+  const stdinScript = secretEnvKey
+    ? `export ${secretEnvKey}='${escapedSecret}'\n${command}\n`
+    : `${command}\n`;
 
   const sshArgs: string[] = ['-o', 'BatchMode=yes'];
   if (remote.ssh_key) {
@@ -187,8 +197,11 @@ export function runWithSecretRemote(
     secretBuf.fill(0);
   }
 
-  stdout = stdout.replaceAll(plaintext, '[SECRET_REDACTED]');
-  stderr = stderr.replaceAll(plaintext, '[SECRET_REDACTED]');
+  // Only redact when a secret was actually injected (replaceAll('') would corrupt output).
+  if (plaintext) {
+    stdout = stdout.replaceAll(plaintext, '[SECRET_REDACTED]');
+    stderr = stderr.replaceAll(plaintext, '[SECRET_REDACTED]');
+  }
 
   return { exitCode, stdout, stderr };
 }

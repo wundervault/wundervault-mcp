@@ -209,14 +209,17 @@ export function createServer(args: { url?: string } = {}) {
           + 'and the Buffer is zeroed immediately after spawn.\n\n'
           + 'Tier 1 and Tier 2 secrets execute automatically based on server-side access policy.\n\n'
           + 'The vault entry\'s exec_config (set in dashboard) provides the injection recipe '
-          + '(env_key, pre_command, post_command). You may override it with inject_as if needed.\n\n'
+          + '(env_key, pre_command, post_command). You may override it with inject_as if needed. '
+          + 'For LOCAL exec an injection recipe is required; for REMOTE exec it is optional.\n\n'
+          + 'To run a remote command using only a vaulted SSH key (no secret injected), omit '
+          + 'entry_id and pass remote_host with ssh_key_entry_id.\n\n'
           + 'NEVER use shell escape patterns in command ($(), backticks, bash -c, sh -c, eval) — '
           + 'these are rejected before the secret is decrypted.'
         ),
         inputSchema: {
           type: 'object',
           properties: {
-            entry_id: { type: 'string', description: 'Vault entry ID (from vault_entries_list).' },
+            entry_id: { type: 'string', description: 'Vault entry ID (from vault_entries_list) of the secret to inject. Optional: omit it to run a remote command using only a vaulted SSH key (remote_host.ssh_key_entry_id) with no secret injected.' },
             purpose: { type: 'string', description: 'Why this secret is needed (audit log).' },
             command: { type: 'string', description: 'Full shell command to run (no escape patterns).' },
             working_dir: { type: 'string', description: 'Optional working directory for the command.' },
@@ -249,7 +252,7 @@ export function createServer(args: { url?: string } = {}) {
               required: ['host', 'user'],
             },
           },
-          required: ['entry_id', 'purpose', 'command'],
+          required: ['purpose', 'command'],
         },
       },
       {
@@ -435,7 +438,7 @@ export function createServer(args: { url?: string } = {}) {
 
       if (request.params.name === 'vault_exec') {
         const { entry_id, purpose, command, working_dir, inject_as, remote_host } = request.params.arguments as {
-          entry_id: string;
+          entry_id?: string;
           purpose: string;
           command: string;
           working_dir?: string;
@@ -452,42 +455,64 @@ export function createServer(args: { url?: string } = {}) {
           }
         }
 
-        // Fetch entry to get tier and exec_config
-        const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
-        const tier = secretData.access_tier ?? '1';
-
-        // Decrypt secret
-        const vaultKey = await api.ensureVaultKey();
-        const plaintextBytes = decryptSecretContent(
-          vaultKey,
-          secretData.encrypted_content,
-          secretData.content_nonce,
-        );
-        const plaintext = new TextDecoder().decode(plaintextBytes);
-
-        // Verify directive
-        const sig = secretData.directive_signature;
-        const directive = secretData.directive || DIRECTIVE;
-        if (sig && !verifyDirectiveSignature(directive, sig, plaintextBytes)) {
+        // entry_id is optional: omit it to run a remote command using only a vaulted
+        // SSH key (no secret injected). Require at least a secret to inject OR an SSH key.
+        const hasSshKey = !!(remote_host && (remote_host.ssh_key_entry_id || remote_host.ssh_key));
+        if (!entry_id && !hasSshKey) {
           return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `⚠️ Directive signature invalid for '${secretData.name ?? entry_id}'. Aborting.` }],
+            content: [{ type: 'text', text: `❌ Provide entry_id (a secret to inject) and/or a remote_host with ssh_key_entry_id (to run remotely with a vaulted SSH key).` }],
           });
         }
 
-        // Resolve injection config: prefer inject_as param, fall back to vault entry exec_config
-        const cfg = inject_as ?? secretData.exec_config;
-        if (!cfg) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `❌ No injection config. Set exec_config on the vault entry in the dashboard, or provide inject_as in the call.` }],
-          });
+        let plaintext = '';
+        let tier = '-';
+        let entryName: string | undefined;
+        let cfg: { env_key: string; pre_command?: string; post_command?: string } | undefined = inject_as;
+
+        if (entry_id) {
+          // Fetch entry to get tier and exec_config
+          const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
+          tier = secretData.access_tier ?? '1';
+          entryName = secretData.name ?? entry_id;
+
+          // Decrypt secret
+          const vaultKey = await api.ensureVaultKey();
+          const plaintextBytes = decryptSecretContent(
+            vaultKey,
+            secretData.encrypted_content,
+            secretData.content_nonce,
+          );
+          plaintext = new TextDecoder().decode(plaintextBytes);
+
+          // Verify directive
+          const sig = secretData.directive_signature;
+          const directive = secretData.directive || DIRECTIVE;
+          if (sig && !verifyDirectiveSignature(directive, sig, plaintextBytes)) {
+            return CallToolResultSchema.parse({
+              content: [{ type: 'text', text: `⚠️ Directive signature invalid for '${secretData.name ?? entry_id}'. Aborting.` }],
+            });
+          }
+
+          // Resolve injection config: prefer inject_as, fall back to the entry's exec_config.
+          // Required for LOCAL exec (the point is to inject a secret); OPTIONAL for REMOTE
+          // exec, where entry_id may be supplied only to use it as the SSH key without
+          // injecting it as an env var.
+          cfg = inject_as ?? secretData.exec_config;
+          if (!cfg && !remote_host) {
+            return CallToolResultSchema.parse({
+              content: [{ type: 'text', text: `❌ No injection config. Set exec_config on the vault entry in the dashboard, or provide inject_as in the call.` }],
+            });
+          }
         }
+
+        const envKey = cfg?.env_key ?? '';
 
         // Build full command: pre_command && main_command; post_command
         let fullCommand = command;
-        if (cfg.pre_command) {
+        if (cfg?.pre_command) {
           fullCommand = `${cfg.pre_command} && ${command}`;
         }
-        if (cfg.post_command) {
+        if (cfg?.post_command) {
           fullCommand = `${fullCommand}; ${cfg.post_command}`;
         }
 
@@ -529,7 +554,7 @@ export function createServer(args: { url?: string } = {}) {
               resolvedRemote = { ...remote_host, ssh_key: tempKeyPath, ssh_key_entry_id: undefined };
             }
             // pre_command/post_command are local hooks — not forwarded to remote execution.
-            execResult = runWithSecretRemote(plaintext, fullCommand, cfg.env_key, resolvedRemote);
+            execResult = runWithSecretRemote(plaintext, fullCommand, envKey, resolvedRemote);
           } finally {
             if (tempKeyPath) {
               try { unlinkSync(tempKeyPath); } catch { /* ignore */ }
@@ -539,7 +564,7 @@ export function createServer(args: { url?: string } = {}) {
         } else {
           const prevDir = process.cwd();
           if (working_dir) { try { process.chdir(working_dir); } catch { /* ignore */ } }
-          execResult = runWithSecret(plaintext, fullCommand, cfg.env_key);
+          execResult = runWithSecret(plaintext, fullCommand, envKey);
           if (working_dir) { try { process.chdir(prevDir); } catch { /* ignore */ } }
         }
         const { exitCode, stdout, stderr } = execResult;
@@ -547,7 +572,7 @@ export function createServer(args: { url?: string } = {}) {
         const resultLines = [
           `✅ vault_exec complete.`,
           ``,
-          `  Entry:   ${secretData.name ?? entry_id}`,
+          `  Entry:   ${entryName ?? '(none — SSH-only, no secret injected)'}`,
           `  Tier:    ${tier}`,
           `  Command: ${command}`,
           ...(remote_host ? [`  Remote:  ${remote_host.user}@${remote_host.host}${remote_host.ssh_key_entry_id ? ' (vaulted key)' : ''}`] : []),
