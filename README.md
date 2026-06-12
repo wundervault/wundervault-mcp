@@ -1,5 +1,9 @@
 # @wundervault/mcp-server
 
+[![npm version](https://img.shields.io/npm/v/%40wundervault%2Fmcp-server)](https://www.npmjs.com/package/@wundervault/mcp-server)
+[![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.wundervault%2Fwundervault--mcp-blue)](https://registry.modelcontextprotocol.io/v0/servers?search=wundervault)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-green)](LICENSE)
+
 MCP server for [Wundervault](https://wundervault.com) zero-knowledge secret management. Exposes vault secrets to AI agents via the [Model Context Protocol](https://modelcontextprotocol.io) — secrets are decrypted server-side and never returned to the agent in plaintext.
 
 ## Install
