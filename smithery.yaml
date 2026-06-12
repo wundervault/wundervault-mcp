@@ -1,29 +1,28 @@
 # Smithery configuration for @wundervault/mcp-server
 # https://smithery.ai/docs
+#
+# NOTE: this server reads vault credentials from the local wundervault-agent
+# daemon (unix socket under ~/.wundervault/agents/), not from env vars — run
+# onboard.py first. It is a LOCAL stdio server; a hosted/container deployment
+# starts and serves introspection, but the vault tools need the local daemon.
 startCommand:
   type: stdio
   configSchema:
     type: object
     required:
-      - agentVaultApiKey
-      - agentKey
+      - agentName
     properties:
-      agentVaultUrl:
+      agentName:
         type: string
-        default: "https://wundervault.com"
-        description: "Wundervault API base URL."
-      agentVaultApiKey:
+        description: "Agent name registered with the local wundervault-agent daemon (run onboard.py to register)."
+      agentToken:
         type: string
-        description: "Agent API key, format wv_agent_<AGENT_ID>|<KEY_SUFFIX> (from your Wundervault dashboard, Settings -> Agents)."
-      agentKey:
-        type: string
-        description: "Base64 URL-safe agent encryption key (issued during agent onboarding)."
+        description: "Optional daemon auth token. Defaults to ~/.wundervault/agents/<agentName>.token."
   commandFunction: |
     (config) => ({
       command: 'wundervault-mcp',
       env: {
-        WUNDERVault_AGENT_VAULT_URL: config.agentVaultUrl || 'https://wundervault.com',
-        WUNDERVault_AGENT_VAULT_API_KEY: config.agentVaultApiKey,
-        WUNDERVault_AGENT_KEY: config.agentKey
+        WUNDERVAULT_AGENT_NAME: config.agentName,
+        ...(config.agentToken ? { WUNDERVAULT_AGENT_TOKEN: config.agentToken } : {})
       }
     })
