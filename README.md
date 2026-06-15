@@ -112,6 +112,20 @@ wundervault-mcp [options]
   --help              Show help
 ```
 
+## Sandbox / demo mode
+
+Set `WUNDERVAULT_MOCK=1` to run the server **without** a `wundervault-agent`
+daemon or any credentials. In this mode every tool call returns a representative
+response clearly labelled `[DEMO MODE]` instead of contacting the vault — **no
+real secret is ever involved**. This exists so MCP directory scanners and CI
+(e.g. [Glama](https://glama.ai)) can start the server, exercise each tool, and
+validate the build with no live vault. It is **off by default** and is never
+enabled in production.
+
+```jsonc
+"env": { "WUNDERVAULT_MOCK": "1" }   // demo/CI only — returns fake, labelled output
+```
+
 ## Building from source
 
 ```bash
