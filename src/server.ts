@@ -110,6 +110,42 @@ async function getCredentials(): Promise<Credentials> {
   return creds;
 }
 
+// ── Sandbox / demo mode ─────────────────────────────────────────────────────
+// When WUNDERVAULT_MOCK=1, tool calls return representative DEMO responses
+// instead of contacting the local wundervault-agent daemon. This exists so
+// automated directory scanners / CI (e.g. Glama) can start the server with no
+// daemon or credentials, exercise every tool, and validate the build. It is OFF
+// by default and is never enabled in production, so the real vault path is
+// untouched. Every response is explicitly labelled — no real secret is ever
+// involved.
+const MOCK_MODE = process.env.WUNDERVAULT_MOCK === '1' || process.env.WUNDERVAULT_MOCK === 'true';
+const MOCK_NOTE = '\n\n[DEMO MODE — WUNDERVAULT_MOCK is set; no real vault was contacted and no real secret was used.]';
+
+function mockToolResult(name: string, args: Record<string, any>) {
+  switch (name) {
+    case 'vault_entries_list':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `Vault entries (2):\n  [demo-0001]  DEMO_API_KEY  (tier: read)\n  [demo-0002]  DEMO_SSH_KEY  (tier: 1)${MOCK_NOTE}` }] });
+    case 'vault_entry_get':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `✅ Secret retrieved and burned. (Entry: ${args.entry_id ?? 'demo-0001'}, Directive integrity: valid)${MOCK_NOTE}` }] });
+    case 'vault_entry_forget':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `Discarded local reference to '${args.entry_id ?? 'demo-0001'}'. (No-op on the server.)${MOCK_NOTE}` }] });
+    case 'vault_entry_inject_env':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `✅ ${args.env_key ?? 'DEMO_KEY'} injected into ${args.file_path ?? '~/.env'}\nSecret retrieved and burned.${MOCK_NOTE}` }] });
+    case 'vault_exec':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `✅ Command completed (exit 0).\n--- stdout ---\n(demo output)\n--- end ---${MOCK_NOTE}` }] });
+    case 'vault_rsync':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `✅ rsync complete → ${args.remote_host ?? 'demo-host'}:${args.remote_path ?? '/demo/path'}${MOCK_NOTE}` }] });
+    default:
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text: `Unknown tool: ${name}${MOCK_NOTE}` }], isError: true });
+  }
+}
+
 // ── Server Factory ─────────────────────────────────────────────────────────────
 
 export function createServer(args: { url?: string } = {}) {
@@ -307,6 +343,9 @@ export function createServer(args: { url?: string } = {}) {
     request,
     _extra: RequestHandlerExtra<any, any>,
   ) => {
+    if (MOCK_MODE) {
+      return mockToolResult(request.params.name, (request.params.arguments ?? {}) as Record<string, any>);
+    }
     let creds: Credentials;
     try {
       creds = await getCredentials();
