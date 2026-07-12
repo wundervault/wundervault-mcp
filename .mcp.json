@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "wundervault": {
+      "command": "wundervault-mcp",
+      "env": {
+        "WUNDERVAULT_AGENT_NAME": "${WUNDERVAULT_AGENT_NAME}"
+      }
+    }
+  }
+}
