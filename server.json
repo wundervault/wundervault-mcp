@@ -1,18 +1,18 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.wundervault/wundervault-mcp",
-  "description": "Zero-knowledge secret vault for AI agents: secrets injected into commands, never seen by the model",
+  "description": "Zero-knowledge MCP secrets vault for AI agents: secrets injected at runtime, never seen by the model",
   "repository": {
     "url": "https://github.com/wundervault/wundervault-mcp",
     "source": "github"
   },
   "websiteUrl": "https://wundervault.com",
-  "version": "1.6.7",
+  "version": "1.6.8",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@wundervault/mcp-server",
-      "version": "1.6.7",
+      "version": "1.6.8",
       "transport": {
         "type": "stdio"
       },
