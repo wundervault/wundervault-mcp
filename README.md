@@ -4,9 +4,30 @@
 [![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.wundervault%2Fwundervault--mcp-blue)](https://registry.modelcontextprotocol.io/v0/servers?search=wundervault)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-green)](LICENSE)
 
-A zero-knowledge MCP secrets vault for AI agents, by [Wundervault](https://wundervault.com). Exposes vault secrets to AI agents via the [Model Context Protocol](https://modelcontextprotocol.io) — secrets are decrypted locally by the daemon and injected into a command's runtime; plaintext is never returned to the agent or the model context.
+**A zero-knowledge secrets vault for AI agents.** Every API key you paste into an agent chat or a `.env` file ends up in context windows, transcripts, and provider logs. Wundervault's answer: the agent never receives the secret at all. It asks for *work* — "run this deploy with the key injected" — and a local daemon decrypts the secret, injects it into the subprocess environment, zeroes the buffer, and scrubs the output before the agent sees any of it.
+
+This repo is the MCP server that exposes that workflow to any [Model Context Protocol](https://modelcontextprotocol.io) client — Claude Code, Cursor, Cline, and others.
 
 **Don't trust the claim — test it:** the zero-knowledge property is independently verifiable at your own network boundary in about 5 minutes (browser DevTools or a mitmproxy canary test). Guide + our own test transcript: [wundervault.com/verify](https://wundervault.com/verify).
+
+## How it works
+
+```
+┌──────────────┐  MCP (stdio)  ┌───────────────────┐  ciphertext only  ┌───────────────────┐
+│   AI agent   │──────────────▶│  wundervault-mcp  │◀─────────────────▶│  wundervault.com  │
+│ (Claude, …)  │◀──────────────│  + local daemon   │                   │ stores encrypted  │
+└──────────────┘ "burned" ack  │  decrypts HERE    │                   │ blobs, no keys    │
+                               └─────────┬─────────┘                   └───────────────────┘
+                                         │  secret → subprocess env
+                                         │  (buffer zeroed after spawn)
+                                         ▼
+                               ┌───────────────────┐
+                               │   your command    │ stdout/stderr scrubbed
+                               │ (deploy, API, …)  │ before the agent sees it
+                               └───────────────────┘
+```
+
+Secrets are encrypted client-side (AES-256-GCM via Web Crypto) before upload. The hosted service only ever stores ciphertext — it cannot derive the key, the passphrase, or the plaintext.
 
 ## Install
 
@@ -37,13 +58,22 @@ Or using a credentials file:
 wundervault-mcp --credentials ~/.wundervault/creds.json
 ```
 
+New account? [wundervault.com](https://wundervault.com) has a 90-second agent onboarding flow that generates this config for you.
+
 ## Security Model
 
 - **Zero-knowledge:** The encryption key lives only in the MCP server process. The Wundervault server never sees it.
 - **Burn-after-reading:** Plaintext secrets are never returned to the calling agent. After decryption, the agent receives only `"Secret retrieved and burned."`.
-- **Exec scrubbing:** If you use the `exec` parameter, stdout/stderr are scrubbed of the plaintext before being returned.
+- **Exec scrubbing:** Command stdout/stderr are scrubbed of the plaintext before being returned; shell-escape patterns (`$()`, backticks, `sh -c`, `eval`) and file redirects of secrets are rejected *before* decryption.
 - **Directive integrity:** Server-side directive signatures (PBKDF2-HMAC-SHA256, 600k iterations) are verified before any secret is released.
 - **Timing-safe:** HMAC comparison uses `crypto.timingSafeEqual`.
+- **Tiered access:** Per-entry access tiers are enforced server-side; high-tier secrets require human approval before an agent can use them.
+
+### Honest limitations
+
+- The platform is **open-core**: this MCP server and the [browser crypto](https://github.com/wundervault/wundervault-crypto) are AGPL-3.0 so you can audit everything that touches your secrets, but the hosted service itself is not open source.
+- A local daemon must run next to the agent; fully air-gapped setups don't fit.
+- By design the agent can never read a secret's value — if your workflow needs the model to *reason about* the secret itself, this is the wrong shape.
 
 ## Tools
 
@@ -74,6 +104,38 @@ Output: "Secret retrieved and burned." (plaintext NEVER returned)
 sudo -S systemctl restart nginx <<< "$WUNDERVault_SECRET"
 ```
 Do NOT use `echo $WUNDERVault_SECRET | sudo -S` — that exposes the secret in process logs.
+
+### `vault_exec`
+
+Execute a shell command with a vault secret injected as an env var — locally or on a remote host over SSH. The secret is injected into the subprocess and the buffer is zeroed immediately after spawn; escape patterns are rejected before decryption.
+
+```
+Input:
+  purpose: string           # audit log reason
+  command: string           # full shell command (no escape patterns)
+  entry_id?: string         # secret to inject (omit for SSH-key-only remote exec)
+  working_dir?: string
+  inject_as?: { env_key, pre_command?, post_command? }   # override entry's exec_config
+  remote_host?: { host, user, ssh_key_entry_id? | ssh_key? }
+```
+
+With `remote_host.ssh_key_entry_id`, the SSH key is fetched from the vault and used without ever being written to disk.
+
+### `vault_entry_inject_env`
+
+Write a vault secret directly into a config file (`~/.npmrc`, `~/.netrc`, `~/.docker/config.json`, or a project `.env`) without the plaintext passing through the agent.
+
+```
+Input:
+  entry_id: string
+  purpose: string
+  file_path: string         # allowed config file paths only
+  env_key: string           # variable name to set
+```
+
+### `vault_rsync`
+
+Sync a local directory to a remote host using rsync over SSH, with the SSH key fetched from the vault (temp keyfile deleted immediately after transfer).
 
 ### `vault_entry_forget`
 
@@ -119,7 +181,8 @@ wundervault-mcp [options]
 Set `WUNDERVAULT_MOCK=1` to run the server **without** a `wundervault-agent`
 daemon or any credentials. In this mode every tool call returns a representative
 response clearly labelled `[DEMO MODE]` instead of contacting the vault — **no
-real secret is ever involved**. This exists so MCP directory scanners and CI
+real secret is ever involved**. This exists so you can poke at the tool surface
+without an account, and so MCP directory scanners and CI
 (e.g. [Glama](https://glama.ai)) can start the server, exercise each tool, and
 validate the build with no live vault. It is **off by default** and is never
 enabled in production.
