@@ -57,9 +57,42 @@ export class AgentVaultAPI {
   }
 
   async getSecret(id: string, purpose: string): Promise<SecretResponse> {
-    return this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, {
-      purpose: purpose.slice(0, 200),
-    });
+    try {
+      return await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, {
+        purpose: purpose.slice(0, 200),
+      });
+    } catch (err: any) {
+      // Tier-2 gate: the 403 detail carries a pending approval-request id.
+      // Park here and poll it so the human's approval resolves this same
+      // tool call instead of forcing a blind retry later.
+      const requestId = err?.status === 403
+        ? String(err.message).match(/tier2-requests\/([A-Za-z0-9_-]+)/)?.[1]
+        : undefined;
+      if (!requestId) throw err;
+      const approved = await this.waitForTier2Approval(requestId);
+      if (!approved) throw err;
+      return await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, {
+        purpose: purpose.slice(0, 200),
+      });
+    }
+  }
+
+  /** Poll a tier-2 approval request for up to ~90s. True once approved. */
+  private async waitForTier2Approval(requestId: string): Promise<boolean> {
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 5_000));
+      try {
+        const res = await this.fetchJson<{ status: string }>(
+          `/agent/vault/tier2-requests/${requestId}`,
+        );
+        if (res.status === 'approved') return true;
+        if (res.status === 'denied' || res.status === 'expired') return false;
+      } catch {
+        // transient poll error — keep waiting until the deadline
+      }
+    }
+    return false;
   }
 
   async getMcpSettings(): Promise<{
