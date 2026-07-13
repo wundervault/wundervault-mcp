@@ -176,6 +176,19 @@ wundervault-mcp [options]
   --help              Show help
 ```
 
+## Agent wallets (x402)
+
+An [x402](https://x402.org) payment is just a signature, and a wallet key is a
+vault secret like any other. Store the key at **tier 2**, have the agent sign the
+payment payload through `vault_exec`, and the key is injected into a local signing
+subprocess — it never enters the model context, and every use needs the owner's
+approval first (the agent's denied call carries a request id; approval is scoped
+to that agent + secret, once or for a 15/60-minute window). We ran this
+end-to-end on Base Sepolia — the verified run is written up at
+[wundervault.com/agent-wallets](https://wundervault.com/agent-wallets).
+Payment-specific policy (spend caps, payee allowlists) is not built yet:
+compatible, not productized.
+
 ## Sandbox / demo mode
 
 Set `WUNDERVAULT_MOCK=1` to run the server **without** a `wundervault-agent`
