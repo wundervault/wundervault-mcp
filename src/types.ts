@@ -52,7 +52,7 @@ export interface SecretResponse {
   directive?: string;
   directive_signature?: string;
   access_tier?: string;
-  exec_config?: ExecConfig; // CIP-017
+  exec_config?: ExecConfig | string; // CIP-017 — backend forwards a JSON string; coerce before use
 }
 
 export interface VaultHttpPostCredential {

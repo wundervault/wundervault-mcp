@@ -2,8 +2,30 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, openSync, writeSync, closeSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { ExecResult, RemoteHost } from './types.js';
+import type { ExecConfig, ExecResult, RemoteHost } from './types.js';
 import { STRIP_FROM_CHILD_ENV } from './templates.js';
+
+/**
+ * The backend stores exec_config as an opaque JSON STRING and forwards it
+ * as-is. Coerce it to an object before use — tolerating an already-parsed
+ * object, a JSON string, or absent/garbage (→ undefined). Without this the
+ * dashboard's credential_type/env_key never reach the delivery dispatch.
+ */
+export function coerceExecConfig(raw: unknown): ExecConfig | undefined {
+  if (!raw) return undefined;
+  if (typeof raw === 'object') return raw as ExecConfig;
+  if (typeof raw === 'string') {
+    const s = raw.trim();
+    if (!s) return undefined;
+    try {
+      const parsed = JSON.parse(s);
+      return parsed && typeof parsed === 'object' ? (parsed as ExecConfig) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
 
 const DANGEROUS_EXEC_PATTERNS = [
   /\s*>/,

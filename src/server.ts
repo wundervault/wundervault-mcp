@@ -13,7 +13,7 @@ import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmdirSync, exists
 import net from 'node:net';
 import { AgentVaultAPI } from './api-client.js';
 import { loadEncryptionKey, verifyDirectiveSignature, decryptSecretContent } from './crypto.js';
-import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync } from './exec.js';
+import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig } from './exec.js';
 import { getRecipe, recipeIds } from './recipes.js';
 import type { Credentials, VaultEntry, RemoteHost } from './types.js';
 import { STRIP_FROM_CHILD_ENV, isAllowedInjectPath } from './templates.js';
@@ -544,7 +544,7 @@ export function createServer(args: { url?: string } = {}) {
           // Required for LOCAL exec (the point is to inject a secret); OPTIONAL for REMOTE
           // exec, where entry_id may be supplied only to use it as the SSH key without
           // injecting it as an env var.
-          cfg = inject_as ?? secretData.exec_config;
+          cfg = inject_as ?? coerceExecConfig(secretData.exec_config);
           if (!cfg && !remote_host) {
             return CallToolResultSchema.parse({
               content: [{ type: 'text', text: `❌ No injection config. Set exec_config on the vault entry in the dashboard, or provide inject_as in the call.` }],
