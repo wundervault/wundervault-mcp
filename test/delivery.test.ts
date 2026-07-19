@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readdirSync } from 'node:fs';
 import os from 'node:os';
-import { runWithSecret, runWithSecretStdin, runWithSecretAskpass } from '../src/exec.js';
+import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, coerceExecConfig } from '../src/exec.js';
 import { getRecipe, recipeIds, RECIPES } from '../src/recipes.js';
 
 const SECRET = 'hunter2';
@@ -27,6 +27,24 @@ describe('recipes', () => {
 
   it('every recipe carries a non-empty delivery note', () => {
     for (const r of Object.values(RECIPES)) expect(r.delivery.length).toBeGreaterThan(0);
+  });
+});
+
+describe('coerceExecConfig', () => {
+  it('parses the JSON string the backend forwards', () => {
+    expect(coerceExecConfig('{"credential_type":"sudo"}')).toEqual({ credential_type: 'sudo' });
+    expect(coerceExecConfig('{"env_key":"NPM_TOKEN","pre_command":"x"}')).toEqual({ env_key: 'NPM_TOKEN', pre_command: 'x' });
+  });
+  it('passes through an already-parsed object', () => {
+    expect(coerceExecConfig({ credential_type: 'git' })).toEqual({ credential_type: 'git' });
+  });
+  it('returns undefined for empty / garbage / non-object', () => {
+    expect(coerceExecConfig(undefined)).toBeUndefined();
+    expect(coerceExecConfig('')).toBeUndefined();
+    expect(coerceExecConfig('   ')).toBeUndefined();
+    expect(coerceExecConfig('not json')).toBeUndefined();
+    expect(coerceExecConfig('"a string"')).toBeUndefined();
+    expect(coerceExecConfig('42')).toBeUndefined();
   });
 });
 
