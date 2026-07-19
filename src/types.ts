@@ -26,9 +26,16 @@ export interface SecretsResponse {
 }
 
 export interface ExecConfig {
-  env_key: string;
+  /** env var name for the `env`/generic mechanism (optional once a recipe drives delivery) */
+  env_key?: string;
   pre_command?: string;
   post_command?: string;
+  /** CIP-025: recipe id (sudo | ssh-passphrase | git | generic). Drives the delivery mechanism. */
+  credential_type?: string;
+  /** Advanced escape hatch — force a channel directly instead of a recipe. */
+  mechanism?: 'env' | 'stdin' | 'askpass';
+  /** Advanced escape hatch — askpass env var, used with mechanism: 'askpass'. */
+  askpass_var?: string;
 }
 
 export interface RemoteHost {
@@ -45,7 +52,7 @@ export interface SecretResponse {
   directive?: string;
   directive_signature?: string;
   access_tier?: string;
-  exec_config?: ExecConfig; // CIP-017
+  exec_config?: ExecConfig | string; // CIP-017 — backend forwards a JSON string; coerce before use
 }
 
 export interface VaultHttpPostCredential {
