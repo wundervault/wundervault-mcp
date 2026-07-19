@@ -30,7 +30,7 @@ export interface ExecConfig {
   env_key?: string;
   pre_command?: string;
   post_command?: string;
-  /** CIP-018: recipe id (sudo | ssh-passphrase | git | generic). Drives the delivery mechanism. */
+  /** CIP-025: recipe id (sudo | ssh-passphrase | git | generic). Drives the delivery mechanism. */
   credential_type?: string;
   /** Advanced escape hatch — force a channel directly instead of a recipe. */
   mechanism?: 'env' | 'stdin' | 'askpass';

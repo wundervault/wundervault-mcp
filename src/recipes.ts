@@ -1,5 +1,5 @@
 /**
- * CIP-018: Credential delivery recipes.
+ * CIP-025: Credential delivery recipes.
  *
  * A vault entry declares WHAT a secret is (its `credential_type`); the recipe
  * maps that intent to a safe delivery MECHANISM. Callers never pick a channel
