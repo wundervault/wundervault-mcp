@@ -13,7 +13,8 @@ import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmdirSync, exists
 import net from 'node:net';
 import { AgentVaultAPI } from './api-client.js';
 import { loadEncryptionKey, verifyDirectiveSignature, decryptSecretContent } from './crypto.js';
-import { runWithSecret, runWithSecretRemote, runRsync } from './exec.js';
+import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync } from './exec.js';
+import { getRecipe, recipeIds } from './recipes.js';
 import type { Credentials, VaultEntry, RemoteHost } from './types.js';
 import { STRIP_FROM_CHILD_ENV, isAllowedInjectPath } from './templates.js';
 import { VERSION } from './version.js';
@@ -240,13 +241,18 @@ export function createServer(args: { url?: string } = {}) {
       {
         name: 'vault_exec',
         description: (
-          'Execute a shell command with a vault secret injected as an env var. '
-          + 'The secret is never returned to the agent — it is injected into the subprocess '
-          + 'and the Buffer is zeroed immediately after spawn.\n\n'
+          'Execute a shell command with a vault secret delivered to it safely. '
+          + 'The secret is never returned to the agent, and is scrubbed from output and '
+          + 'zeroed after the process runs.\n\n'
           + 'Tier 1 and Tier 2 secrets execute automatically based on server-side access policy.\n\n'
-          + 'The vault entry\'s exec_config (set in dashboard) provides the injection recipe '
-          + '(env_key, pre_command, post_command). You may override it with inject_as if needed. '
-          + 'For LOCAL exec an injection recipe is required; for REMOTE exec it is optional.\n\n'
+          + 'HOW THE SECRET IS DELIVERED is chosen by the entry\'s credential_type (its recipe) — '
+          + 'you do not pick a channel:\n'
+          + '  • generic (default) → injected as a named env var (set env_key)\n'
+          + '  • sudo → piped to `sudo -S` over stdin, never in the environment\n'
+          + '  • git / ssh-passphrase → via a GIT_ASKPASS / SSH_ASKPASS helper reading a private pipe\n'
+          + 'The credential_type is normally set on the entry in the dashboard; override per-call with '
+          + 'inject_as if needed. For LOCAL exec a recipe or env_key is required; for REMOTE exec it is optional '
+          + '(remote currently supports the generic/env path only).\n\n'
           + 'To run a remote command using only a vaulted SSH key (no secret injected), omit '
           + 'entry_id and pass remote_host with ssh_key_entry_id.\n\n'
           + 'NEVER use shell escape patterns in command ($(), backticks, bash -c, sh -c, eval) — '
@@ -261,13 +267,15 @@ export function createServer(args: { url?: string } = {}) {
             working_dir: { type: 'string', description: 'Optional working directory for the command.' },
             inject_as: {
               type: 'object',
-              description: 'Override exec_config injection recipe. Omit to use vault entry\'s exec_config.',
+              description: 'Override the entry\'s delivery config for this call. Omit to use the entry\'s exec_config / credential_type.',
               properties: {
-                env_key: { type: 'string', description: 'Env var name to inject secret as.' },
+                credential_type: { type: 'string', description: 'How to deliver the secret — the vault picks the safe channel: generic | sudo | git | ssh-passphrase.' },
+                env_key: { type: 'string', description: 'For generic secrets: env var name to inject the secret as.' },
                 pre_command: { type: 'string', description: 'Setup command (runs before main command).' },
                 post_command: { type: 'string', description: 'Teardown command (always runs after main command).' },
+                mechanism: { type: 'string', enum: ['env', 'stdin', 'askpass'], description: 'Advanced: force a delivery channel directly instead of a credential_type.' },
+                askpass_var: { type: 'string', description: 'Advanced: askpass env var (e.g. SUDO_ASKPASS) when mechanism is askpass.' },
               },
-              required: ['env_key'],
             },
             remote_host: {
               type: 'object',
@@ -481,7 +489,7 @@ export function createServer(args: { url?: string } = {}) {
           purpose: string;
           command: string;
           working_dir?: string;
-          inject_as?: { env_key: string; pre_command?: string; post_command?: string };
+          inject_as?: { credential_type?: string; env_key?: string; pre_command?: string; post_command?: string; mechanism?: 'env' | 'stdin' | 'askpass'; askpass_var?: string };
           remote_host?: RemoteHost;
         };
 
@@ -506,7 +514,7 @@ export function createServer(args: { url?: string } = {}) {
         let plaintext = '';
         let tier = '-';
         let entryName: string | undefined;
-        let cfg: { env_key: string; pre_command?: string; post_command?: string } | undefined = inject_as;
+        let cfg: { credential_type?: string; env_key?: string; pre_command?: string; post_command?: string; mechanism?: 'env' | 'stdin' | 'askpass'; askpass_var?: string } | undefined = inject_as;
 
         if (entry_id) {
           // Fetch entry to get tier and exec_config
@@ -546,6 +554,45 @@ export function createServer(args: { url?: string } = {}) {
 
         const envKey = cfg?.env_key ?? '';
 
+        // Resolve the delivery mechanism from the recipe (credential_type), an
+        // advanced override, or the legacy env_key (generic). Callers pick intent,
+        // not a channel.
+        let mechanism: 'env' | 'stdin' | 'askpass' = 'env';
+        let askpassVar: string | undefined;
+        let wrap: 'setsid' | undefined;
+        let appendNewline: boolean | undefined;
+        let deliveryNote = '';
+
+        if (cfg?.credential_type) {
+          const recipe = getRecipe(cfg.credential_type);
+          if (!recipe) {
+            return CallToolResultSchema.parse({
+              content: [{ type: 'text', text: `❌ Unknown credential_type '${cfg.credential_type}'. Known types: ${recipeIds().join(', ')}.` }],
+            });
+          }
+          mechanism = recipe.mechanism;
+          askpassVar = recipe.askpassVar;
+          wrap = recipe.wrap;
+          appendNewline = recipe.appendNewline;
+          deliveryNote = recipe.delivery;
+        } else if (cfg?.mechanism) {
+          // Advanced escape hatch: force a channel directly.
+          mechanism = cfg.mechanism;
+          askpassVar = cfg.askpass_var;
+        }
+
+        // Validate the mechanism has what it needs (SSH-only no-secret remote runs skip this).
+        if (mechanism === 'env' && !envKey && !remote_host && (entry_id || cfg)) {
+          return CallToolResultSchema.parse({
+            content: [{ type: 'text', text: `❌ No delivery config. Set a credential_type (${recipeIds().join(', ')}) on the entry, or pass env_key for a generic secret.` }],
+          });
+        }
+        if (mechanism === 'askpass' && !askpassVar) {
+          return CallToolResultSchema.parse({
+            content: [{ type: 'text', text: `❌ askpass delivery needs an askpass_var — use a credential_type (git, ssh-passphrase) instead of a bare mechanism.` }],
+          });
+        }
+
         // Build full command: pre_command && main_command; post_command
         let fullCommand = command;
         if (cfg?.pre_command) {
@@ -558,6 +605,11 @@ export function createServer(args: { url?: string } = {}) {
         let execResult: ReturnType<typeof runWithSecret>;
         let keyFingerprint: string | null = null;
         if (remote_host) {
+          if (mechanism !== 'env') {
+            return CallToolResultSchema.parse({
+              content: [{ type: 'text', text: `❌ credential_type '${cfg?.credential_type ?? mechanism}' is not supported for remote exec yet — remote delivery is env-only. Run it locally, or use a generic secret for the remote host.` }],
+            });
+          }
           // Resolve ssh_key_entry_id: fetch SSH key from vault, write to a temp file,
           // use for the connection, then delete immediately after.
           let resolvedRemote = { ...remote_host };
@@ -603,7 +655,13 @@ export function createServer(args: { url?: string } = {}) {
         } else {
           const prevDir = process.cwd();
           if (working_dir) { try { process.chdir(working_dir); } catch { /* ignore */ } }
-          execResult = runWithSecret(plaintext, fullCommand, envKey);
+          if (mechanism === 'stdin') {
+            execResult = runWithSecretStdin(plaintext, fullCommand, { appendNewline });
+          } else if (mechanism === 'askpass') {
+            execResult = runWithSecretAskpass(plaintext, fullCommand, { askpassVar: askpassVar as string, wrap });
+          } else {
+            execResult = runWithSecret(plaintext, fullCommand, envKey);
+          }
           if (working_dir) { try { process.chdir(prevDir); } catch { /* ignore */ } }
         }
         const { exitCode, stdout, stderr } = execResult;
@@ -614,6 +672,7 @@ export function createServer(args: { url?: string } = {}) {
           `  Entry:   ${entryName ?? '(none — SSH-only, no secret injected)'}`,
           `  Tier:    ${tier}`,
           `  Command: ${command}`,
+          ...(deliveryNote ? [`  Delivery: ${deliveryNote}`] : []),
           ...(remote_host ? [`  Remote:  ${remote_host.user}@${remote_host.host}${remote_host.ssh_key_entry_id ? ' (vaulted key)' : ''}`] : []),
           ...(keyFingerprint ? [`  Key:     ${keyFingerprint}`] : []),
           `  Exit:    ${exitCode}`,
