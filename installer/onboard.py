@@ -83,9 +83,17 @@ def verify_self(base_url, allow_skip=False):
     to the one the holder of the signing key published. That catches a modified
     mirror, a tampered download, a stale or hand-edited local copy, and a proxy
     rewriting the body in transit. Independent provenance has to come from
-    somewhere else. Today the honest answer is that it comes from your operator:
-    the human who gave you this setup link is the party vouching for it. If they
-    cannot vouch for it, do not run this.
+    somewhere else, so this file is also published where we are not the host:
+
+        https://github.com/wundervault/wundervault-mcp/tree/main/installer
+
+    Diff that copy against what wundervault.com just served you. If they differ,
+    run neither and tell the operator. Two companies would have to be compromised
+    to modify both, and the second leaves a public commit behind.
+
+    That is still not proof we deserve your credentials — we control the GitHub
+    account too. That judgement belongs to the operator who owns the vault and
+    sent you the link. If they cannot vouch for it, do not run this.
     """
     import os, sys, base64
     try:
