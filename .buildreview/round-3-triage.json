@@ -1,0 +1,41 @@
+{"round": 3, "decisions": [
+  {"id": "F1", "action": "fixed",
+   "claim": "The non-Linux filesystem socket can be unlinked while bound, and stale recovery is a non-atomic probe-then-unlink, so two processes can serve the same credential.",
+   "reason": "Confirmed on both halves. A pathname that can be removed while its socket is live reintroduces exactly the delete-the-lock leak the Linux path was designed to make impossible, and probe-then-unlink is a race by construction. Replaced the non-Linux claim with a LOOPBACK TCP PORT derived from the agent name: no filesystem entry to delete, kernel-released on death, atomic to bind — the same properties the abstract socket gives on Linux."},
+
+  {"id": "F2", "action": "fixed",
+   "claim": "The Windows branch passes a home-directory path where Node requires a named-pipe address, so binding fails and a free credential is reported as held.",
+   "reason": "Confirmed — Windows IPC needs \\\\.\\pipe\\..., and my code would have handed it C:\\Users\\...\\mcp-X.sock. The same TCP change removes the platform special case entirely rather than adding a third address format to get wrong."},
+
+  {"id": "F3", "action": "fixed",
+   "claim": "A process that binds successfully still serves when writing the compatibility lock file fails, so an older copy sees no lock and serves the same credential.",
+   "reason": "Confirmed, and it defeated the whole point of keeping that file. If ~/.wundervault is read-only or missing, the write is swallowed and a frozen older copy joins us. Failing to write it is now failing to claim: we close the address and refuse, naming the path in the reason."},
+
+  {"id": "F4", "action": "fixed",
+   "claim": "releaseCredential() deletes the lock file on a bare PID match rather than proving this incarnation wrote it.",
+   "reason": "Confirmed — I had the incarnation check in the previous design and dropped it in the rewrite. The file now carries a random token generated once per run; release requires an exact token match, so a replaced file, a restored file, or a recycled PID cannot trigger it. A legacy tokenless file is never ours and is never removed. Two tests cover it."},
+
+  {"id": "F5", "action": "fixed",
+   "claim": "vault_status re-checks only whether the credential is occupied, then replays the startup holder, so it names the wrong process after a handover.",
+   "reason": "Confirmed. It now asks who holds it AT CALL TIME rather than reporting a snapshot, which matters precisely in the case a blocked session is used for: sitting connected while the credential changes hands."},
+
+  {"id": "F6", "action": "fixed",
+   "claim": "With the lock file deleted, a blocked instance can only say 'another process on this machine' — no PID, no time, no session hint.",
+   "reason": "Confirmed, and the fix falls out of the mechanism rather than adding a file: THE HOLDER NOW ANSWERS FOR ITSELF. It replies to any connection on the address it already holds with a one-line identity banner (pid, agent, connect time — never a secret, never the parent's argv). That cannot be deleted by anyone. The lock file is now only a fallback, and the message says which source it used."},
+
+  {"id": "F7", "action": "fixed",
+   "claim": "New evidence: with the raw-name /proc comparison deleted, the address is keyed only by slug, so 'Team A' and 'Team?A' — distinct credentials — now exclude each other.",
+   "reason": "Accepted, and the reviewer was right to re-raise it: my round-2 rejection rested on the raw-name comparison that the rewrite removed. The address now carries a SHA-256 digest of the raw agent name, so distinct names claim distinct addresses. The lock FILENAME stays slug-based, because older copies look for exactly that path."},
+
+  {"id": "B2", "action": "fixed",
+   "claim": "Unix address length limits are not handled for long agent names or long home paths.",
+   "reason": "Real — a unix address caps at 108 bytes and an unbounded name would fail to bind, which this design reads as 'held' and would strand a free credential. The address is now a 32-char slug prefix plus a 12-char digest. Tested with a 500-character agent name."},
+
+  {"id": "B1", "action": "deferred",
+   "claim": "Any local process can bind the predictable address and impersonate occupancy without being an MCP server.",
+   "reason": "True and inherent to any same-UID lock — a process that can bind your address can also read your lock file, your socket and your home directory. It denies service rather than granting it, which is the safe direction, and the identity banner now makes an impostor visible (it cannot produce the protocol line, so the refusal reports the holder as unknown rather than pretending). Not fixable without an authenticated channel, which is out of proportion here."},
+
+  {"id": "B3", "action": "deferred",
+   "claim": "The suite covers the lock module and cross-process behaviour but not full MCP initialization, tool listing, tool rejection, or holder turnover.",
+   "reason": "Fair. Those paths ARE exercised, but by hand against the live daemon rather than in the suite — handshake, vault_status only, vault-tool rejection, and standing down for this machine's older-build holder. Worth turning into a spawned-server integration test; noted rather than done, and called out to the owner as the weakest part of the coverage."}
+]}

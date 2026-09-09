@@ -1,0 +1,29 @@
+{"round": 4, "decisions": [
+  {"id": "F2", "action": "fixed",
+   "claim": "On non-Linux, EADDRINUSE on the derived loopback port is treated as proof the credential is held, even when the port belongs to an unrelated service.",
+   "reason": "Confirmed and the more serious of the two blockers, because it breaks the FREE case: an unrelated local service squatting one number out of 16,384 would make the vault permanently unavailable on that machine while reporting it as held. Two changes: the port is now a candidate LIST of 8 derived from the agent name, and EADDRINUSE no longer settles anything on its own — the occupant is asked to identify itself over the holder banner, and only a process that answers our protocol counts as a holder. Anything else is just in the way, so we move to the next candidate."},
+
+  {"id": "F3", "action": "fixed",
+   "claim": "Linux ignores kernel start time, so a stale lock naming a recycled PID makes an unrelated live process look like the holder.",
+   "reason": "Confirmed. The compatibility file now records the holder's /proc start ticks, and the mixed-version gate requires them to match before a live PID counts. A recycled PID is now visibly not the same incarnation instead of refusing a free credential forever."},
+
+  {"id": "F4", "action": "fixed",
+   "claim": "New evidence: the raw-name comparison is gone, so a live PID in the shared slugged FILENAME blocks every agent whose name slugs the same.",
+   "reason": "Accepted — and the reviewer was right to re-raise this a second time. I fixed the ADDRESS keying in round 3 and left the file keyed by slug, then built the mixed-version gate on that file, which put the bug straight back. The file now records the raw agent name and the gate honours it over the filename. A legacy file states neither and is still honoured conservatively, which is the narrow remaining case."},
+
+  {"id": "F5", "action": "fixed",
+   "claim": "The socket address was bounded but the lock FILENAME was not, so a long agent name yields ENAMETOOLONG and the claim is refused.",
+   "reason": "Confirmed. The slug in the filename is capped at 200 characters. That only diverges from an older copy past the point where the filename is illegal anyway, so there is no compatibility left to lose. Tested with a 500-character agent name."},
+
+  {"id": "B1", "action": "fixed",
+   "claim": "The abstract socket name and TCP port are machine-global but carry no user identity.",
+   "reason": "Real, and it cuts both ways: two OS accounts on one box would exclude each other over credentials they do not share, and another local user could squat the name. The uid is now part of the address key on both platforms."},
+
+  {"id": "B2", "action": "fixed",
+   "claim": "askHolder() accumulates an unbounded string until a newline or its one-second timer.",
+   "reason": "Correct — and it matters precisely because the responder may NOT be us, which is the case the port-candidate search now creates deliberately. Capped at 4 KB."},
+
+  {"id": "F1", "action": "deferred",
+   "claim": "A rebuilt instance and a frozen pre-socket instance can both serve if they interleave around the old build's non-atomic pid-file check and write.",
+   "reason": "Confirmed, and NOT FIXABLE FROM THIS REPOSITORY. The race lives in code already installed elsewhere: an older build does existsSync, then readFile, then writeFile with no atomicity, and nothing a new build does can make another process's check-then-write atomic. Binding first and honouring the pid file narrows the window but cannot close it. The actual remedy is to stop having two versions — which is what publishing this and updating the frozen copies achieves. Raised to the owner explicitly rather than closed, because it means the invariant is not fully restored box-wide until every copy is updated."}
+]}
