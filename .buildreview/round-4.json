@@ -1,0 +1,126 @@
+{
+  "verdict": "revise",
+  "summary": "The build replaces the deletable-file authority with a kernel-held address, preserves the legacy PID file, and gives blocked clients a usable MCP diagnostic mode. Same-version Linux exclusion is substantially improved, but a mixed-version startup race can still let two instances serve, and the non-Linux TCP claim can reject a genuinely free credential. PID-incarnation handling, slug-colliding agent names, and long agent names also remain incomplete.",
+  "spec_check": [
+    {
+      "requirement": "A second instance under the same agent name never gets vault tools while a first live instance holds the credential.",
+      "status": "unmet",
+      "evidence": "The bound address excludes two rebuilt instances, but acquireCredential() can race a frozen build's non-atomic exists/read/write PID-file acquisition so that both proceed."
+    },
+    {
+      "requirement": "Deleting the lock file while a live holder is running does NOT let a second instance serve vault tools.",
+      "status": "met",
+      "evidence": "For rebuilt instances, the live holder retains the abstract socket or TCP listener independently of the compatibility file, and the test deletes the file before confirming a second claim is refused."
+    },
+    {
+      "requirement": "releaseLock() removes the lock file only when this exact process incarnation owns it \u2014 identity is (pid, kernel start time).",
+      "status": "partial",
+      "evidence": "releaseCredential() requires a per-run UUID token and therefore rejects foreign or tokenless files, but no kernel start time is recorded or checked and live-PID decisions use only process.kill(pid, 0)."
+    },
+    {
+      "requirement": "Two instances starting simultaneously resolve deterministically: exactly one serves the vault, and it is never the case that both do OR that both stand down.",
+      "status": "unmet",
+      "evidence": "Two rebuilt copies are serialized by bind(), but a frozen copy can pass its file-existence check before the rebuilt copy writes the compatibility file and then overwrite that file and serve; on non-Linux an unrelated owner of the selected TCP port also makes all contenders stand down."
+    },
+    {
+      "requirement": "A blocked instance completes the MCP initialize handshake and stays connected. It must NOT exit during the handshake.",
+      "status": "met",
+      "evidence": "serveHeldNotice() constructs a Server, connects a StdioServerTransport, and only exits when stdin ends."
+    },
+    {
+      "requirement": "A blocked instance advertises NO vault tools. Any vault tool call returns an error explaining the credential is held. It exposes exactly one diagnostic tool, vault_status, which re-checks live state rather than replaying a startup snapshot.",
+      "status": "met",
+      "evidence": "The held-mode ListTools handler returns only vault_status, all other tool names receive isError: true, and vault_status calls credentialIsFree() and whoHolds() on each invocation."
+    },
+    {
+      "requirement": "The refusal message identifies the holder well enough to act on: PID, start time, and a hint at the owning session.",
+      "status": "met",
+      "evidence": "The holder banner and compatibility metadata provide PID and connected-since time, while describeHolder() includes those values and the refusal directs the user to close the session owning that process."
+    },
+    {
+      "requirement": "Lock file line 1 remains a bare PID. Older builds of this package parse the file with parseInt and treat NaN as \"no lock\" \u2014 a pure-JSON file would make every older copy on the box ignore the lock and start alongside a live holder. Metadata is line 2 JSON.",
+      "status": "met",
+      "evidence": "writeCompatFile() writes process.pid followed by a newline and a JSON metadata object, and the compatibility test parses line 1 exactly as an older build does."
+    },
+    {
+      "requirement": "Nothing regresses on the normal path: a free credential yields all six vault tools and a working vault_entries_list, and a clean exit releases the lock.",
+      "status": "partial",
+      "evidence": "A successful claim enters the existing createServer() path and installs clean-exit release handlers, but the six-tool implementation and a normal-path MCP integration test are not included in the excerpt, so the complete tool behavior cannot be independently verified here."
+    },
+    {
+      "requirement": "Behaviour degrades safely where /proc is unavailable (non-Linux): the file remains the fallback authority; the process must still start and serve when nothing holds it.",
+      "status": "unmet",
+      "evidence": "On non-Linux, any EADDRINUSE on the deterministic loopback port is treated as an occupied credential even when the compatibility file is absent and the port belongs to an unrelated service or another agent with a colliding port hash."
+    },
+    {
+      "requirement": "No secret, token, or credential value is written to stderr, the lock file, or any tool response by this change.",
+      "status": "met",
+      "evidence": "The banner and responses contain agent identity, PID, and timestamps; the lock file additionally contains version and a newly generated lock-ownership UUID, but no vault credential or daemon token is read or emitted by this code."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/lock.ts",
+      "line": 250,
+      "claim": "A rebuilt instance and a frozen pre-socket instance can both serve when their startup operations interleave around the legacy build's non-atomic PID-file check and write.",
+      "failure_scenario": "With no initial lock, the frozen build executes existsSync(lockFile) and sees false, then pauses; the rebuilt build binds its address, reads no compatibility file, writes its metadata, and proceeds, after which the frozen build resumes, overwrites the file with its own PID, and also proceeds, leaving two live MCP processes with vault tools for the same credential.",
+      "suggested_direction": "Add a mixed-version arbitration step that detects and resolves a legacy process which passed its pre-check before the new compatibility file appeared, and do not expose vault tools until that gate has deterministically settled."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/lock.ts",
+      "line": 100,
+      "claim": "On macOS or Windows, EADDRINUSE on the deterministic 14-bit TCP port is treated as proof that this credential is held even when the port belongs to something unrelated.",
+      "failure_scenario": "Set WUNDERVAULT_AGENT_NAME to an agent whose derived 127.0.0.1 port is already occupied by another local service, an outbound-port conflict, or a different agent with the same modulo-16384 hash; with no live holder and no compatibility lock, tryBind() returns in-use and the process advertises only vault_status instead of the six vault tools.",
+      "suggested_direction": "Use an atomic non-Linux claim mechanism that is uniquely scoped to the credential and user, or add a protocol that can distinguish a genuine holder from an unrelated port owner without serving when ownership is uncertain."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "src/lock.ts",
+      "line": 214,
+      "claim": "New evidence beyond the previously deferred non-Linux PID-reuse issue is that Linux also ignores kernel start time and treats any live process with a stale lock's PID as the holder.",
+      "failure_scenario": "A Linux holder is killed after writing its compatibility file, its PID 4242 is later reused by an unrelated long-running process, and a new MCP instance binds the now-free abstract socket; pidAlive(4242) returns true, so acquireCredential() closes its claim, refuses all vault tools, and identifies the unrelated process as the holder.",
+      "suggested_direction": "Record and validate the Linux kernel process start time when interpreting compatibility metadata, using the per-run token only as the file-release ownership guard rather than as a replacement for process-incarnation validation."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "src/lock.ts",
+      "line": 250,
+      "claim": "Contrary to the earlier rejected slug-collision concern, the shown implementation no longer compares raw agent names and therefore treats a live PID in a shared slugged filename as belonging to every colliding agent.",
+      "failure_scenario": "Start agent \"Team A\", which writes mcp-Team_A.lock, and then start distinct credential \"Team?A\"; the second process successfully binds its distinct digest-based address but reads Team A's live PID from the shared file, closes its address, and exposes no vault tools even though its own credential is free.",
+      "suggested_direction": "Retain the compatibility filename but carry the raw agent identity through readCompatFile() and avoid treating metadata explicitly naming a different raw agent as this credential's holder, while defining conservative handling for genuinely ambiguous legacy files."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "src/lock.ts",
+      "line": 78,
+      "claim": "If no unshown onboarding validation caps WUNDERVAULT_AGENT_NAME, the compatibility filename remains unbounded even though the socket address was bounded.",
+      "failure_scenario": "On an ext4-style filesystem with a 255-byte filename limit, set WUNDERVAULT_AGENT_NAME to 500 ASCII characters and leave the credential free; the address binds successfully, but writeCompatFile() receives ENAMETOOLONG for mcp-<500 characters>.lock, closes the claim, and serves only the held notice.",
+      "suggested_direction": "Establish and enforce a supported agent-name byte limit before startup, or define a bounded compatibility-path strategy and migration that does not cause older copies to ignore the lock."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The abstract socket name and TCP port are machine-global but include neither the user ID nor the home-directory identity.",
+      "why_it_matters": "On a multi-user host, two users with independent vault homes and the same agent name exclude each other; the blocked user can also query the other user's PID, agent name, and connection time through the unauthenticated holder banner."
+    },
+    {
+      "id": "B2",
+      "concern": "askHolder() appends received data to an unbounded string until it sees a newline or its one-second timer fires.",
+      "why_it_matters": "An unrelated or hostile local listener owning the selected address can stream data without a newline and create substantial memory pressure or crash the MCP process during startup or a vault_status call."
+    }
+  ],
+  "_meta": {
+    "round": 4,
+    "at": "2026-09-09T01:57:05+00:00",
+    "package_bytes": 49088,
+    "schema_problems": []
+  }
+}

@@ -1,0 +1,25 @@
+{"round": 2, "decisions": [
+  {"id": "F1", "action": "fixed",
+   "claim": "On a non-Linux host with no lock file, A and B both call currentHolder before either writes, both see nothing, and both serve all vault tools.",
+   "reason": "Confirmed, and not patchable in place — the whole design inferred the answer from /proc and then did check-then-write, which is a race by construction. Replaced the mechanism: the credential is now claimed by BINDING A SOCKET, which the kernel makes atomic, so there is no window between checking and taking, on any platform."},
+
+  {"id": "F3", "action": "fixed",
+   "claim": "Under hidepid or a sandbox, /proc/self is readable but peers are not; with the lock file deleted, the scan sees nothing and a second process serves alongside the holder.",
+   "reason": "Confirmed. Same root cause as F1 — arbitration was inference. Binding needs no visibility into other processes at all, so a hardened /proc no longer weakens it. On Linux the socket is in the ABSTRACT namespace, which has no filesystem entry, so the delete-the-lock leak cannot exist rather than being defended against."},
+
+  {"id": "F2", "action": "fixed",
+   "claim": "A stale lock names a PID the kernel later reuses; the reusing process excludes itself from peers while an older contender blocks on its PID, and neither serves.",
+   "reason": "Confirmed against the old logic. Mutual deadlock is gone with the PID reasoning that caused it — the kernel releases the socket on death, including SIGKILL, so there is no such thing as a stale claim to resolve. Covered by a test that kills a holder and takes the credential afterwards."},
+
+  {"id": "F4", "action": "rejected",
+   "claim": "A reparented (PPID 1) holder yields no parent hint, so the blocked user gets no way to identify the owning session.",
+   "reason": "Accurate but not a defect. PID and connection time are still reported and are enough to find the process; naming init would identify nothing. Deliberately not falling back to the parent's argv, which is where a useful-looking hint would have to come from and which can contain tokens — that was blocker F4 in round 1."},
+
+  {"id": "B1", "action": "fixed",
+   "claim": "PID plus /proc start ticks are not unique across reboots, while held-marker files survive an unclean one.",
+   "reason": "Both the start-tick identity and the marker files are gone with the rewrite. Nothing about the claim now survives a reboot: an abstract socket exists only while its process does."},
+
+  {"id": "B2", "action": "fixed",
+   "claim": "Held-mode markers are predictable files, and any same-UID process could write one to make a real holder look like it is serving nothing.",
+   "reason": "Correct, and a genuine forgery path — a marker was trusted on evidence an attacker could reproduce from public /proc data. Markers are deleted entirely; a blocked instance now binds nothing and so cannot block anyone, which is what the markers existed to work around."}
+]}

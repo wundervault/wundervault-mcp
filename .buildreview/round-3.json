@@ -1,0 +1,149 @@
+{
+  "verdict": "revise",
+  "summary": "The build replaces Linux lock arbitration with an atomic abstract socket and correctly keeps blocked MCP sessions connected with only a diagnostic tool. It does not yet hold up across the required non-Linux path, compatibility-file failures, or exact-incarnation release semantics, and those gaps can either permit two live servers or refuse a free credential.",
+  "spec_check": [
+    {
+      "requirement": "A second instance under the same agent name never gets vault tools while a first live instance holds the credential.",
+      "status": "partial",
+      "evidence": "Atomic abstract-socket binding enforces this between new Linux instances, but a failed compatibility-file write allows an older build to start alongside the new holder, and a non-Linux filesystem socket can be unlinked while still bound."
+    },
+    {
+      "requirement": "Deleting the lock file while a live holder is running does NOT let a second instance serve vault tools.",
+      "status": "met",
+      "evidence": "The compatibility lock file is no longer used to arbitrate new instances; the held socket remains bound after the .lock file is removed, as covered by the supplied test."
+    },
+    {
+      "requirement": "releaseLock() removes the lock file only when this exact process incarnation owns it \u2014 identity is (pid, kernel start time). A refused instance, a recycled PID, or an unrelated process must not be able to unlink a live holder's lock.",
+      "status": "unmet",
+      "evidence": "releaseCredential() checks only compat.pid === process.pid, and neither reads nor compares a kernel start time."
+    },
+    {
+      "requirement": "Two instances starting simultaneously resolve deterministically: exactly one serves the vault, and it is never the case that both do OR that both stand down.",
+      "status": "partial",
+      "evidence": "Atomic bind provides deterministic new-to-new arbitration on Linux, but the non-Linux probe-then-unlink recovery can detach one contender's newly bound pathname and let the other contender bind it too."
+    },
+    {
+      "requirement": "A blocked instance completes the MCP initialize handshake and stays connected. It must NOT exit during the handshake.",
+      "status": "met",
+      "evidence": "serveHeldNotice() creates an MCP Server, connects a StdioServerTransport, and exits only when stdin ends."
+    },
+    {
+      "requirement": "A blocked instance advertises NO vault tools. Any vault tool call returns an error explaining the credential is held. It exposes exactly one diagnostic tool, vault_status, which re-checks live state rather than replaying a startup snapshot.",
+      "status": "partial",
+      "evidence": "ListTools exposes only vault_status and other calls return isError, but when the credential remains occupied after holder turnover the response reuses the startup Holder object rather than identifying the current holder."
+    },
+    {
+      "requirement": "The refusal message identifies the holder well enough to act on: PID, start time, and a hint at the owning session.",
+      "status": "partial",
+      "evidence": "PID, a wall-clock since value, and Linux parent information are read from the compatibility file when available; if that advisory file was deleted or could not be written, the message degrades to only 'another process on this machine'."
+    },
+    {
+      "requirement": "Lock file line 1 remains a bare PID. Older builds of this package parse the file with parseInt and treat NaN as \"no lock\" \u2014 a pure-JSON file would make every older copy on the box ignore the lock and start alongside a live holder. Metadata is line 2 JSON.",
+      "status": "partial",
+      "evidence": "writeCompatFile() writes a bare PID followed by JSON metadata, but silently ignores write failures and continues serving without the marker older copies require."
+    },
+    {
+      "requirement": "Nothing regresses on the normal path: a free credential yields all six vault tools and a working vault_entries_list, and a clean exit releases the lock.",
+      "status": "partial",
+      "evidence": "A successful claim invokes the existing createServer() path and installs release handlers, but the excerpt provides no normal-path integration result for the six tools or vault_entries_list."
+    },
+    {
+      "requirement": "Behaviour degrades safely where /proc is unavailable (non-Linux): the file remains the fallback authority; the process must still start and serve when nothing holds it.",
+      "status": "unmet",
+      "evidence": "macOS filesystem-socket recovery has an unsafe probe/unlink race, and socketAddress() supplies an ordinary filesystem path on Windows rather than a documented Windows named-pipe path."
+    },
+    {
+      "requirement": "No secret, token, or credential value is written to stderr, the lock file, or any tool response by this change.",
+      "status": "met",
+      "evidence": "The new outputs contain agent identity, PID/timing/version metadata, and parent comm only; describeParent deliberately avoids argv and no credential value is read or emitted."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/lock.ts",
+      "line": 168,
+      "claim": "The non-Linux filesystem-socket design can leave two live processes holding the same credential because its pathname can be removed while bound and stale recovery performs a non-atomic probe-then-unlink.",
+      "failure_scenario": "On macOS, process A is listening; either an operator deletes mcp-<slug>.sock, or process B has already received a failed probe for an old socket just before A replaces it. Once the pathname is absent or B unlinks A's newly bound pathname, B binds the same path while A's detached listening socket remains alive, so both processes proceed to serve vault tools.",
+      "suggested_direction": "Use an arbitration primitive whose live claim cannot be detached by unlinking, or make non-Linux ownership and stale replacement atomic rather than deciding from a prior connection probe."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/lock.ts",
+      "line": 73,
+      "claim": "The Windows branch uses a regular home-directory path as a net IPC address instead of a Windows named-pipe address, so an otherwise free credential can fail binding and be treated as held.",
+      "failure_scenario": "On Windows with no MCP holder, socketAddress() returns a path such as C:\\Users\\alice\\.wundervault\\mcp-Claude.sock; if Node rejects it because Windows IPC requires a named-pipe namespace, tryBind returns error and index.ts starts held-notice mode with no vault tools.",
+      "suggested_direction": "Give Windows a platform-valid named-pipe address and test acquisition, contention, crash release, and status probing on an actual Windows runtime."
+    },
+    {
+      "id": "F3",
+      "severity": "blocker",
+      "file": "src/lock.ts",
+      "line": 142,
+      "claim": "A successful socket claimant serves even when writing the compatibility lock file fails, allowing an older package copy to ignore the live holder.",
+      "failure_scenario": "If ~/.wundervault is read-only, missing, or out of space, a new Linux instance binds the abstract socket, writeCompatFile() silently catches the failure, and serves all vault tools; a frozen older copy then sees no parseable lock file and also serves the same credential.",
+      "suggested_direction": "Treat inability to publish and verify the compatibility marker as a failed claim while older pidfile-only copies remain supported."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "src/lock.ts",
+      "line": 194,
+      "claim": "releaseCredential() authorizes lock-file deletion using only a PID match rather than the required PID and kernel-start-time process incarnation.",
+      "failure_scenario": "If the compatibility file is replaced or restored with line 1 equal to the current process PID but metadata belonging to a different incarnation, releaseCredential() unlinks it solely because the numeric PID matches, despite the file not representing this process incarnation.",
+      "suggested_direction": "Record the holder's kernel start identity and require both PID and that identity to match the values retained by the acquiring process before unlinking."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "src/index.ts",
+      "line": 99,
+      "claim": "vault_status rechecks only whether the credential is occupied and replays the startup holder details even when a different process now holds it.",
+      "failure_scenario": "Process A holds the credential and B enters held mode with A's Holder snapshot; A exits and process C acquires before B calls vault_status. credentialIsFree() correctly returns false, but B reports that A's PID, start time, and parent currently hold the credential instead of reporting C.",
+      "suggested_direction": "Obtain fresh holder metadata as part of the status check and avoid claiming stale identity details are current when only occupancy is known."
+    },
+    {
+      "id": "F6",
+      "severity": "major",
+      "file": "src/index.ts",
+      "line": 55,
+      "claim": "After the compatibility lock file is deleted or cannot be read, a blocked instance cannot provide the required PID, start time, or owning-session hint.",
+      "failure_scenario": "Process A acquires normally, an operator deletes only mcp-Claude.lock, and process B is refused by A's still-bound abstract socket. currentHolderInfo() returns all null fields, so stderr, instructions, and vault_status identify the holder only as 'another process on this machine'.",
+      "suggested_direction": "Make holder diagnostics available through a channel that survives compatibility-file deletion, while ensuring the metadata cannot be used as the arbitration authority."
+    },
+    {
+      "id": "F7",
+      "severity": "minor",
+      "file": "src/lock.ts",
+      "line": 73,
+      "claim": "New evidence invalidates the earlier slug-collision mitigation: because the raw-name /proc comparison was deleted and the socket itself is keyed only by slug, distinct agent names with the same slug now exclude each other.",
+      "failure_scenario": "With WUNDERVAULT_AGENT_NAME='Team A', one process binds the socket for slug Team_A; a second process using the distinct credential name 'Team?A' receives EADDRINUSE and exposes no vault tools even though the one-per-credential rule permits both agents to run.",
+      "suggested_direction": "Preserve the legacy slugged pidfile for compatibility while using a collision-resistant representation of the raw agent name for the new socket address."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "Any local process able to bind the predictable abstract socket or filesystem socket can impersonate occupancy without being an MCP server.",
+      "why_it_matters": "A same-host user or compromised process can indefinitely deny vault access and produce an unhelpful generic-holder diagnostic without possessing any credential."
+    },
+    {
+      "id": "B2",
+      "concern": "Unix-domain socket address limits are not handled or tested for long agent names or long home-directory paths.",
+      "why_it_matters": "A valid but long agent name on Linux, or a long home path on macOS, can make listen fail with an address-length error; the server then reports the credential as held instead of explaining that its lock address is invalid."
+    },
+    {
+      "id": "B3",
+      "concern": "The test suite exercises the imported lock module repeatedly in one process and Linux cross-process behavior, but does not exercise full MCP initialization, tool listing, arbitrary tool rejection, or holder turnover.",
+      "why_it_matters": "Protocol-level regressions such as a failed initialize handshake, incorrect tool schema behavior, or stale vault_status attribution can pass all twelve supplied lock tests."
+    }
+  ],
+  "_meta": {
+    "round": 3,
+    "at": "2026-09-09T01:19:19+00:00",
+    "package_bytes": 41394,
+    "schema_problems": []
+  }
+}

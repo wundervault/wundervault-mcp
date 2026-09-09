@@ -1,0 +1,37 @@
+{"round": 1, "decisions": [
+  {"id": "F1", "action": "fixed",
+   "claim": "A holder launched as `node dist/index.js` matches no recognition pattern, so the scan misses it, the file check is skipped, and a second instance serves the vault concurrently. Same for an unreadable /proc/<pid>/environ.",
+   "reason": "Confirmed, and my own earlier fail-closed patch did not cover it — it still trusted a cmdline verdict of `false`. Rewrote the file path to identify the holder by START TOKEN instead of by command line: the lock records the writer's incarnation, so a match proves that process still holds it and only a genuine mismatch proves PID reuse. Legacy plain-PID files have no token and now fail closed. Scan pattern also broadened to cover `dist/index.js`."},
+
+  {"id": "F2", "action": "deferred",
+   "claim": "Delete the lock file, start a frozen OLDER copy of the package, and it starts alongside a live holder because it has no process scan.",
+   "reason": "True and unfixable from inside this repo — an old build cannot be taught to scan. Explicitly out of scope per the spec (frozen copies are not being rebuilt), but it means the invariant is only restored box-wide once Byte's copy in ~/.openclaw/workspace/node_modules is updated. Raised to the user as a real remaining gap, not closed."},
+
+  {"id": "F3", "action": "fixed",
+   "claim": "Two processes born in the same kernel tick both find no older peer (strict `<` on equal values) and both proceed into serveVault().",
+   "reason": "Confirmed — the tiebreak was not a total order. Now compares (start, pid); PIDs are unique among live processes, so exactly one side can win."},
+
+  {"id": "F4", "action": "fixed",
+   "claim": "procParent() copies up to 120 chars of the parent's raw command line into stderr, MCP instructions and tool responses, which can carry a token.",
+   "reason": "Confirmed. I found this independently while round 1 was still running and had already cut it back to parent PID + executable basename before the verdict arrived. Verified live: the hint now reads `1596878 (claude)`."},
+
+  {"id": "F5", "action": "fixed",
+   "claim": "If the file records a start token but procStart(process.pid) returns null, the mismatch guard is skipped and releaseLock() unlinks on a bare PID match.",
+   "reason": "Confirmed. Failing to read our own start time is not proof of ownership; it now refuses to unlink. Files with no recorded token (non-Linux) still release normally, so no lock leak there."},
+
+  {"id": "F6", "action": "fixed",
+   "claim": "Held-mode processes are themselves live instances, so they block a credential nobody holds; and vault_status appends the stale startup description to a fresh re-check, naming two different holders at once.",
+   "reason": "Both confirmed. (a) vault_status now builds its message from the holder it just re-checked. (b) Held-mode processes write a marker file recording (pid, start token) and the scan skips them. A leaked marker cannot vouch for a PID-reusing process because the start token will not match, so the unsafe direction still fails closed. Verified live: with a real holder plus two held processes, a third correctly names the real holder."},
+
+  {"id": "B2", "action": "rejected",
+   "claim": "Agent names 'Team A' and 'Team?A' both slug to mcp-Team_A.lock and can clobber each other's lock.",
+   "reason": "Real but not fixable under this spec's compatibility constraint: changing the filename breaks every older copy on the box that reads mcp-<slug>.lock, which is a strictly worse failure. Impact is now small because arbitration is by process and the scan compares the RAW agent name from environ, not the slug. Documented, not changed."},
+
+  {"id": "B1", "action": "deferred",
+   "claim": "Containers with disjoint /proc views sharing one home directory cannot be disambiguated by a host-local (pid, start) pair.",
+   "reason": "Correct, and out of scope — no such deployment exists here. Worth recording as a known boundary of the design rather than pretending the lock is namespace-safe."},
+
+  {"id": "B3", "action": "deferred",
+   "claim": "On non-Linux there is no incarnation evidence, so a stale lock naming a reused PID refuses forever and points at the wrong process.",
+   "reason": "Accurate. Mitigated in practice by fix 2 of this build: the refusal is now legible and names the PID, so an operator can see it is wrong and delete the lock, instead of staring at CONNECTION_CLOSED. A real fix needs a non-/proc incarnation source; noted, not built."}
+]}

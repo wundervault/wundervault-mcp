@@ -1,0 +1,117 @@
+{
+  "verdict": "revise",
+  "summary": "The build substantially improves the normal Linux path: blocked clients complete MCP initialization, expose only a live vault_status diagnostic, and lock ownership uses PID plus kernel start time. It still has a non-Linux race that can give two processes vault tools, fails open when a Linux process scan is inconclusive after lock deletion, and can make all simultaneous contenders stand down when a stale lock PID has been recycled.",
+  "spec_check": [
+    {
+      "requirement": "1. A second instance under the same agent name never gets vault tools while a first live instance holds the credential.",
+      "status": "partial",
+      "evidence": "On readable Linux /proc, findLiveInstances identifies same-agent processes independently of the lock file and currentHolder blocks the younger process. On non-Linux simultaneous starts and on an inconclusive Linux scan with a missing lock, currentHolder can return null in both processes."
+    },
+    {
+      "requirement": "2. Deleting the lock file while a live holder is running does NOT let a second instance serve vault tools.",
+      "status": "partial",
+      "evidence": "The Linux process scan normally preserves enforcement after deletion, but findLiveInstances converts unreadable process data or a failed /proc enumeration into an empty result; with the lock deleted, currentHolder then reports the credential free."
+    },
+    {
+      "requirement": "3. releaseLock() removes the lock file only when this exact process incarnation owns it \u2014 identity is (pid, kernel start time). A refused instance, a recycled PID, or an unrelated process must not be able to unlink a live holder's lock.",
+      "status": "met",
+      "evidence": "Vault-mode exit handlers are installed only after acquisition, held-mode processes install only marker cleanup, and releaseLock compares both the recorded PID and, when present, the recorded start token against procStart before unlinking."
+    },
+    {
+      "requirement": "4. Two instances starting simultaneously resolve deterministically: exactly one serves the vault, and it is never the case that both do OR that both stand down.",
+      "status": "unmet",
+      "evidence": "The Linux process election uses a total order over start token and PID, but the non-Linux fallback performs a non-atomic check followed by writeLock, allowing both contenders to serve. Separately, the established-owner lookup compares only PID, so a recycled stale lock PID can cause both contenders to enter held mode."
+    },
+    {
+      "requirement": "5. A blocked instance completes the MCP initialize handshake and stays connected. It must NOT exit during the handshake.",
+      "status": "met",
+      "evidence": "serveHeldNotice creates a Server, connects StdioServerTransport, and exits only on stdin end or termination signals."
+    },
+    {
+      "requirement": "6. A blocked instance advertises NO vault tools. Any vault tool call returns an error explaining the credential is held. It exposes exactly one diagnostic tool, vault_status, which re-checks live state rather than replaying a startup snapshot.",
+      "status": "met",
+      "evidence": "The held-mode ListTools handler returns only vault_status, all other CallTool requests return isError, and vault_status invokes currentHolder for each request."
+    },
+    {
+      "requirement": "7. The refusal message identifies the holder well enough to act on: PID, start time, and a hint at the owning session.",
+      "status": "partial",
+      "evidence": "describeHolder always includes PID and conditionally includes since and parent. A process reparented to PID 1 receives no parent hint because procParent returns null for PPID 1."
+    },
+    {
+      "requirement": "8. Lock file line 1 remains a bare PID. Older builds of this package parse the file with parseInt and treat NaN as \"no lock\" \u2014 a pure-JSON file would make every older copy on the box ignore the lock and start alongside a live holder. Metadata is line 2 JSON.",
+      "status": "met",
+      "evidence": "writeLock writes the decimal PID followed by a newline and JSON metadata, and the lock-format test verifies the first line with parseInt."
+    },
+    {
+      "requirement": "9. Nothing regresses on the normal path: a free credential yields all six vault tools and a working vault_entries_list, and a clean exit releases the lock.",
+      "status": "met",
+      "evidence": "The free path still uses createServer, installs stdin and signal cleanup handlers, and calls releaseLock on clean termination; the package reports successful live verification and no new normal-path test failures."
+    },
+    {
+      "requirement": "10. Behaviour degrades safely where /proc is unavailable (non-Linux): the file remains the fallback authority; the process must still start and serve when nothing holds it.",
+      "status": "partial",
+      "evidence": "A single free process starts and writes the fallback file, and a later process observes that file. The fallback does not provide atomic acquisition, so two processes that both check before either writes can both serve."
+    },
+    {
+      "requirement": "11. No secret, token, or credential value is written to stderr, the lock file, or any tool response by this change.",
+      "status": "met",
+      "evidence": "The new outputs contain agent name, PID, timestamps, version, and parent PID/executable name; procParent deliberately avoids exposing argv, and no vault value is included."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/lock.ts",
+      "line": null,
+      "claim": "When /proc is unavailable, lock acquisition is a non-atomic check followed by an ordinary overwriting write, so simultaneous starters can both enter vault mode.",
+      "failure_scenario": "On macOS or another non-Linux host with no existing lock, processes A and B both call currentHolder before either reaches writeLock; both see no peers and no file, both receive null, both overwrite the same lock file, and both continue through createServer with all vault tools.",
+      "suggested_direction": "Use an atomic file-based acquisition and arbitration protocol on the fallback path, require exactly one contender to own it before serving, and fail closed if ownership cannot be established or persisted."
+    },
+    {
+      "id": "F2",
+      "severity": "major",
+      "file": "src/lock.ts",
+      "line": null,
+      "claim": "The established-owner branch matches the lock file to a peer by PID without comparing the recorded and live start tokens, allowing a stale recycled-PID lock to make every contender stand down.",
+      "failure_scenario": "A stale lock records PID B with an old start token, the kernel later reuses PID B for contender B, and an older contender A starts concurrently; A sees B's PID in the lock and blocks without noticing the token mismatch, while B excludes itself from peers, sees older A, and also blocks, so neither process serves despite acceptance check 4 requiring exactly one winner.",
+      "suggested_direction": "Treat a peer as the established file owner only after validating that the lock metadata start token matches that peer's current kernel start token; otherwise disregard the stale ownership claim and use the total process order."
+    },
+    {
+      "id": "F3",
+      "severity": "blocker",
+      "file": "src/lock.ts",
+      "line": null,
+      "claim": "Unreadable or failed Linux process inspection is collapsed into \u201cno peers,\u201d so deletion of the lock file can make an indeterminate state fail open.",
+      "failure_scenario": "A live same-agent holder is serving, its lock file is deleted, and a sandbox or process protection allows /proc/self/stat but denies enumeration or reading the holder's cmdline or environ; findLiveInstances returns an empty list, readLock finds no file, currentHolder returns null, and the second process serves vault tools alongside the holder.",
+      "suggested_direction": "Represent process-scan uncertainty separately from a confirmed empty scan and refuse vault mode whenever relevant /proc enumeration or identification cannot be completed, while retaining the specified file-only behavior on platforms where /proc is wholly unavailable."
+    },
+    {
+      "id": "F4",
+      "severity": "minor",
+      "file": "src/lock.ts",
+      "line": null,
+      "claim": "A holder whose parent has exited or is PID 1 produces a refusal without the required owning-session hint.",
+      "failure_scenario": "A supervisor launches the MCP process and it is reparented to PID 1; procParent returns null because PPID is at most 1, so describeHolder emits only PID and start information and the blocked user receives no hint identifying the owning session.",
+      "suggested_direction": "Provide a safe fallback session hint when parent information is unavailable, using non-secret process or supervisor metadata rather than full command-line arguments."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "PID plus /proc start ticks is not unique across host reboots because the start counter resets, while held-marker files survive an unclean reboot.",
+      "why_it_matters": "A service started in a repeatable boot sequence can receive the same PID and start tick as a pre-reboot held process; the stale marker will then be accepted as belonging to the new incarnation, and after lock deletion scanners can skip a real vault-serving holder and admit a second one."
+    },
+    {
+      "id": "B2",
+      "concern": "Held-mode markers are ordinary predictable files, and matching PID/start data proves process identity but does not independently prove that the process is actually in held mode.",
+      "why_it_matters": "Any same-UID process able to write in ~/.wundervault can read a serving holder's public /proc start token, create the matching marker, and remove the lock; subsequent instances will skip the real holder and can serve concurrently, so the marker directory's ownership and integrity are now part of the security boundary."
+    }
+  ],
+  "_meta": {
+    "round": 2,
+    "at": "2026-09-09T00:09:27+00:00",
+    "package_bytes": 42107,
+    "schema_problems": []
+  }
+}
