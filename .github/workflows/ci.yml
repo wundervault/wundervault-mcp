@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['20', '22']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+  # The repo mirrors the installer so a customer can diff it against the served copy.
+  # installer/README.md tells them to refuse BOTH files if the two differ, so a stale
+  # mirror turns careful users away — fail the build instead of finding out from them.
+  installer-mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repo mirror must match wundervault.com/onboard
+        run: |
+          curl -fsSL https://wundervault.com/onboard -o served.py
+          diff served.py installer/onboard.py
+      - name: Committed signature must verify over the committed installer
+        run: |
+          python3 -m pip install --quiet pynacl
+          python3 - <<'PY'
+          import base64
+          from nacl.signing import VerifyKey
+          key = VerifyKey(base64.b64decode('3yhfVM5ABcBHPGSuZSQuIxr0C9QkHnFKoGMWwcWpooY='))
+          data = open('installer/onboard.py','rb').read()
+          sig = base64.b64decode(open('installer/onboard.py.sig').read().strip())
+          key.verify(data, sig)
+          print('installer signature OK')
+          PY

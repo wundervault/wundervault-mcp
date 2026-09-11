@@ -4,6 +4,26 @@ import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
+/**
+ * A pid that is genuinely not running.
+ *
+ * 999999 was hardcoded here as "obviously dead", but pid_max on Linux is commonly
+ * 4194304 and a busy box hands out pids well above a million — so that pid is
+ * sometimes a LIVE process, the lock correctly refuses to steal it, and the test
+ * fails perhaps one run in ten. Find a free one instead of assuming.
+ */
+function deadPid(): number {
+  for (let p = 999999; p > 90000; p--) {
+    try {
+      process.kill(p, 0);   // it exists (or we lack permission) — keep looking
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ESRCH') return p;
+    }
+  }
+  throw new Error('could not find an unused pid for the test');
+}
+
+
 // A unique agent name per run: the Linux abstract socket namespace is
 // machine-global, so a test must never claim the name a real agent uses.
 const AGENT = `TestAgent_${process.pid}_${Date.now()}`;
@@ -21,8 +41,8 @@ beforeEach(async () => {
   lock = await import('../src/lock.js');
 });
 
-afterEach(() => {
-  lock.releaseCredential();
+afterEach(async () => {
+  await lock.releaseCredential();
   (os as any).homedir = realHomedir;
   if (realAgent === undefined) delete process.env.WUNDERVAULT_AGENT_NAME;
   else process.env.WUNDERVAULT_AGENT_NAME = realAgent;
@@ -43,7 +63,7 @@ describe('acquiring the credential', () => {
 
   it('grants it again after release', async () => {
     await lock.acquireCredential('9.9.9');
-    lock.releaseCredential();
+    await lock.releaseCredential();
     expect((await lock.acquireCredential('9.9.9')).ok).toBe(true);
   });
 
@@ -59,7 +79,7 @@ describe('acquiring the credential', () => {
   it('reports the credential as taken while held, and free once released', async () => {
     await lock.acquireCredential('9.9.9');
     expect(await lock.credentialIsFree()).toBe(false);
-    lock.releaseCredential();
+    await lock.releaseCredential();
     expect(await lock.credentialIsFree()).toBe(true);
   });
 });
@@ -87,8 +107,9 @@ describe('compatibility lock file', () => {
 
   it('releases only a file this process owns', async () => {
     await lock.acquireCredential('9.9.9');
-    writeFileSync(lock.lockFilePath(), '999999\n{"pid":999999}\n');
-    lock.releaseCredential();
+    const dead = deadPid();
+    writeFileSync(lock.lockFilePath(), `${dead}\n${JSON.stringify({ pid: dead })}\n`);
+    await lock.releaseCredential();
     expect(existsSync(lock.lockFilePath())).toBe(true);
   });
 });
@@ -180,14 +201,14 @@ describe('release guard', () => {
       lock.lockFilePath(),
       `${process.pid}\n${JSON.stringify({ pid: process.pid, token: 'someone-elses-token' })}\n`,
     );
-    lock.releaseCredential();
+    await lock.releaseCredential();
     expect(existsSync(lock.lockFilePath())).toBe(true);
   });
 
   it('does not remove a legacy tokenless lock file', async () => {
     await lock.acquireCredential('9.9.9');
     writeFileSync(lock.lockFilePath(), String(process.pid));
-    lock.releaseCredential();
+    await lock.releaseCredential();
     expect(existsSync(lock.lockFilePath())).toBe(true);
   });
 });
@@ -293,7 +314,7 @@ describe('mixed-version safety', () => {
   });
 
   it('ignores an older-build lock whose process is gone', async () => {
-    writeFileSync(lock.lockFilePath(), '999999\n');
+    writeFileSync(lock.lockFilePath(), `${deadPid()}\n`);
     expect((await lock.acquireCredential('9.9.9')).ok).toBe(true);
   });
 });

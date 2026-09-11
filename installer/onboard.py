@@ -629,19 +629,23 @@ WantedBy=default.target
 
     # ── Multi-agent isolation note ─────────────────────────────────────────────
     print(f'Note: WUNDERVAULT_AGENT_NAME must match this agent\'s name exactly ("{creds["agent_name"]}").')
-    print("Each agent framework (Claude Code, OpenClaw, Hermes, etc.) has its own MCP config file.")
+    print("Each agent framework (Claude Code, Grok Build, OpenClaw, Hermes, etc.) has its own MCP config file.")
     print("Update YOUR framework's config — not another agent's.")
     print()
 
     # ── Config file location table ─────────────────────────────────────────────
     print("Common MCP config file locations:")
     print("  Claude Code  ~/.claude.json                           → mcpServers")
+    print("  Grok Build   ~/.grok/mcp.json                         → servers")
     print("  OpenClaw     ~/.openclaw/openclaw.json                → mcp.servers")
     print("  Hermes       ~/.hermes/config.yaml                    → mcp_servers")
     print("  Windsurf     ~/.codeium/windsurf/mcp_config.json      → mcpServers")
     print()
     print("After updating config:")
     print("  Claude Code — picks up changes automatically, no restart needed")
+    print("  Grok Build  — or skip the file: grok mcp add wundervault \\")
+    print("                  --command wundervault-mcp --env WUNDERVAULT_AGENT_NAME=<name>")
+    print("                then verify with: grok mcp test wundervault")
     print("  Hermes      — run: hermes gateway restart")
     print("  OpenClaw    — run: systemctl --user restart openclaw-gateway")
     print("  Windsurf    — restart from the application menu")

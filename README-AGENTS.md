@@ -12,23 +12,8 @@ Add to `~/.claude/desktop_config.json` (or your Claude Code MCP config):
     "wundervault": {
       "command": "wundervault-mcp",
       "env": {
-        "WUNDERVault_AGENT_VAULT_URL": "https://wundervault.com",
-        "WUNDERVault_AGENT_VAULT_API_KEY": "wv_agent_<AGENT_ID>|<KEY_SUFFIX>",
-        "WUNDERVault_AGENT_KEY": "<BASE64_ENCRYPTION_KEY>"
+        "WUNDERVAULT_AGENT_NAME": "<agent-name>"
       }
-    }
-  }
-}
-```
-
-Or using a credentials file:
-
-```json
-{
-  "mcpServers": {
-    "wundervault": {
-      "command": "wundervault-mcp",
-      "args": ["--credentials", "/home/user/.wundervault/creds.json"]
     }
   }
 }
@@ -44,8 +29,7 @@ Add to `.cursor/mcp.json` in your project (or `~/.cursor/mcp.json` globally):
     "wundervault": {
       "command": "wundervault-mcp",
       "env": {
-        "WUNDERVault_AGENT_VAULT_API_KEY": "wv_agent_<AGENT_ID>|<KEY_SUFFIX>",
-        "WUNDERVault_AGENT_KEY": "<BASE64_ENCRYPTION_KEY>"
+        "WUNDERVAULT_AGENT_NAME": "<agent-name>"
       }
     }
   }
@@ -62,8 +46,7 @@ wundervault_server = MCPServerStdio(
     params={
         "command": "wundervault-mcp",
         "env": {
-            "WUNDERVault_AGENT_VAULT_API_KEY": "wv_agent_<AGENT_ID>|<KEY_SUFFIX>",
-            "WUNDERVault_AGENT_KEY": "<BASE64_ENCRYPTION_KEY>",
+            "WUNDERVAULT_AGENT_NAME": "<agent-name>",
         },
     }
 )
@@ -81,34 +64,34 @@ agent = Agent(
   "mcpServers": {
     "wundervault": {
       "command": "npx",
-      "args": [
-        "@wundervault/mcp-server",
-        "--credentials", "/home/user/.wundervault/creds.json"
-      ]
+      "args": ["@wundervault/mcp-server"],
+      "env": {
+        "WUNDERVAULT_AGENT_NAME": "<agent-name>"
+      }
     }
   }
 }
 ```
 
-## Credentials File Format
+## Where the keys actually come from
 
-Create `~/.wundervault/creds.json`:
+There is no credentials file and no key in your MCP config. `onboard.py` registers
+the agent and starts the local `wundervault-agent` daemon; the daemon holds the API
+key and the encryption key and hands them to the MCP server over a unix socket at
+`~/.wundervault/agents/<name>.sock`, authenticated with the agent token in
+`~/.wundervault/agents/<name>.token`.
 
-```json
-{
-  "agent_vault_url": "https://wundervault.com",
-  "agent_vault_api_key": "wv_agent_<AGENT_ID>|<KEY_SUFFIX>",
-  "agent_encryption_key": "<BASE64_URL_SAFE_32_BYTES>"
-}
-```
-
-Set permissions: `chmod 600 ~/.wundervault/creds.json`
+All your config has to say is which agent this is.
 
 ## Environment Variables Reference
 
 | Variable | Description |
 |---|---|
-| `WUNDERVault_AGENT_VAULT_URL` | API base URL (default: `https://wundervault.com`) |
-| `WUNDERVault_AGENT_VAULT_API_KEY` | Agent API key (`wv_agent_<ID>\|<HMAC>`) |
-| `WUNDERVault_AGENT_KEY` | Base64 URL-safe encryption key (32 bytes) |
-| `WUNDERVault_CREDENTIALS_FILE` | Explicit path to credentials JSON file |
+| `WUNDERVAULT_AGENT_NAME` | **Required.** Which registered agent this process is. |
+| `WUNDERVAULT_AGENT_TOKEN` | Optional. Overrides the token file above. |
+| `WUNDERVAULT_MOCK` | Optional. `1` returns labelled demo output and touches no real secret. |
+
+## CLI Options
+
+`--url <url>` overrides the API base URL; `--help` prints usage. There are no
+`--api-key`, `--enc-key`, or `--credentials` flags — unknown options are rejected.

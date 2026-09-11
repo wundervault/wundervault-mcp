@@ -9,14 +9,14 @@ import { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.j
 import { parseArgs } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
-import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmdirSync, existsSync as fsExistsSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmdirSync, existsSync as fsExistsSync, statSync } from 'node:fs';
 import net from 'node:net';
 import { AgentVaultAPI } from './api-client.js';
 import { loadEncryptionKey, verifyDirectiveSignature, decryptSecretContent } from './crypto.js';
-import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig } from './exec.js';
+import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey } from './exec.js';
 import { getRecipe, recipeIds } from './recipes.js';
 import type { Credentials, VaultEntry, RemoteHost } from './types.js';
-import { STRIP_FROM_CHILD_ENV, isAllowedInjectPath } from './templates.js';
+import { STRIP_FROM_CHILD_ENV, resolveInjectTarget, writeInjectedLine } from './templates.js';
 import { VERSION } from './version.js';
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -423,11 +423,24 @@ export function createServer(args: { url?: string } = {}) {
           env_key: string;
         };
 
-        if (!isAllowedInjectPath(file_path)) {
+        // A key is interpolated into a config line, so a newline in it writes extra
+        // lines of someone else's choosing. Check before a secret is fetched or burned.
+        if (!isValidEnvKey(env_key)) {
           return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `❌ vault_entry_inject_env: '${file_path}' is not an allowed config file path. Allowed: ~/.npmrc, ~/.netrc, ~/.docker/config.json, and project .env files. Use vault_exec for command execution.` }],
+            content: [{ type: 'text', text: `❌ vault_entry_inject_env: '${String(env_key)}' is not a valid environment variable name (letters, digits and underscore; not starting with a digit).` }],
           });
         }
+
+        // Resolve BEFORE anything else: the allowlist judges a name, and a name
+        // says nothing about where a symlink actually points.
+        const resolved = resolveInjectTarget(file_path);
+        if (!resolved.ok) {
+          return CallToolResultSchema.parse({
+            content: [{ type: 'text', text: `❌ vault_entry_inject_env: ${resolved.error} Use vault_exec for command execution.` }],
+          });
+        }
+        const injectTarget = resolved.target;
+        const safePath = injectTarget.path;
 
         const { allow_env_inject: allowEnvInject } = await api.getProfile();
         if (!allowEnvInject) {
@@ -458,28 +471,15 @@ export function createServer(args: { url?: string } = {}) {
           });
         }
 
-        let lines: string[];
-        try {
-          lines = readFileSync(file_path, 'utf8').split('\n');
-        } catch {
-          lines = [];
+        const written = writeInjectedLine(injectTarget, env_key, plaintext);
+        if (!written.ok) {
+          return CallToolResultSchema.parse({
+            content: [{ type: 'text', text: `❌ vault_entry_inject_env: ${written.error}` }],
+          });
         }
-
-        const newLine = `${env_key}=${plaintext}`;
-        let replaced = false;
-        for (let i = 0; i < lines.length; i++) {
-          if (lines[i].split('=')[0].trim() === env_key) {
-            lines[i] = newLine;
-            replaced = true;
-            break;
-          }
-        }
-        if (!replaced) lines.push(newLine);
-
-        writeFileSync(file_path, lines.join('\n'), 'utf8');
 
         return CallToolResultSchema.parse({
-          content: [{ type: 'text', text: `✅ ${env_key} injected into ${file_path}\nSecret retrieved and burned.` }],
+          content: [{ type: 'text', text: `✅ ${env_key} injected into ${safePath}\nSecret retrieved and burned.` }],
         });
       }
 
@@ -502,6 +502,41 @@ export function createServer(args: { url?: string } = {}) {
           }
         }
 
+        // env_key ends up inside `export <key>='<secret>'` in the remote script, so an
+        // unchecked key is remote command execution. The shell-escape screen above only
+        // looks at `command`. Check both sources before anything is decrypted.
+        for (const [label, k] of [['inject_as.env_key', inject_as?.env_key]] as const) {
+          if (k !== undefined && !isValidEnvKey(k)) {
+            return CallToolResultSchema.parse({
+              content: [{ type: 'text', text: `❌ vault_exec: ${label} '${String(k)}' is not a valid environment variable name (letters, digits and underscore; not starting with a digit).` }],
+            });
+          }
+        }
+
+        // Validate working_dir BEFORE fetching and decrypting: a bad path should not
+        // consume a burn-on-read secret. spawnSync stays the authority — this only
+        // catches the obvious mistakes early. '' would otherwise reach spawnSync as an
+        // empty cwd, which is not the same as "unset".
+        const workingDir = working_dir && working_dir.trim() ? working_dir : undefined;
+        if (workingDir && !remote_host) {
+          if (!path.isAbsolute(workingDir)) {
+            return CallToolResultSchema.parse({
+              content: [{ type: 'text', text: `❌ vault_exec: working_dir must be an absolute path; got '${workingDir}'.` }],
+            });
+          }
+          let wdStat;
+          try { wdStat = statSync(workingDir); } catch {
+            return CallToolResultSchema.parse({
+              content: [{ type: 'text', text: `❌ vault_exec: working_dir '${workingDir}' does not exist.` }],
+            });
+          }
+          if (!wdStat.isDirectory()) {
+            return CallToolResultSchema.parse({
+              content: [{ type: 'text', text: `❌ vault_exec: working_dir '${workingDir}' is not a directory.` }],
+            });
+          }
+        }
+
         // entry_id is optional: omit it to run a remote command using only a vaulted
         // SSH key (no secret injected). Require at least a secret to inject OR an SSH key.
         const hasSshKey = !!(remote_host && (remote_host.ssh_key_entry_id || remote_host.ssh_key));
@@ -515,6 +550,7 @@ export function createServer(args: { url?: string } = {}) {
         let tier = '-';
         let entryName: string | undefined;
         let cfg: { credential_type?: string; env_key?: string; pre_command?: string; post_command?: string; mechanism?: 'env' | 'stdin' | 'askpass'; askpass_var?: string } | undefined = inject_as;
+        let overrideNote = '';
 
         if (entry_id) {
           // Fetch entry to get tier and exec_config
@@ -540,11 +576,33 @@ export function createServer(args: { url?: string } = {}) {
             });
           }
 
-          // Resolve injection config: prefer inject_as, fall back to the entry's exec_config.
+          // Resolve injection config. The entry's exec_config is set by the OWNER in
+          // the dashboard; inject_as is chosen by the CALLING AGENT. Where the owner has
+          // named a delivery channel, that channel is a ceiling, not a default: an agent
+          // asking for `env` must not be able to pull a secret the owner scoped to stdin
+          // into the process environment, where /proc/<pid>/environ and every child can
+          // read it.
+          //
+          // There are two ways to name a channel — credential_type (a recipe) and the
+          // lower-level mechanism escape hatch — and the dispatch below prefers the
+          // former. Pinning BOTH from the server config is what closes the second door:
+          // overriding only credential_type would leave `mechanism` free to weaken
+          // delivery whenever the owner's config used the escape hatch.
+          //
           // Required for LOCAL exec (the point is to inject a secret); OPTIONAL for REMOTE
           // exec, where entry_id may be supplied only to use it as the SSH key without
           // injecting it as an env var.
-          cfg = inject_as ?? coerceExecConfig(secretData.exec_config);
+          const delivery = resolveDeliveryConfig(coerceExecConfig(secretData.exec_config), inject_as);
+          if (!delivery.ok) {
+            return CallToolResultSchema.parse({
+              content: [{ type: 'text', text: `❌ vault_exec: ${delivery.error}` }],
+            });
+          }
+          cfg = delivery.cfg;
+          if (delivery.ignoredOverride) {
+            const { asked, enforced } = delivery.ignoredOverride;
+            overrideNote = `\n⚠️ Requested delivery '${asked}' was ignored: this entry is configured for '${enforced}' by its owner.`;
+          }
           if (!cfg && !remote_host) {
             return CallToolResultSchema.parse({
               content: [{ type: 'text', text: `❌ No injection config. Set exec_config on the vault entry in the dashboard, or provide inject_as in the call.` }],
@@ -553,6 +611,11 @@ export function createServer(args: { url?: string } = {}) {
         }
 
         const envKey = cfg?.env_key ?? '';
+        if (envKey && !isValidEnvKey(envKey)) {
+          return CallToolResultSchema.parse({
+            content: [{ type: 'text', text: `❌ vault_exec: this entry's exec_config sets env_key '${envKey}', which is not a valid environment variable name. Fix it in the dashboard.` }],
+          });
+        }
 
         // Resolve the delivery mechanism from the recipe (credential_type), an
         // advanced override, or the legacy env_key (generic). Callers pick intent,
@@ -653,16 +716,24 @@ export function createServer(args: { url?: string } = {}) {
             }
           }
         } else {
-          const prevDir = process.cwd();
-          if (working_dir) { try { process.chdir(working_dir); } catch { /* ignore */ } }
+          // working_dir is passed per-child rather than via process.chdir(). chdir
+          // moves the WHOLE daemon: a throw between the two calls would strand every
+          // later command in the wrong directory, and the restore was not in a finally.
+          // spawnSync's own cwd has neither problem and needs no restoring. It is
+          // validated up top, before the secret is fetched, so a typo cannot burn one.
           if (mechanism === 'stdin') {
-            execResult = runWithSecretStdin(plaintext, fullCommand, { appendNewline });
+            execResult = runWithSecretStdin(plaintext, fullCommand, { appendNewline, cwd: workingDir });
           } else if (mechanism === 'askpass') {
-            execResult = runWithSecretAskpass(plaintext, fullCommand, { askpassVar: askpassVar as string, wrap });
+            execResult = runWithSecretAskpass(plaintext, fullCommand, { askpassVar: askpassVar as string, wrap, cwd: workingDir });
+          } else if (mechanism === 'env') {
+            execResult = runWithSecret(plaintext, fullCommand, envKey, { cwd: workingDir });
           } else {
-            execResult = runWithSecret(plaintext, fullCommand, envKey);
+            // Unreachable for validated input. Kept as an error rather than a default
+            // so a new mechanism added later cannot quietly deliver over `env`.
+            return CallToolResultSchema.parse({
+              content: [{ type: 'text', text: `❌ vault_exec: unsupported delivery mechanism '${String(mechanism)}'.` }],
+            });
           }
-          if (working_dir) { try { process.chdir(prevDir); } catch { /* ignore */ } }
         }
         const { exitCode, stdout, stderr } = execResult;
 
@@ -679,6 +750,7 @@ export function createServer(args: { url?: string } = {}) {
           `  stdout:  ${(stdout || '(empty)').trim()}`,
         ];
         if (stderr) resultLines.push(`  stderr:  ${stderr.trim()}`);
+        if (overrideNote) resultLines.push(overrideNote);
         resultLines.push(`\nSecret injected and buffer zeroed. Not returned to agent.`);
 
         return CallToolResultSchema.parse({ content: [{ type: 'text', text: resultLines.join('\n') }] });

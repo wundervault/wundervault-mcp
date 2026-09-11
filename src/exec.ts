@@ -27,6 +27,112 @@ export function coerceExecConfig(raw: unknown): ExecConfig | undefined {
   return undefined;
 }
 
+/**
+ * Decide the delivery config for one exec, given the entry's owner-set exec_config
+ * and the calling agent's requested inject_as.
+ *
+ * The owner's channel is a CEILING, not a default. An agent that can name its own
+ * delivery can pull a stdin-only secret into the process environment, where
+ * /proc/<pid>/environ and every child process can read it — which would make the
+ * owner's choice advisory. Two fields can name a channel (credential_type, and the
+ * lower-level mechanism escape hatch); pinning both from the server config is what
+ * stops an agent from dodging the first by using the second.
+ *
+ * Non-delivery fields (env_key, pre/post commands) stay negotiable, with the
+ * owner's value preferred where it is set.
+ */
+/**
+ * An env var name reaches us from the calling agent (inject_as.env_key) or from the
+ * entry's exec_config, and it is INTERPOLATED, not passed as data:
+ *   - runWithSecretRemote builds `export ${key}='<secret>'` and pipes it to a remote
+ *     shell, so a key containing `;` is remote command execution. The shell-escape
+ *     screen upstream only ever inspected `command`, never this,
+ *   - writeInjectedLine builds `${key}=<secret>` as a config line, so a key containing
+ *     a newline writes additional lines of attacker-chosen configuration.
+ * Neither needs a clever payload — a semicolon or a newline is enough. Hold every key
+ * to what a shell environment variable may actually be called.
+ */
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+export function isValidEnvKey(k: unknown): k is string {
+  return typeof k === 'string' && k.length <= 128 && ENV_KEY_RE.test(k);
+}
+
+export const VALID_MECHANISMS = ['env', 'stdin', 'askpass'] as const;
+
+/** A mechanism arrives as opaque JSON from the backend or as an agent argument.
+ *  Anything that is not one of the three real channels is rejected rather than
+ *  allowed to fall through the dispatch — the bottom of that chain is `env`, so an
+ *  unrecognised value would fail open into the least confidential delivery. */
+export function isValidMechanism(m: unknown): m is 'env' | 'stdin' | 'askpass' {
+  return typeof m === 'string' && (VALID_MECHANISMS as readonly string[]).includes(m);
+}
+
+/** Treat blank strings as absent: a dashboard that serialises an unselected recipe
+ *  as "" must not read as "this entry names a channel" — nor, via ??, as a reason to
+ *  discard an owner mechanism sitting right beside it. */
+function present(v: string | undefined): string | undefined {
+  const t = typeof v === 'string' ? v.trim() : undefined;
+  return t ? t : undefined;
+}
+
+export function resolveDeliveryConfig(
+  serverCfg: ExecConfig | undefined,
+  injectAs: ExecConfig | undefined,
+):
+  | { ok: true; cfg: ExecConfig | undefined; ignoredOverride?: { asked: string; enforced: string } }
+  | { ok: false; error: string } {
+  const serverType = present(serverCfg?.credential_type);
+  const serverMech = present(serverCfg?.mechanism);
+  const clientType = present(injectAs?.credential_type);
+  const clientMech = present(injectAs?.mechanism);
+
+  if (serverMech !== undefined && !isValidMechanism(serverMech)) {
+    return { ok: false, error: `This entry's exec_config names an unknown delivery mechanism '${serverMech}'. Valid: ${VALID_MECHANISMS.join(', ')}. Fix it in the dashboard.` };
+  }
+  if (clientMech !== undefined && !isValidMechanism(clientMech)) {
+    return { ok: false, error: `Unknown delivery mechanism '${clientMech}' in inject_as. Valid: ${VALID_MECHANISMS.join(', ')}.` };
+  }
+
+  const serverChannel = serverType ?? serverMech;
+  if (!serverChannel) {
+    // No owner-set channel. The agent may choose, but the owner's other fields still
+    // stand where the agent did not supply its own. Hand back a NORMALISED config
+    // either way: returning serverCfg raw would let a whitespace-only credential_type
+    // that present() just declared absent come back to life as an unknown recipe.
+    if (!serverCfg && !injectAs) return { ok: true, cfg: undefined };
+    return {
+      ok: true,
+      cfg: {
+        ...(injectAs ?? {}),
+        env_key: injectAs?.env_key ?? serverCfg?.env_key,
+        pre_command: injectAs?.pre_command ?? serverCfg?.pre_command,
+        post_command: injectAs?.post_command ?? serverCfg?.post_command,
+        askpass_var: injectAs?.askpass_var ?? serverCfg?.askpass_var,
+        credential_type: undefined,
+        mechanism: clientMech as ExecConfig['mechanism'],
+      },
+    };
+  }
+
+  const cfg: ExecConfig = {
+    ...(injectAs ?? {}),
+    env_key: serverCfg?.env_key ?? injectAs?.env_key,
+    pre_command: serverCfg?.pre_command ?? injectAs?.pre_command,
+    post_command: serverCfg?.post_command ?? injectAs?.post_command,
+    credential_type: serverType,
+    mechanism: serverMech as ExecConfig['mechanism'],
+    askpass_var: serverCfg?.askpass_var ?? injectAs?.askpass_var,
+  };
+
+  // Report on EITHER channel field the agent tried, not just the first one present:
+  // {credential_type: 'sudo', mechanism: 'env'} silently lost its `env` before.
+  const conflicting = [clientType, clientMech].find((a) => a && a !== serverChannel);
+  return conflicting
+    ? { ok: true, cfg, ignoredOverride: { asked: conflicting, enforced: serverChannel } }
+    : { ok: true, cfg };
+}
+
 const DANGEROUS_EXEC_PATTERNS = [
   /\s*>/,
   /\s*>>/,
@@ -76,6 +182,7 @@ export function runWithSecret(
   plaintext: string,
   command: string,
   secretEnvKey: string = 'WUNDERVault_SECRET',
+  opts: { cwd?: string } = {},
 ): ExecResult {
   const rejection = rejectDangerous(command);
   if (rejection) return { exitCode: 1, stdout: '', stderr: rejection };
@@ -95,6 +202,7 @@ export function runWithSecret(
     const result = spawnSync(command, {
       shell: true,
       env: secretEnv,
+      cwd: opts.cwd,
       timeout: 30_000,
       encoding: 'utf8',
     });
@@ -120,7 +228,7 @@ export function runWithSecret(
 export function runWithSecretStdin(
   plaintext: string,
   command: string,
-  opts: { appendNewline?: boolean } = {},
+  opts: { appendNewline?: boolean; cwd?: string } = {},
 ): ExecResult {
   const rejection = rejectDangerous(command);
   if (rejection) return { exitCode: 1, stdout: '', stderr: rejection };
@@ -136,6 +244,7 @@ export function runWithSecretStdin(
       shell: true,
       env: strippedParentEnv(), // secret is NOT in the environment
       input: inputBuf,
+      cwd: opts.cwd,
       timeout: 30_000,
       encoding: 'utf8',
     });
@@ -166,7 +275,7 @@ export function runWithSecretStdin(
 export function runWithSecretAskpass(
   plaintext: string,
   command: string,
-  opts: { askpassVar: string; wrap?: 'setsid' },
+  opts: { askpassVar: string; wrap?: 'setsid'; cwd?: string },
 ): ExecResult {
   const rejection = rejectDangerous(command);
   if (rejection) return { exitCode: 1, stdout: '', stderr: rejection };
@@ -203,7 +312,7 @@ export function runWithSecretAskpass(
     }
     const finalCommand = opts.wrap === 'setsid' ? `setsid -w ${command}` : command;
 
-    const result = spawnSync(finalCommand, { shell: true, env, timeout: 30_000, encoding: 'utf8' });
+    const result = spawnSync(finalCommand, { shell: true, env, cwd: opts.cwd, timeout: 30_000, encoding: 'utf8' });
     exitCode = result.status ?? 1;
     stdout = (result.stdout ?? '').toString();
     stderr = (result.stderr ?? '').toString();
@@ -291,6 +400,9 @@ export function runWithSecretRemote(
   // Single-quote the secret for safe shell assignment; handle embedded single-quotes.
   // When no env var is being injected (SSH-only remote exec, e.g. running a command
   // with just a vaulted SSH key), omit the export line entirely.
+  if (secretEnvKey && !isValidEnvKey(secretEnvKey)) {
+    return { exitCode: 1, stdout: '', stderr: `Refusing to build a remote script with an invalid env var name '${secretEnvKey}'.` };
+  }
   const escapedSecret = plaintext.replace(/'/g, `'\\''`);
   const stdinScript = secretEnvKey
     ? `export ${secretEnvKey}='${escapedSecret}'\n${command}\n`

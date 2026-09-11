@@ -43,20 +43,16 @@ npm install -g @wundervault/mcp-server
     "wundervault": {
       "command": "wundervault-mcp",
       "env": {
-        "WUNDERVault_AGENT_VAULT_URL": "https://wundervault.com",
-        "WUNDERVault_AGENT_VAULT_API_KEY": "wv_agent_<AGENT_ID>|<KEY_SUFFIX>",
-        "WUNDERVault_AGENT_KEY": "<BASE64_ENCRYPTION_KEY>"
+        "WUNDERVAULT_AGENT_NAME": "<agent-name>"
       }
     }
   }
 }
 ```
 
-Or using a credentials file:
-
-```bash
-wundervault-mcp --credentials ~/.wundervault/creds.json
-```
+Keys are never placed in the MCP config. The server names its agent, then asks the
+local `wundervault-agent` daemon for that agent's credentials over a unix socket.
+`onboard.py` registers the agent and starts the daemon.
 
 New account? [wundervault.com](https://wundervault.com) has a 90-second agent onboarding flow that generates this config for you.
 
@@ -146,35 +142,32 @@ Input: { entry_id: string }
 Output: "Reference [id] discarded from local context."
 ```
 
-## Credential Loading Priority
+## Credentials
 
-1. CLI flags (`--api-key`, `--enc-key`, `--url`)
-2. Environment variables (`WUNDERVault_AGENT_VAULT_API_KEY`, `WUNDERVault_AGENT_KEY`, `WUNDERVault_AGENT_VAULT_URL`)
-3. `WUNDERVault_CREDENTIALS_FILE` env var (explicit path)
-4. `~/.wundervault/creds.json`
-5. `~/.config/wundervault/credentials` (XDG)
+The MCP server holds no keys of its own and takes none on the command line. On the
+first tool call it resolves them like this:
 
-### Credentials file format
+1. `WUNDERVAULT_AGENT_NAME` (required) names which registered agent this process is.
+2. The agent token is read from `WUNDERVAULT_AGENT_TOKEN`, or from
+   `~/.wundervault/agents/<name>.token`.
+3. That token is presented to the local daemon over
+   `~/.wundervault/agents/<name>.sock`, which returns the API key, the encryption
+   key, and the vault URL.
 
-```json
-{
-  "agent_vault_url": "https://wundervault.com",
-  "agent_vault_api_key": "wv_agent_<ID>|<SUFFIX>",
-  "agent_encryption_key": "<BASE64_URL_SAFE_32_BYTES>"
-}
-```
+If the daemon is not running, tool calls fail with instructions rather than falling
+back to a weaker source. Run `onboard.py` to register an agent and start it.
 
 ## CLI Options
 
 ```
 wundervault-mcp [options]
 
-  --api-key <key>     Agent API key
-  --enc-key <key>     Encryption key (base64 URL-safe)
-  --url <url>         API base URL (default: https://wundervault.com)
-  --credentials <f>   Path to credentials JSON file
-  --help              Show help
+  --url <url>   API base URL override (default: supplied by the daemon)
+  --help        Show help
 ```
+
+There are no `--api-key`, `--enc-key`, or `--credentials` flags. Unknown options are
+rejected.
 
 ## Agent wallets (x402)
 

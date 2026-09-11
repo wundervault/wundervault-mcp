@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import crypto from 'node:crypto';
 import { loadEncryptionKey, hmacForApiKey, verifyDirectiveSignature } from '../src/crypto.js';
 import { runWithSecret } from '../src/exec.js';
-import { loadCredentials } from '../src/server.js';
 
 // ── Crypto: loadEncryptionKey ─────────────────────────────────────────────────
 
@@ -110,9 +109,19 @@ describe('runWithSecret', () => {
 
   it('scrubs plaintext from stderr', () => {
     const secret = 'supersecret456';
-    const { stderr } = runWithSecret(secret, `echo ${secret} >&2`);
+    // The disk-write guard matches ANY `>`, so `2>&1`-style redirection never reaches
+    // the shell and the command would be rejected before running — which would make
+    // this pass without scrubbing anything. Write to stderr without a redirect.
+    const { stderr } = runWithSecret(secret, `node -e 'process.stderr.write(process.env.WUNDERVault_SECRET)'`);
     expect(stderr).not.toContain(secret);
     expect(stderr).toContain('[SECRET_REDACTED]');
+  });
+
+  it('refuses a command that redirects the secret to disk', () => {
+    const secret = 'supersecret789';
+    const { exitCode, stderr } = runWithSecret(secret, 'echo $WUNDERVault_SECRET > /tmp/leak.txt');
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('Exec rejected');
   });
 
   it('returns exit code 0 for a successful command', () => {
@@ -135,40 +144,3 @@ describe('runWithSecret', () => {
   });
 });
 
-// ── Credentials: loadCredentials ─────────────────────────────────────────────
-
-describe('loadCredentials', () => {
-  it('prefers env vars over nothing', () => {
-    const origApiKey = process.env['WUNDERVault_AGENT_VAULT_API_KEY'];
-    const origEncKey = process.env['WUNDERVault_AGENT_KEY'];
-    process.env['WUNDERVault_AGENT_VAULT_API_KEY'] = 'env_api_key';
-    process.env['WUNDERVault_AGENT_KEY'] = 'ZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVl'; // 32-char base64
-    try {
-      const creds = loadCredentials({});
-      expect(creds.agent_vault_api_key).toBe('env_api_key');
-    } finally {
-      if (origApiKey === undefined) delete process.env['WUNDERVault_AGENT_VAULT_API_KEY'];
-      else process.env['WUNDERVault_AGENT_VAULT_API_KEY'] = origApiKey;
-      if (origEncKey === undefined) delete process.env['WUNDERVault_AGENT_KEY'];
-      else process.env['WUNDERVault_AGENT_KEY'] = origEncKey;
-    }
-  });
-
-  it('returns empty credentials when none are available', () => {
-    // Use a credentials path that doesn't exist
-    const origApiKey = process.env['WUNDERVault_AGENT_VAULT_API_KEY'];
-    const origEncKey = process.env['WUNDERVault_AGENT_KEY'];
-    delete process.env['WUNDERVault_AGENT_VAULT_API_KEY'];
-    delete process.env['WUNDERVault_AGENT_KEY'];
-    try {
-      const creds = loadCredentials({ credentials: '/nonexistent/path/creds.json' });
-      // Should return with empty strings rather than throwing
-      expect(creds.agent_vault_api_key).toBe('');
-      expect(creds.agent_encryption_key).toBe('');
-      expect(creds.agent_vault_url).toBe('https://wundervault.com');
-    } finally {
-      if (origApiKey !== undefined) process.env['WUNDERVault_AGENT_VAULT_API_KEY'] = origApiKey;
-      if (origEncKey !== undefined) process.env['WUNDERVault_AGENT_KEY'] = origEncKey;
-    }
-  });
-});

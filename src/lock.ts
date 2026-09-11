@@ -386,7 +386,17 @@ export async function acquireCredential(version: string): Promise<Claim> {
 }
 
 /** Release only a lock file this exact incarnation wrote. */
-export function releaseCredential(): void {
+/**
+ * Give up the credential.
+ *
+ * Returns a promise that settles once the bound address is actually gone.
+ * net.Server.close() is asynchronous, so a caller that released and immediately
+ * re-acquired in the same process could race its own teardown and get EADDRINUSE
+ * from a socket it had just closed itself. Every production caller is a
+ * process-exit path where the kernel reclaims the address anyway and the return
+ * value is safely ignored; anything reconnecting in-process should await it.
+ */
+export function releaseCredential(): Promise<void> {
   try {
     const compat = readCompatFile();
     // A PID match alone is not proof — the file may have been replaced, or the
@@ -397,9 +407,19 @@ export function releaseCredential(): void {
       unlinkSync(lockFilePath());
     }
   } catch { /* ignore */ }
-  try { held?.close(); } catch { /* ignore */ }
+
+  const server = held;
   held = null;
   heldPort = undefined;
+  if (!server) return Promise.resolve();
+
+  return new Promise<void>((resolve) => {
+    try {
+      server.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
 }
 
 /** Is the credential free right now? */
