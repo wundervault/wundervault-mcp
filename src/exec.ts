@@ -178,6 +178,22 @@ function isTimeout(err: unknown): boolean {
  * recipe / default). Strips sensitive keys from parent env, scrubs the secret
  * from output, zeroes the buffer. Timeout: 30s. Exit code 124 = timeout.
  */
+/**
+ * Secret delivery is POSIX-only. The stdin path shells out through /bin/sh and the
+ * askpass path needs mkfifo and setsid; on Windows those fail deep inside with an
+ * error that reads like a bug in the caller's command. Say the real thing instead.
+ */
+const IS_WINDOWS = process.platform === 'win32';
+function windowsUnsupported(mechanism: string): ExecResult {
+  return {
+    exitCode: 1,
+    stdout: '',
+    stderr: `The '${mechanism}' delivery mechanism is not supported on Windows: it needs a POSIX shell `
+      + `(and, for askpass, mkfifo and setsid). Run the MCP server on Linux or macOS, or use a `
+      + `credential_type that delivers through the environment.`,
+  };
+}
+
 export function runWithSecret(
   plaintext: string,
   command: string,
@@ -230,6 +246,7 @@ export function runWithSecretStdin(
   command: string,
   opts: { appendNewline?: boolean; cwd?: string } = {},
 ): ExecResult {
+  if (IS_WINDOWS) return windowsUnsupported('stdin');
   const rejection = rejectDangerous(command);
   if (rejection) return { exitCode: 1, stdout: '', stderr: rejection };
 
@@ -277,6 +294,7 @@ export function runWithSecretAskpass(
   command: string,
   opts: { askpassVar: string; wrap?: 'setsid'; cwd?: string },
 ): ExecResult {
+  if (IS_WINDOWS) return windowsUnsupported('askpass');
   const rejection = rejectDangerous(command);
   if (rejection) return { exitCode: 1, stdout: '', stderr: rejection };
 

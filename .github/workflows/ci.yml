@@ -7,10 +7,16 @@ on:
 
 jobs:
   test:
+    # Secret delivery is POSIX-only by construction: the sudo path shells out through
+    # /bin/sh, and the askpass path needs mkfifo and setsid. None of those exist on
+    # Windows, so a Windows job here would be permanently red against a gap we have
+    # chosen not to close — which is exactly the "red suite nobody reads" the audit
+    # flagged. The server refuses those mechanisms on win32 with a clear message
+    # instead; see runWithSecretStdin/runWithSecretAskpass in src/exec.ts.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
         node: ['20', '22']
     runs-on: ${{ matrix.os }}
     steps:

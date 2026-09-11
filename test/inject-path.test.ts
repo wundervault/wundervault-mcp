@@ -5,6 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { resolveInjectTarget, isAllowedInjectPath } from '../src/templates.js';
 
+
+// Unix modes, symlinks, mkfifo and /bin/sh. Secret delivery is POSIX-only by
+// construction, so these assert semantics Windows does not have.
+const POSIX_ONLY = process.platform === 'win32' ? describe.skip : describe;
+
 // resolveInjectTarget is the gate in front of vault_entry_inject_env. The tool exists
 // to be the SAFE way to put a secret in a config file — the alternative to letting a
 // command write files — so any way to steer it at another file defeats its purpose.
@@ -21,7 +26,7 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-describe('resolveInjectTarget — accepts legitimate targets', () => {
+POSIX_ONLY('resolveInjectTarget — accepts legitimate targets', () => {
   it('accepts a real project .env', () => {
     const target = path.join(root, '.env');
     const r = resolveInjectTarget(target);
@@ -43,7 +48,7 @@ describe('resolveInjectTarget — accepts legitimate targets', () => {
   });
 });
 
-describe('resolveInjectTarget — rejects redirected writes', () => {
+POSIX_ONLY('resolveInjectTarget — rejects redirected writes', () => {
   it('rejects a symlink named .env that points elsewhere', () => {
     const decoy = path.join(root, 'elsewhere.txt');
     writeFileSync(decoy, 'original\n');
@@ -77,7 +82,7 @@ describe('resolveInjectTarget — rejects redirected writes', () => {
   });
 });
 
-describe('resolveInjectTarget — rejects non-regular targets', () => {
+POSIX_ONLY('resolveInjectTarget — rejects non-regular targets', () => {
   // A FIFO here is not a curiosity: every fs call on this path is synchronous, so
   // opening a named pipe with no writer blocks the entire daemon, not one request.
   it('rejects a FIFO named .env instead of blocking on it', () => {
@@ -100,7 +105,7 @@ describe('resolveInjectTarget — rejects non-regular targets', () => {
   });
 });
 
-describe('resolveInjectTarget — hardlinks', () => {
+POSIX_ONLY('resolveInjectTarget — hardlinks', () => {
   // lstat cannot tell a hardlink from an ordinary file and O_NOFOLLOW does not help.
   // The path layer genuinely cannot see this; writeInjectedLine fstats the open file
   // and refuses on nlink > 1. This test pins where the blindness actually is.
@@ -116,7 +121,7 @@ describe('resolveInjectTarget — hardlinks', () => {
   });
 });
 
-describe('resolveInjectTarget — path policy', () => {
+POSIX_ONLY('resolveInjectTarget — path policy', () => {
   it('rejects a relative path rather than resolving it against the daemon cwd', () => {
     const r = resolveInjectTarget('.env');
     expect(r.ok).toBe(false);
@@ -174,7 +179,7 @@ describe('resolveInjectTarget — path policy', () => {
   });
 });
 
-describe('isAllowedInjectPath', () => {
+POSIX_ONLY('isAllowedInjectPath', () => {
   it('accepts ~/.npmrc by its canonical spelling', () => {
     expect(isAllowedInjectPath(path.join(realpathSync(os.homedir()), '.npmrc'))).toBe(true);
   });

@@ -4,9 +4,14 @@ import os from 'node:os';
 import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, coerceExecConfig } from '../src/exec.js';
 import { getRecipe, recipeIds, RECIPES } from '../src/recipes.js';
 
+
+// Unix modes, symlinks, mkfifo and /bin/sh. Secret delivery is POSIX-only by
+// construction, so these assert semantics Windows does not have.
+const POSIX_ONLY = process.platform === 'win32' ? describe.skip : describe;
+
 const SECRET = 'hunter2';
 
-describe('recipes', () => {
+POSIX_ONLY('recipes', () => {
   it('maps credential types to safe mechanisms', () => {
     expect(getRecipe('generic')?.mechanism).toBe('env');
     expect(getRecipe('sudo')?.mechanism).toBe('stdin');
@@ -30,7 +35,7 @@ describe('recipes', () => {
   });
 });
 
-describe('coerceExecConfig', () => {
+POSIX_ONLY('coerceExecConfig', () => {
   it('parses the JSON string the backend forwards', () => {
     expect(coerceExecConfig('{"credential_type":"sudo"}')).toEqual({ credential_type: 'sudo' });
     expect(coerceExecConfig('{"env_key":"NPM_TOKEN","pre_command":"x"}')).toEqual({ env_key: 'NPM_TOKEN', pre_command: 'x' });
@@ -48,7 +53,7 @@ describe('coerceExecConfig', () => {
   });
 });
 
-describe('env mechanism (generic)', () => {
+POSIX_ONLY('env mechanism (generic)', () => {
   it('injects the secret as the named env var', () => {
     const r = runWithSecret(SECRET, 'printenv THEKEY', 'THEKEY');
     expect(r.exitCode).toBe(0);
@@ -58,7 +63,7 @@ describe('env mechanism (generic)', () => {
   });
 });
 
-describe('stdin mechanism (sudo)', () => {
+POSIX_ONLY('stdin mechanism (sudo)', () => {
   it('delivers the secret on stdin (byte count proves arrival)', () => {
     const r = runWithSecretStdin(SECRET, 'wc -c', { appendNewline: true });
     expect(r.exitCode).toBe(0);
@@ -78,7 +83,7 @@ describe('stdin mechanism (sudo)', () => {
   });
 });
 
-describe('askpass mechanism (git / ssh)', () => {
+POSIX_ONLY('askpass mechanism (git / ssh)', () => {
   it('the askpass helper hands the secret to the tool', () => {
     // A stand-in "tool": invoke the askpass var and count the bytes it prints.
     const r = runWithSecretAskpass(SECRET, '"$TEST_ASKPASS" | wc -c', { askpassVar: 'TEST_ASKPASS' });

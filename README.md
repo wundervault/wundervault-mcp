@@ -56,6 +56,13 @@ local `wundervault-agent` daemon for that agent's credentials over a unix socket
 
 New account? [wundervault.com](https://wundervault.com) has a 90-second agent onboarding flow that generates this config for you.
 
+## Supported platforms
+
+**Linux and macOS.** Secret delivery is POSIX-only by construction: the `sudo` recipe
+pipes through `/bin/sh`, and the `git` / `ssh-passphrase` recipes need `mkfifo` and
+`setsid`. On Windows those mechanisms return a clear "not supported" error rather than
+failing somewhere deep inside. CI runs on Linux and macOS for the same reason.
+
 ## Security Model
 
 - **Zero-knowledge:** The encryption key lives only in the MCP server process. The Wundervault server never sees it.

@@ -5,6 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { resolveInjectTarget, writeInjectedLine } from '../src/templates.js';
 
+
+// Unix modes, symlinks, mkfifo and /bin/sh. Secret delivery is POSIX-only by
+// construction, so these assert semantics Windows does not have.
+const POSIX_ONLY = process.platform === 'win32' ? describe.skip : describe;
+
 // These exercise the actual write, not just the path helper. The path helper cannot
 // see a hardlink and does not try to — the write is what has to survive one.
 
@@ -19,7 +24,7 @@ function resolved(p: string) {
   return r.target;
 }
 
-describe('writeInjectedLine', () => {
+POSIX_ONLY('writeInjectedLine', () => {
   it('creates the file and writes the pair', () => {
     const target = path.join(root, '.env');
     expect(writeInjectedLine(resolved(target), 'TOKEN', 's3cret').ok).toBe(true);
@@ -145,7 +150,7 @@ describe('writeInjectedLine', () => {
   });
 });
 
-describe('writeInjectedLine — key validation', () => {
+POSIX_ONLY('writeInjectedLine — key validation', () => {
   it('refuses a key carrying a newline instead of writing extra lines', () => {
     const target = path.join(root, '.env');
     writeFileSync(target, 'KEEP=yes\n');
