@@ -58,10 +58,17 @@ New account? [wundervault.com](https://wundervault.com) has a 90-second agent on
 
 ## Supported platforms
 
-**Linux and macOS.** Secret delivery is POSIX-only by construction: the `sudo` recipe
-pipes through `/bin/sh`, and the `git` / `ssh-passphrase` recipes need `mkfifo` and
-`setsid`. On Windows those mechanisms return a clear "not supported" error rather than
-failing somewhere deep inside. CI runs on Linux and macOS for the same reason.
+**Linux is the verified platform.** macOS works for secret delivery; Windows does not.
+
+Delivery is POSIX-only by construction: the `sudo` recipe pipes through `/bin/sh`, and
+the `git` / `ssh-passphrase` recipes need `mkfifo` and `setsid`. On Windows those
+mechanisms return a clear "not supported" error rather than failing somewhere deep
+inside.
+
+The single-instance lock has two implementations: a kernel-held abstract socket on
+Linux, and loopback ports elsewhere. Only the Linux one is covered by tests — see
+`HANDOFF-lock-on-non-linux.md` for what is unverified on macOS and why. CI runs both
+platforms; the lock suite runs on Linux.
 
 ## Security Model
 

@@ -194,6 +194,15 @@ export function resolveInjectTarget(
   const requested = path.resolve(filePath);
   const parent = path.dirname(requested);
 
+  // Refuse a forbidden destination on the spelling we were handed, before asking the
+  // filesystem anything. Otherwise a box without /root reports "does not exist" for
+  // /root/.env — true, unhelpful, and the wrong reason.
+  for (const root of FORBIDDEN_ROOTS) {
+    if (requested === root || requested.startsWith(root + path.sep)) {
+      return { ok: false, error: `Refusing to write a secret into a system directory ('${requested}').` };
+    }
+  }
+
   let realParent: string;
   try {
     realParent = realpathSync(parent);
