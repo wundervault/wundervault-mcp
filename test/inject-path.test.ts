@@ -147,6 +147,14 @@ POSIX_ONLY('resolveInjectTarget — path policy', () => {
     }
   });
 
+  // macOS reaches /etc and /tmp through symlinks into /private, so the refusal must
+  // name the real reason rather than whichever rule happened to fire first.
+  it('names the location as the reason on a platform that symlinks /etc', () => {
+    const r = resolveInjectTarget('/etc/.env');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('system directory');
+  });
+
   it('rejects a filename that is not on the allowlist', () => {
     const r = resolveInjectTarget(path.join(root, 'secrets.txt'));
     expect(r.ok).toBe(false);

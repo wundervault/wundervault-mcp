@@ -99,6 +99,9 @@ export const STRIP_FROM_CHILD_ENV = [
 const FORBIDDEN_ROOTS = [
   '/etc', '/usr', '/bin', '/sbin', '/lib', '/lib64', '/boot',
   '/sys', '/proc', '/dev', '/run', '/var/lib', '/var/run', '/root',
+  // macOS reaches several of these through /private; realpath() hands back that
+  // spelling, so the list has to know both.
+  '/private/etc', '/private/var/lib', '/private/var/run',
 ];
 
 /** The account home, canonicalised once. os.homedir() honours $HOME on POSIX and may
@@ -200,28 +203,37 @@ export function resolveInjectTarget(
       ? { ok: false, error: `Directory '${parent}' does not exist. Create it first; injection will not create directories.` }
       : { ok: false, error: `Cannot resolve directory '${parent}' (${code ?? 'unknown error'}).` };
   }
+  const target = path.join(realParent, path.basename(requested));
+
+  // Judge location BEFORE the symlink rule, and judge BOTH spellings. macOS reaches
+  // /etc through a symlink to /private/etc and /tmp through /private/tmp, so checking
+  // only the resolved path would miss the denylist and checking only the lexical one
+  // would miss the real destination. Either spelling landing somewhere forbidden is
+  // enough, and asking here means the refusal names the actual reason.
+  const spellings = [requested, target];
+
+  let realTmp: string;
+  try { realTmp = realpathSync(os.tmpdir()); } catch { realTmp = os.tmpdir(); }
+  for (const p of spellings) {
+    if (p === realTmp || p.startsWith(realTmp + path.sep) || p === os.tmpdir() || p.startsWith(os.tmpdir() + path.sep)) {
+      return { ok: false, error: `Refusing to write a secret into the temp directory ('${p}').` };
+    }
+  }
+  for (const root of FORBIDDEN_ROOTS) {
+    for (const p of spellings) {
+      if (p === root || p.startsWith(root + path.sep)) {
+        return { ok: false, error: `Refusing to write a secret into a system directory ('${p}').` };
+      }
+    }
+  }
+
   // A symlinked parent is refused for the basename rules (.env and friends), because
   // those accept ANY directory: honouring a redirect there would quietly relocate the
   // owner's "write my project's .env" to wherever the link points. The home-anchored
   // files name one exact destination, so resolving them is safe — and required, or a
   // user whose home is itself a symlink could not use the natural spelling at all.
-  const resolvedCandidate = path.join(realParent, path.basename(path.resolve(filePath)));
-  const isExactHomeFile = HOME_ANCHORED.some((fn) => fn(resolvedCandidate));
-  if (realParent !== parent && !isExactHomeFile) {
+  if (realParent !== parent && !HOME_ANCHORED.some((fn) => fn(target))) {
     return { ok: false, error: `Refusing to write through a symlinked directory: '${parent}' really resolves to '${realParent}'.` };
-  }
-
-  const target = path.join(realParent, path.basename(requested));
-
-  let realTmp: string;
-  try { realTmp = realpathSync(os.tmpdir()); } catch { realTmp = os.tmpdir(); }
-  if (target === realTmp || target.startsWith(realTmp + path.sep)) {
-    return { ok: false, error: `Refusing to write a secret into the temp directory ('${target}').` };
-  }
-  for (const root of FORBIDDEN_ROOTS) {
-    if (target === root || target.startsWith(root + path.sep)) {
-      return { ok: false, error: `Refusing to write a secret into a system directory ('${target}').` };
-    }
   }
 
   let existingMode: number | undefined;
