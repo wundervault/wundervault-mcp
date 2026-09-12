@@ -160,6 +160,12 @@ function tryBind(port?: number): Promise<BindResult> {
   });
 }
 
+function closed(server: net.Server): Promise<void> {
+  return new Promise((resolve) => {
+    try { server.close(() => resolve()); } catch { resolve(); }
+  });
+}
+
 /** Ask whoever holds the address who they are. */
 function askHolder(port?: number): Promise<Holder | null> {
   return new Promise((resolve) => {
@@ -429,7 +435,12 @@ export async function credentialIsFree(): Promise<boolean> {
   for (const port of candidates) {
     const result = await tryBind(port);
     if (result.status === 'bound') {
-      try { result.server.close(); } catch { /* ignore */ }
+      // Wait for the probe socket to actually be gone. close() is asynchronous,
+      // and this function's whole job is to answer a question the caller acts on
+      // immediately: an un-awaited teardown leaves our own closing socket on the
+      // address, so the very next bind — another probe, or the acquire that
+      // follows a "yes" — reads EADDRINUSE and reports a FREE credential as held.
+      await closed(result.server);
       return legacyHolder() === null;
     }
     if (result.status === 'in-use' && (await askHolder(port))) return false;

@@ -59,35 +59,63 @@ afterEach(async () => {
   rmSync(home, { recursive: true, force: true });
 });
 
+/** The lock file carries no secret, but its incarnation token is the one field
+ *  that authorises deleting the file — so a failure dump has no use for it. */
+function redactToken(raw: string): string {
+  return JSON.stringify(raw.replace(/("token":")[^"]*/, '$1<redacted>'));
+}
+
+/**
+ * Acquire a credential that nothing should be holding, and fail loudly if not.
+ *
+ * `expect((await acquireCredential(v)).ok).toBe(true)` reports "expected false
+ * to be true" and discards the two fields a refusal exists to carry — the
+ * reason and the holder. That is how a one-in-many-runs failure here reached CI
+ * saying nothing about which of the four ways to refuse had happened. Assert on
+ * the whole claim, and print the address and the compatibility file with it.
+ */
+async function mustAcquire(version = '9.9.9'): Promise<void> {
+  const claim = await lock.acquireCredential(version);
+  if (claim.ok) return;
+  const file = lock.lockFilePath();
+  throw new Error(
+    'acquireCredential refused a credential nothing should hold.\n' +
+    `  claim:   ${JSON.stringify(claim)}\n` +
+    `  address: ${lock.addressDescription()}\n` +
+    `  file:    ${file} ${existsSync(file) ? `EXISTS: ${redactToken(readFileSync(file, 'utf8'))}` : 'absent'}\n` +
+    `  asked:   ${JSON.stringify(await lock.whoHolds())}`,
+  );
+}
+
 LINUX_ONLY('acquiring the credential', () => {
   it('grants it when nobody holds it', async () => {
-    expect((await lock.acquireCredential('9.9.9')).ok).toBe(true);
+    await mustAcquire();
   });
 
   it('refuses a second claim while the first is held', async () => {
-    expect((await lock.acquireCredential('9.9.9')).ok).toBe(true);
+    await mustAcquire();
     const second = await lock.acquireCredential('9.9.9');
     expect(second.ok).toBe(false);
     expect(second.holder).toBeDefined();
   });
 
   it('grants it again after release', async () => {
-    await lock.acquireCredential('9.9.9');
+    await mustAcquire();
     await lock.releaseCredential();
-    expect((await lock.acquireCredential('9.9.9')).ok).toBe(true);
+    await mustAcquire();
   });
 
   it('still refuses when the lock FILE is deleted out-of-band', async () => {
     // The failure that started all this: enforcement must not depend on a file
     // that anything can remove.
-    expect((await lock.acquireCredential('9.9.9')).ok).toBe(true);
+    await mustAcquire();
     rmSync(lock.lockFilePath());
     expect(existsSync(lock.lockFilePath())).toBe(false);
     expect((await lock.acquireCredential('9.9.9')).ok).toBe(false);
   });
 
   it('reports the credential as taken while held, and free once released', async () => {
-    await lock.acquireCredential('9.9.9');
+    await mustAcquire();
     expect(await lock.credentialIsFree()).toBe(false);
     await lock.releaseCredential();
     expect(await lock.credentialIsFree()).toBe(true);
@@ -96,7 +124,7 @@ LINUX_ONLY('acquiring the credential', () => {
 
 LINUX_ONLY('compatibility lock file', () => {
   it('keeps a bare PID on line 1 so pre-1.7.1 readers still see the lock', async () => {
-    await lock.acquireCredential('9.9.9');
+    await mustAcquire();
     const raw = readFileSync(lock.lockFilePath(), 'utf8');
 
     // Exactly what older builds do. A pure-JSON file yields NaN there, which
@@ -116,7 +144,7 @@ LINUX_ONLY('compatibility lock file', () => {
   });
 
   it('releases only a file this process owns', async () => {
-    await lock.acquireCredential('9.9.9');
+    await mustAcquire();
     const dead = deadPid();
     writeFileSync(lock.lockFilePath(), `${dead}\n${JSON.stringify({ pid: dead })}\n`);
     await lock.releaseCredential();
@@ -181,7 +209,7 @@ LINUX_ONLY('cross-process exclusion', () => {
 
 LINUX_ONLY('holder identity', () => {
   it('answers who it is over the bound address, with no lock file involved', async () => {
-    await lock.acquireCredential('9.9.9');
+    await mustAcquire();
     rmSync(lock.lockFilePath());          // the file anyone could delete
     const who = await lock.whoHolds();
     expect(who.source).toBe('holder');    // learned from the holder, not the file
@@ -197,7 +225,7 @@ LINUX_ONLY('holder identity', () => {
   });
 
   it('never puts a secret or a parent command line in the banner', async () => {
-    await lock.acquireCredential('9.9.9');
+    await mustAcquire();
     const who = await lock.whoHolds();
     expect(Object.keys(who).sort()).toEqual(['agent', 'pid', 'since', 'source']);
   });
@@ -205,7 +233,7 @@ LINUX_ONLY('holder identity', () => {
 
 LINUX_ONLY('release guard', () => {
   it('does not remove a lock file written by a different incarnation', async () => {
-    await lock.acquireCredential('9.9.9');
+    await mustAcquire();
     // Same PID, different token — a replaced or restored file.
     writeFileSync(
       lock.lockFilePath(),
@@ -216,7 +244,7 @@ LINUX_ONLY('release guard', () => {
   });
 
   it('does not remove a legacy tokenless lock file', async () => {
-    await lock.acquireCredential('9.9.9');
+    await mustAcquire();
     writeFileSync(lock.lockFilePath(), String(process.pid));
     await lock.releaseCredential();
     expect(existsSync(lock.lockFilePath())).toBe(true);
