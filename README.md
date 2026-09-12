@@ -3,6 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/%40wundervault%2Fmcp-server)](https://www.npmjs.com/package/@wundervault/mcp-server)
 [![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.wundervault%2Fwundervault--mcp-blue)](https://registry.modelcontextprotocol.io/v0/servers?search=wundervault)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-green)](LICENSE)
+[![Follow @wundervault1](https://img.shields.io/badge/follow-%40wundervault1-000000?logo=x&logoColor=white)](https://x.com/wundervault1)
 
 **A zero-knowledge secrets vault for AI agents.** Every API key you paste into an agent chat or a `.env` file ends up in context windows, transcripts, and provider logs. Wundervault's answer: the agent never receives the secret at all. It asks for *work* — "run this deploy with the key injected" — and a local daemon decrypts the secret, injects it into the subprocess environment, zeroes the buffer, and scrubs the output before the agent sees any of it.
 
@@ -220,6 +221,10 @@ npm install
 npm run build   # compiles TypeScript to dist/
 npm test        # run the test suite
 ```
+
+## Stay updated
+
+Releases, security notes and product posts go out on X as [@wundervault1](https://x.com/wundervault1). Full release history: [wundervault.com/changelog](https://wundervault.com/changelog).
 
 ## License
 
