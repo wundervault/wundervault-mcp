@@ -13,6 +13,7 @@ import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmdirSync, exists
 import net from 'node:net';
 import { AgentVaultAPI } from './api-client.js';
 import { loadEncryptionKey, verifyDirectiveSignature, decryptSecretContent } from './crypto.js';
+import { loadOpenSshEd25519, runSshBrokered, type BrokeredOp } from './ssh-agent.js';
 import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey, commandInvokesSudo } from './exec.js';
 import { getRecipe, recipeIds } from './recipes.js';
 import type { Credentials, VaultEntry, RemoteHost } from './types.js';
@@ -142,6 +143,9 @@ function mockToolResult(name: string, args: Record<string, any>) {
     case 'vault_rsync':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ rsync complete → ${args.remote_host ?? 'demo-host'}:${args.remote_path ?? '/demo/path'}${MOCK_NOTE}` }] });
+    case 'vault_ssh_exec':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `✅ Ran on ${args.destination ?? 'demo-host'} (exit 0). 1 signature, key never left the server.${MOCK_NOTE}` }] });
     default:
       return CallToolResultSchema.parse({ content: [{ type: 'text', text: `Unknown tool: ${name}${MOCK_NOTE}` }], isError: true });
   }
@@ -236,6 +240,39 @@ export function createServer(args: { url?: string } = {}) {
             },
           },
           required: ['entry_id', 'purpose', 'file_path', 'env_key'],
+        },
+      },
+      {
+        name: 'vault_ssh_exec',
+        description: (
+          'Run a command on a remote host, or rsync files to it, using a vaulted SSH key '
+          + 'that is never written to disk and never returned to you.\n\n'
+          + 'The key stays inside this server and answers signature requests over a private '
+          + 'ssh-agent socket that exists only for the duration of this call. You choose the '
+          + 'remote command; you do not get the key.\n\n'
+          + 'The destination is checked against the ssh_hosts allowlist on the entry, and the '
+          + 'ssh command line is constructed here — naming a different host inside remote_argv '
+          + 'does not change where it connects. An entry with no ssh_hosts authorises nothing.\n\n'
+          + 'Every signature is audited with the key fingerprint and the authorised host.'
+        ),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            entry_id: { type: 'string', description: 'Vault entry holding the SSH private key (ed25519, unencrypted).' },
+            destination: { type: 'string', description: 'Remote destination, [user@]host. The host part must be in the entry\'s ssh_hosts.' },
+            purpose: { type: 'string', description: 'Why this is needed (audit log).' },
+            remote_argv: {
+              type: 'array', items: { type: 'string' },
+              description: 'Command and arguments to run on the remote host. An array, run without a shell. Omit when using rsync_args.',
+            },
+            rsync_args: {
+              type: 'array', items: { type: 'string' },
+              description: 'rsync arguments instead of a remote command. Every [user@]host:path argument is checked against the same allowlist.',
+            },
+            timeout_seconds: { type: 'number', description: 'Default 120.' },
+            working_dir: { type: 'string', description: 'Local working directory for rsync source paths.' },
+          },
+          required: ['entry_id', 'destination', 'purpose'],
         },
       },
       {
@@ -480,6 +517,75 @@ export function createServer(args: { url?: string } = {}) {
 
         return CallToolResultSchema.parse({
           content: [{ type: 'text', text: `✅ ${env_key} injected into ${safePath}\nSecret retrieved and burned.` }],
+        });
+      }
+
+      if (request.params.name === 'vault_ssh_exec') {
+        const entry_id = String((request.params.arguments as Record<string, unknown>)?.entry_id ?? '');
+        const destination = String((request.params.arguments as Record<string, unknown>)?.destination ?? '');
+        const purpose = String((request.params.arguments as Record<string, unknown>)?.purpose ?? '');
+        const remoteArgvRaw = (request.params.arguments as Record<string, unknown>)?.remote_argv;
+        const rsyncArgsRaw = (request.params.arguments as Record<string, unknown>)?.rsync_args;
+        const timeoutSeconds = Number((request.params.arguments as Record<string, unknown>)?.timeout_seconds ?? 120);
+        const workingDir = (request.params.arguments as Record<string, unknown>)?.working_dir as string | undefined;
+
+        const fail = (text: string) => CallToolResultSchema.parse({ content: [{ type: 'text', text }], isError: true });
+        if (!entry_id || !destination || !purpose) {
+          return fail('vault_ssh_exec needs entry_id, destination and purpose.');
+        }
+
+        const remoteArgv = Array.isArray(remoteArgvRaw) ? remoteArgvRaw.map(String) : undefined;
+        const rsyncArgs = Array.isArray(rsyncArgsRaw) ? rsyncArgsRaw.map(String) : undefined;
+        if ((remoteArgv && rsyncArgs) || (!remoteArgv && !rsyncArgs)) {
+          return fail('Give exactly one of remote_argv or rsync_args.');
+        }
+
+        // Same entry fetch as vault_exec: the server-side Tier 2 gate and the access log
+        // are on this path, so a brokered call is authorised and recorded exactly like a
+        // direct one.
+        const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
+
+        // The allowlist lives on the entry, server-side, where the owner sets it.
+        let allowedHosts: string[] = [];
+        try {
+          // exec_config arrives as a JSON string from the server, but an older shape
+          // handed back an object; accept both rather than silently reading no hosts,
+          // which would fail the call closed for the wrong reason.
+          const raw = secretData.exec_config as unknown;
+          const cfg = typeof raw === 'string' ? JSON.parse(raw) : (raw ?? {});
+          if (Array.isArray((cfg as { ssh_hosts?: unknown })?.ssh_hosts)) {
+            allowedHosts = ((cfg as { ssh_hosts: unknown[] }).ssh_hosts).map(String);
+          }
+        } catch { allowedHosts = []; }
+
+        const vaultKey = await api.ensureVaultKey();
+        const plaintextBytes = decryptSecretContent(vaultKey, secretData.encrypted_content, secretData.content_nonce);
+        let identity;
+        try {
+          identity = loadOpenSshEd25519(new TextDecoder().decode(plaintextBytes));
+        } catch (e) {
+          return fail(`vault_ssh_exec: ${e instanceof Error ? e.message : String(e)}`);
+        } finally {
+          plaintextBytes.fill(0);
+        }
+
+        const op: BrokeredOp = remoteArgv
+          ? { kind: 'ssh', destination, remoteArgv }
+          : { kind: 'rsync', destination, rsyncArgs: rsyncArgs as string[] };
+
+        const r = await runSshBrokered({
+          identity, op, allowedHosts, cwd: workingDir,
+          timeoutMs: Math.max(1, Math.min(timeoutSeconds, 900)) * 1000,
+        });
+
+        const head = r.exitCode === 0
+          ? `✅ ${op.kind} on ${destination} completed (exit 0).`
+          : `❌ ${op.kind} on ${destination} failed (exit ${r.exitCode}).`;
+        return CallToolResultSchema.parse({
+          content: [{ type: 'text', text:
+            `${head}\n${r.signCount} signature(s); the key never left this server.\n`
+            + `--- stdout ---\n${r.stdout || '(empty)'}\n--- stderr ---\n${r.stderr || '(empty)'}` }],
+          isError: r.exitCode !== 0,
         });
       }
 

@@ -1,0 +1,12 @@
+{"round": 5, "decisions": [
+ {"id":"F1","action":"fixed","claim":"vault_ssh_exec tool is not registered anywhere",
+  "reason":"confirmed — the module was built but never wired into server.ts, so spec A4 was genuinely unmet. Registering it."},
+ {"id":"F2","action":"fixed","claim":"host allowlist is independent of argv, so argv can name a different destination",
+  "reason":"confirmed and serious. runSshBrokered validated `host` then ran whatever argv said. The fix is structural: the broker now CONSTRUCTS the ssh command from the validated host instead of accepting an argv that carries its own destination, and rsync host:path arguments are validated against the same allowlist."},
+ {"id":"F3","action":"fixed","claim":"GIT_SSH_COMMAND does not affect a direct ssh invocation, so ssh may use another key or agent",
+  "reason":"confirmed — GIT_SSH_COMMAND is git-only. The hardening options now go on the constructed ssh argv itself: IdentitiesOnly, IdentityAgent, BatchMode, and -F /dev/null so ~/.ssh/config cannot redirect IdentityAgent."},
+ {"id":"F4","action":"fixed","claim":"audit is optional and refusals are not logged",
+  "reason":"confirmed — spec A5 says log EVERY signature. Logging is no longer caller-optional: a default emitter writes to stderr, and refused signature requests are logged too, since a refusal is the more interesting event."},
+ {"id":"F5","action":"fixed","claim":"the migration test duplicates the DDL, so main.py could drift and tests still pass",
+  "reason":"confirmed — the test asserted against its own copy of the SQL. It now reads the statement out of app/main.py, so drift fails the test."}
+]}

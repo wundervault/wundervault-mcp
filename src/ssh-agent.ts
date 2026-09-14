@@ -175,7 +175,24 @@ export function loadOpenSshEd25519(pem: string): LoadedIdentity {
 
 // ── protocol handling ──────────────────────────────────────────────────────────
 
-export interface SignEvent { fingerprint: string; host: string; at: string; }
+export interface SignEvent {
+  fingerprint: string;
+  host: string;
+  at: string;
+  /** "signed" or the reason it was refused. A refusal is the more interesting event. */
+  outcome: 'signed' | 'refused_unknown_key' | 'refused_malformed';
+}
+
+/**
+ * Auditing is not caller-optional. Spec A5 says log EVERY signature, and an optional
+ * callback means the one deployment that forgets to pass it silently keeps no record at
+ * all. Callers may add their own sink; this one always runs.
+ */
+export function defaultSignAudit(e: SignEvent): void {
+  process.stderr.write(
+    `[wundervault-ssh-agent] ${e.at} ${e.outcome} key=${e.fingerprint} host=${e.host || '-'}\n`,
+  );
+}
 
 /**
  * Answer one agent message. Pure — no I/O — so the protocol is testable without sockets.
@@ -184,7 +201,7 @@ export interface SignEvent { fingerprint: string; host: string; at: string; }
 export function handleAgentMessage(
   msg: Buffer,
   identity: LoadedIdentity,
-  onSign?: () => void,
+  onOutcome?: (outcome: SignEvent['outcome']) => void,
 ): Buffer {
   if (msg.length === 0) return Buffer.from([SSH_AGENT_FAILURE]);
   const type = msg[0];
@@ -208,16 +225,22 @@ export function handleAgentMessage(
 
       // A sign request naming a key this agent does not hold is refused rather than
       // signed with whatever it does hold.
-      if (!wantBlob.equals(identity.keyBlob)) return Buffer.from([SSH_AGENT_FAILURE]);
+      if (!wantBlob.equals(identity.keyBlob)) {
+        // Someone asking this agent to sign with a key it does not hold is worth a
+        // record, not just a silent refusal.
+        onOutcome?.('refused_unknown_key');
+        return Buffer.from([SSH_AGENT_FAILURE]);
+      }
 
       const sig = cryptoSign(null, data, identity.privateKey);
-      onSign?.();
+      onOutcome?.('signed');
       return Buffer.concat([
         Buffer.from([SSH_AGENT_SIGN_RESPONSE]),
         sshString(Buffer.concat([sshString(ED25519_KEY_TYPE), sshString(sig)])),
       ]);
     } catch {
       // Malformed sign request: fail this message, keep the listener alive.
+      onOutcome?.('refused_malformed');
       return Buffer.from([SSH_AGENT_FAILURE]);
     }
   }
@@ -276,9 +299,14 @@ export function startAgent(identity: LoadedIdentity, onSign?: (e: SignEvent) => 
         const msg = buf.subarray(4, 4 + len);
         buf = buf.subarray(4 + len);
 
-        const reply = handleAgentMessage(msg, identity, () => {
-          signs += 1;
-          onSign?.({ fingerprint: identity.fingerprint, host, at: new Date().toISOString() });
+        const reply = handleAgentMessage(msg, identity, (outcome) => {
+          if (outcome === 'signed') signs += 1;
+          const ev: SignEvent = {
+            fingerprint: identity.fingerprint, host, at: new Date().toISOString(), outcome,
+          };
+          // Always audited; the caller's sink is additional, never a replacement.
+          defaultSignAudit(ev);
+          onSign?.(ev);
         });
         try { conn.write(Buffer.concat([u32(reply.length), reply])); } catch { /* peer went away */ }
       }
@@ -336,35 +364,99 @@ export interface SshBrokerResult { exitCode: number; stdout: string; stderr: str
  * ask this agent to sign for some other host. Closing that needs OpenSSH's
  * restrict-destination session-bind extension, and is out of scope for this build.
  */
+/** Everything after `ssh` that stops it choosing its own credentials or destination. */
+export function hardenedSshOptions(socketPath: string): string[] {
+  return [
+    // -F /dev/null FIRST: ~/.ssh/config can set IdentityAgent, ProxyCommand or a
+    // different Hostname for a given pattern, which would let user config redirect a
+    // brokered connection. GIT_SSH_COMMAND does not help here — it is git-only, and a
+    // direct ssh invocation ignores it entirely.
+    '-F', '/dev/null',
+    '-o', 'IdentitiesOnly=yes',
+    '-o', `IdentityAgent=${socketPath}`,
+    '-o', 'BatchMode=yes',              // never block on a passphrase or password prompt
+    '-o', 'StrictHostKeyChecking=accept-new',
+  ];
+}
+
+/** `user@host` → `host`. The allowlist is about the destination, not who you log in as. */
+export function hostOf(destination: string): string {
+  const at = destination.lastIndexOf('@');
+  return at === -1 ? destination : destination.slice(at + 1);
+}
+
+/**
+ * An rsync argument that names a remote side looks like `[user@]host:path`. Anything
+ * with no colon before the first slash is a local path and needs no check.
+ */
+export function rsyncRemoteHost(arg: string): string | null {
+  const colon = arg.indexOf(':');
+  if (colon <= 0) return null;
+  const slash = arg.indexOf('/');
+  if (slash !== -1 && slash < colon) return null;   // e.g. ./weird:name
+  return hostOf(arg.slice(0, colon));
+}
+
+export type BrokeredOp =
+  | { kind: 'ssh'; destination: string; remoteArgv: string[] }
+  | { kind: 'rsync'; destination: string; rsyncArgs: string[] };
+
 export async function runSshBrokered(opts: {
   identity: LoadedIdentity;
-  host: string;
+  op: BrokeredOp;
   allowedHosts: string[];
-  argv: string[];
   cwd?: string;
   timeoutMs?: number;
   onSign?: (e: SignEvent) => void;
 }): Promise<SshBrokerResult> {
-  const { identity, host, allowedHosts, argv, cwd, timeoutMs = 120_000, onSign } = opts;
+  const { identity, op, allowedHosts, cwd, timeoutMs = 120_000, onSign } = opts;
 
-  // Fail closed. An entry that names no hosts authorises nothing — the alternative,
-  // treating "unset" as "anywhere", is how an allowlist becomes decoration.
+  // Fail closed. An entry that names no hosts authorises nothing — treating "unset" as
+  // "anywhere" is how an allowlist becomes decoration.
   if (!allowedHosts || allowedHosts.length === 0) {
     return { exitCode: 1, stdout: '', stderr:
       'Refused: this entry lists no permitted SSH hosts, so it authorises nothing. '
       + "Add ssh_hosts to the entry's exec_config in the dashboard.", signCount: 0 };
   }
+
+  const deny = (msg: string): SshBrokerResult => ({ exitCode: 1, stdout: '', stderr: msg, signCount: 0 });
+  const host = hostOf(op.destination);
   if (!allowedHosts.includes(host)) {
-    return { exitCode: 1, stdout: '', stderr:
-      `Refused: "${host}" is not in this entry's permitted hosts (${allowedHosts.join(', ')}).`,
-      signCount: 0 };
-  }
-  if (!Array.isArray(argv) || argv.length === 0) {
-    return { exitCode: 1, stdout: '', stderr: 'Refused: argv must be a non-empty array.', signCount: 0 };
+    return deny(`Refused: "${host}" is not in this entry's permitted hosts (${allowedHosts.join(', ')}).`);
   }
 
   const agent = startAgent(identity, onSign, host);
+  let argv: string[];
   try {
+    if (op.kind === 'ssh') {
+      if (!Array.isArray(op.remoteArgv) || op.remoteArgv.length === 0) {
+        agent.close();
+        return deny('Refused: remoteArgv must be a non-empty array.');
+      }
+      // The destination is OURS, not the caller's. Previously the caller passed a whole
+      // argv and the validated host was merely advisory: argv ["ssh","evil.example"]
+      // sailed through a check for "good.example" and the key signed for evil.example.
+      // Building the command here makes the check the thing that decides.
+      argv = ['ssh', ...hardenedSshOptions(agent.socketPath), op.destination, '--', ...op.remoteArgv];
+    } else {
+      if (!Array.isArray(op.rsyncArgs) || op.rsyncArgs.length === 0) {
+        agent.close();
+        return deny('Refused: rsyncArgs must be a non-empty array.');
+      }
+      // rsync carries its destination inside its path arguments, so every remote-looking
+      // argument is checked against the same allowlist rather than trusting one field.
+      for (const a of op.rsyncArgs) {
+        const h = rsyncRemoteHost(a);
+        if (h !== null && !allowedHosts.includes(h)) {
+          agent.close();
+          return deny(`Refused: rsync argument targets "${h}", which is not in this entry's permitted hosts (${allowedHosts.join(', ')}).`);
+        }
+      }
+      const sshCmd = ['ssh', ...hardenedSshOptions(agent.socketPath)]
+        .map((t) => (/[\s"']/.test(t) ? JSON.stringify(t) : t)).join(' ');
+      argv = ['rsync', '-e', sshCmd, ...op.rsyncArgs];
+    }
+
     // spawn, NOT spawnSync. The agent's listener lives on this process's event loop, so
     // a synchronous spawn would block the very loop that has to answer the child's
     // signature request — the command would hang until its timeout, every time.
@@ -372,13 +464,7 @@ export async function runSshBrokered(opts: {
       const child = spawn(argv[0], argv.slice(1), {
         shell: false,
         cwd,
-        env: {
-          ...process.env,
-          SSH_AUTH_SOCK: agent.socketPath,
-          // Stop ssh reaching for ~/.ssh/id_* or a previously-forwarded agent: this
-          // command authenticates with THIS key or not at all.
-          GIT_SSH_COMMAND: `ssh -o IdentitiesOnly=yes -o IdentityAgent=${agent.socketPath}`,
-        },
+        env: { ...process.env, SSH_AUTH_SOCK: agent.socketPath },
       });
 
       let stdout = '';

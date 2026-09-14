@@ -1,0 +1,121 @@
+{
+  "verdict": "revise",
+  "summary": "The excerpt implements a functional in-memory Ed25519 parser, a compatible signing-only agent, bounded socket cleanup, and owner-facing entry-mode endpoints. It is not ready to ship because the required MCP tool is not shown, the host and identity restrictions can be bypassed during normal invocation, and successful signatures are not guaranteed to produce audit records.",
+  "spec_check": [
+    {
+      "requirement": "A1. Parse an OpenSSH ed25519 private key in memory",
+      "status": "met",
+      "evidence": "loadOpenSshEd25519 parses the openssh-key-v1 container, rejects non-none ciphers with an ssh-passphrase message, rejects non-ed25519 key types explicitly, validates 32-byte public and 64-byte private fields, and imports the seed without filesystem writes."
+    },
+    {
+      "requirement": "A2. Serve the ssh-agent protocol over a unix socket",
+      "status": "met",
+      "evidence": "handleAgentMessage implements message types 11 and 13, returns types 12 and 14, rejects a mismatched key blob and unknown types with type 5, and startAgent handles framed messages per connection while isolating malformed or oversized connections."
+    },
+    {
+      "requirement": "A3. Bound the socket's lifetime and permissions",
+      "status": "met",
+      "evidence": "startAgent uses mkdtemp, explicitly applies directory mode 0700 and socket mode 0600, rejects Windows, and runSshBrokered closes and recursively removes the agent directory in a finally block on success, spawn error, and timeout."
+    },
+    {
+      "requirement": "A4. Expose it as a tool vault_ssh_exec(entry_id, host, argv[], purpose)",
+      "status": "unmet",
+      "evidence": "The shown code only exports runSshBrokered with an already-loaded identity and caller-supplied allowedHosts; no MCP registration, entry_id lookup, purpose parameter, or server-side loading of the entry allowlist is shown. The helper also does not bind the validated host to the destination in argv and applies SSH options only through GIT_SSH_COMMAND."
+    },
+    {
+      "requirement": "A5. Log every signature",
+      "status": "unmet",
+      "evidence": "Audit handling is an optional onSign callback rather than a required logger. A successful request made without the callback emits no audit line, and rejected SIGN_REQUEST messages do not invoke the callback at all."
+    },
+    {
+      "requirement": "B1. agent_vault_entries.entry_mode, non-null",
+      "status": "partial",
+      "evidence": "The test-local DDL declares the column NOT NULL with a LEGACY_EXEC default and stamps null or empty rows, but the production migration and AgentVaultEntry model are not included in the excerpt. The test duplicates the asserted app/main.py SQL instead of executing that production migration."
+    },
+    {
+      "requirement": "B2. Downgrade is owner-authenticated",
+      "status": "partial",
+      "evidence": "The shown PATCH route requires the owner cookie and CSRF dependency, scopes the entry through an agent owned by that user, and logs broker-to-legacy changes. Agent-authenticated routes are not shown, so the assertion that none can write entry_mode cannot be verified from this excerpt."
+    },
+    {
+      "requirement": "B3. Conversion progress is visible",
+      "status": "met",
+      "evidence": "The mode-counts endpoint authenticates the account, groups entries through that account's registered agents, and returns per-mode counts plus total, brokered, and legacy totals."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/ssh-agent.ts",
+      "line": null,
+      "claim": "Unless integration exists outside the excerpt, the required vault_ssh_exec(entry_id, host, argv, purpose) MCP tool is missing and the only exported runner trusts an already-loaded identity and caller-supplied allowlist.",
+      "failure_scenario": "An MCP client requests vault_ssh_exec for entry e1 with a purpose string; the shown build has no tool registration or handler that resolves e1, decrypts its SSH key, reads its configured allowlist, or accepts purpose, so the operation is unavailable or must bypass the specified entry-based authorization path.",
+      "suggested_direction": "Expose the exact tool contract through the MCP registry and have its server-side handler load the entry, enforce its entry mode, obtain its configured allowlist, load the key in memory, and pass purpose through the intended authorization or audit path."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/ssh-agent.ts",
+      "line": null,
+      "claim": "The validated host is only metadata and is never tied to the SSH destination contained in argv, so an allowed host can authorize use of the broker key against a different host.",
+      "failure_scenario": "With allowedHosts set to [\"good.example\"], host set to \"good.example\", and argv set to [\"ssh\", \"evil.example\"], validation succeeds and the broker signs the SSH exchange with evil.example; the audit callback labels those signatures as authorized for good.example.",
+      "suggested_direction": "Construct or constrain the transport invocation so the actual SSH destination is the validated host, including supported wrappers such as rsync or git, rather than trusting an unrelated host argument as the authorization target."
+    },
+    {
+      "id": "F3",
+      "severity": "blocker",
+      "file": "src/ssh-agent.ts",
+      "line": null,
+      "claim": "IdentitiesOnly and IdentityAgent are supplied only through GIT_SSH_COMMAND, leaving direct ssh, rsync, and other SSH-based commands able to use configured identity files or another IdentityAgent.",
+      "failure_scenario": "Run argv [\"ssh\", \"user@good.example\"] where the broker key is rejected but ~/.ssh/id_ed25519 is accepted, or where ~/.ssh/config selects another IdentityAgent for good.example; the direct ssh process ignores GIT_SSH_COMMAND and succeeds with that unrelated credential instead of failing with the broker key.",
+      "suggested_direction": "Apply broker-only identity controls to the actual SSH transport for every supported command path, suppress local identity files and configured alternate agents, and test that a server accepting only a local fallback key cannot be reached."
+    },
+    {
+      "id": "F4",
+      "severity": "blocker",
+      "file": "src/ssh-agent.ts",
+      "line": null,
+      "claim": "Signature auditing is optional and only runs after a successful signature, so the implementation does not ensure one audit line for every SIGN_REQUEST.",
+      "failure_scenario": "Start the agent with no onSign callback and send a valid request for the loaded identity; it returns SSH_AGENT_SIGN_RESPONSE and increments signCount, but no audit record is emitted. Even when a callback is supplied, a SIGN_REQUEST with a mismatched key blob returns SSH_AGENT_FAILURE without an audit event.",
+      "suggested_direction": "Make an operational audit sink mandatory for brokered execution and invoke it once for every parsed sign request, including refused requests if the specification's request-level wording is retained, with fingerprint, authorized host, timestamp, and outcome but no key material."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "/home/zee/.openclaw/workspace/projects/burnbox/tests/test_entry_mode.py",
+      "line": null,
+      "claim": "Because the production migration is not shown, B1 remains unverified: the migration tests execute copied SQL constants and will pass even if the deployed app migration is absent or has drifted.",
+      "failure_scenario": "If app/main.py omits the ALTER TABLE statement while ADD_COLUMN in this test remains unchanged, all TestMigration cases pass against their private SQLite database, but a deployed legacy database still lacks entry_mode and the mode endpoints fail when SQLAlchemy queries that column.",
+      "suggested_direction": "Exercise the actual production migration or application startup migration against a legacy database, then inspect the resulting production schema and migrated rows rather than maintaining a second copy of the DDL in the test."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "Timeout kills only the immediate child process, not its process group or descendants.",
+      "why_it_matters": "A command such as a script that starts a background ssh, rsync, or remote deployment process can receive exit code 124 while its descendant continues making remote changes; the broker socket is then removed even though the operation the user intended to stop is still running."
+    },
+    {
+      "id": "B2",
+      "concern": "stdout and stderr are accumulated into unbounded in-memory strings.",
+      "why_it_matters": "A noisy or malicious command can emit data continuously until the 120-second default timeout and exhaust the MCP daemon's heap, potentially terminating unrelated vault operations and bypassing orderly socket cleanup."
+    },
+    {
+      "id": "B3",
+      "concern": "There is no startup scavenging for agent directories left by SIGKILL, power loss, or runtime termination that bypasses the exit handler.",
+      "why_it_matters": "The key is no longer usable after process death, but stale wv-agent-* directories and socket nodes accumulate indefinitely and can confuse operational checks that interpret their presence as a live broker."
+    },
+    {
+      "id": "B4",
+      "concern": "The audit callback has no specified durability, backpressure, or failure policy.",
+      "why_it_matters": "If the eventual logger buffers asynchronously, loses records during a crash, or throws while writing, signatures may be used without durable audit evidence or authentication may fail unpredictably after the cryptographic signature has already been computed."
+    }
+  ],
+  "_meta": {
+    "round": 5,
+    "at": "2026-09-14T22:27:37+00:00",
+    "package_bytes": 77719,
+    "schema_problems": []
+  }
+}

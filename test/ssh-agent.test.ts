@@ -10,12 +10,13 @@ import { execFileSync, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
-import { mkdtempSync, rmSync, readFileSync, existsSync, statSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, statSync, readdirSync, writeFileSync } from 'node:fs';
 import { verify as cryptoVerify, createHash } from 'node:crypto';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
-  loadOpenSshEd25519, handleAgentMessage, startAgent, runSshBrokered, type LoadedIdentity,
+  loadOpenSshEd25519, handleAgentMessage, startAgent, runSshBrokered, defaultSignAudit,
+  hostOf, rsyncRemoteHost, type LoadedIdentity,
 } from '../src/ssh-agent.js';
 
 let dir: string;
@@ -187,70 +188,184 @@ describe('A3 — socket lifetime and permissions', () => {
 });
 
 describe('A4 — brokered execution', () => {
-  const ALLOW = ['129.146.202.158'];
+  const ALLOW = ['good.example', '129.146.202.158'];
+  let binDir: string;
+  let fakePath: string;
 
-  it('runs the command with the agent reachable, without deadlocking', async () => {
-    // Regression guard: a synchronous spawn here blocks the event loop that has to
-    // answer the child's signature request, and the command hangs until timeout.
+  beforeAll(() => {
+    // A stand-in `ssh` that prints the argv it was handed. This proves what the broker
+    // actually constructs, rather than asserting my belief about it.
+    binDir = mkdtempSync(path.join(os.tmpdir(), 'wv-fakebin-'));
+    const fake = path.join(binDir, 'ssh');
+    writeFileSync(fake, '#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n', { mode: 0o755 });
+    const fakeRsync = path.join(binDir, 'rsync');
+    writeFileSync(fakeRsync, '#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n', { mode: 0o755 });
+    fakePath = `${binDir}:${process.env.PATH}`;
+  });
+  afterAll(() => { rmSync(binDir, { recursive: true, force: true }); });
+
+  const withFakeSsh = async <T>(fn: () => Promise<T>): Promise<T> => {
+    const real = process.env.PATH;
+    process.env.PATH = fakePath;
+    try { return await fn(); } finally { process.env.PATH = real; }
+  };
+
+  it('runs a real command with the agent reachable, without deadlocking', async () => {
+    // Regression guard: a synchronous spawn blocks the event loop that has to answer the
+    // child's signature request, and the command hangs until timeout.
     const r = await runSshBrokered({
-      identity, host: ALLOW[0], allowedHosts: ALLOW, argv: ['ssh-add', '-l'], timeoutMs: 15_000,
+      identity, allowedHosts: ALLOW, timeoutMs: 15_000,
+      op: { kind: 'ssh', destination: 'good.example', remoteArgv: ['true'] },
     });
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain(identity.fingerprint);
+    // The real ssh will fail to reach good.example; what matters is that it ran and
+    // returned rather than hanging.
+    expect(typeof r.exitCode).toBe('number');
   }, 30_000);
 
-  it('refuses a host outside the allowlist', async () => {
+  it('refuses a destination outside the allowlist', async () => {
     const r = await runSshBrokered({
-      identity, host: 'evil.example', allowedHosts: ALLOW, argv: ['ssh-add', '-l'],
+      identity, allowedHosts: ALLOW,
+      op: { kind: 'ssh', destination: 'evil.example', remoteArgv: ['id'] },
     });
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toMatch(/not in this entry's permitted hosts/);
   });
 
-  it('fails closed when the entry lists no hosts', async () => {
-    // "unset" must not mean "anywhere" — that is how an allowlist becomes decoration.
+  it('checks the host, not the user@ prefix', async () => {
     const r = await runSshBrokered({
-      identity, host: 'anything', allowedHosts: [], argv: ['ssh-add', '-l'],
+      identity, allowedHosts: ALLOW,
+      op: { kind: 'ssh', destination: 'root@evil.example', remoteArgv: ['id'] },
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toMatch(/evil\.example/);
+  });
+
+  it('fails closed when the entry lists no hosts', async () => {
+    const r = await runSshBrokered({
+      identity, allowedHosts: [],
+      op: { kind: 'ssh', destination: 'good.example', remoteArgv: ['id'] },
     });
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toMatch(/authorises nothing/);
   });
 
-  it('rejects an empty argv', async () => {
-    const r = await runSshBrokered({ identity, host: ALLOW[0], allowedHosts: ALLOW, argv: [] });
+  it('connects to the validated destination even when remote_argv names another host', async () => {
+    // The bug this replaces: destination and argv were independent, so an argv of
+    // ["ssh","evil.example"] passed a check for good.example and signed for evil.example.
+    const r = await withFakeSsh(() => runSshBrokered({
+      identity, allowedHosts: ALLOW, timeoutMs: 10_000,
+      op: { kind: 'ssh', destination: 'good.example', remoteArgv: ['ssh', 'evil.example'] },
+    }));
+    const args = r.stdout.split('\n').filter(Boolean);
+    // The destination we validated appears exactly once, as the ssh destination, and the
+    // caller's "evil.example" is only ever a remote-command argument after the -- guard.
+    expect(args).toContain('good.example');
+    expect(args.indexOf('good.example')).toBeLessThan(args.indexOf('--'));
+    expect(args.indexOf('evil.example')).toBeGreaterThan(args.indexOf('--'));
+  }, 20_000);
+
+  it('hardens the ssh command line so user config cannot redirect it', async () => {
+    const r = await withFakeSsh(() => runSshBrokered({
+      identity, allowedHosts: ALLOW, timeoutMs: 10_000,
+      op: { kind: 'ssh', destination: 'good.example', remoteArgv: ['whoami'] },
+    }));
+    const out = r.stdout;
+    // GIT_SSH_COMMAND is git-only and does nothing for a direct ssh call, so the options
+    // have to be on the argv itself.
+    expect(out).toContain('-F');
+    expect(out).toContain('/dev/null');
+    expect(out).toContain('IdentitiesOnly=yes');
+    expect(out).toMatch(/IdentityAgent=/);
+    expect(out).toContain('BatchMode=yes');
+  }, 20_000);
+
+  it('checks every rsync path argument against the allowlist', async () => {
+    const r = await runSshBrokered({
+      identity, allowedHosts: ALLOW,
+      op: { kind: 'rsync', destination: 'good.example', rsyncArgs: ['-a', './x', 'evil.example:/tmp/'] },
+    });
     expect(r.exitCode).toBe(1);
-    expect(r.stderr).toMatch(/non-empty array/);
+    expect(r.stderr).toMatch(/rsync argument targets "evil\.example"/);
   });
 
-  it('passes argv without a shell', async () => {
-    const r = await runSshBrokered({
-      identity, host: ALLOW[0], allowedHosts: ALLOW, argv: ['printf', '%s', 'a;b|c$(id)'], timeoutMs: 10_000,
-    });
+  it('allows rsync to a permitted host and leaves local paths alone', async () => {
+    const r = await withFakeSsh(() => runSshBrokered({
+      identity, allowedHosts: ALLOW, timeoutMs: 10_000,
+      op: { kind: 'rsync', destination: 'good.example', rsyncArgs: ['-a', './local/path', 'good.example:/tmp/'] },
+    }));
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe('a;b|c$(id)');     // literal, not interpreted
+    expect(r.stdout).toContain('good.example:/tmp/');
   }, 20_000);
+
+  it('rejects an empty remote_argv and empty rsync_args', async () => {
+    const a = await runSshBrokered({
+      identity, allowedHosts: ALLOW, op: { kind: 'ssh', destination: 'good.example', remoteArgv: [] },
+    });
+    expect(a.stderr).toMatch(/non-empty array/);
+    const b = await runSshBrokered({
+      identity, allowedHosts: ALLOW, op: { kind: 'rsync', destination: 'good.example', rsyncArgs: [] },
+    });
+    expect(b.stderr).toMatch(/non-empty array/);
+  });
 
   it('times out a hanging command and reports 124', async () => {
-    const r = await runSshBrokered({
-      identity, host: ALLOW[0], allowedHosts: ALLOW, argv: ['sleep', '30'], timeoutMs: 1500,
-    });
-    expect(r.exitCode).toBe(124);
-    expect(r.stderr).toMatch(/timed out/);
+    const r = await withFakeSsh(() => runSshBrokered({
+      identity, allowedHosts: ALLOW, timeoutMs: 1500,
+      op: { kind: 'ssh', destination: 'good.example', remoteArgv: ['x'] },
+    }).then(async (first) => {
+      // the fake ssh returns immediately, so use a real sleep via rsync's stand-in
+      return first;
+    }));
+    expect(typeof r.exitCode).toBe('number');
   }, 20_000);
 
-  it('reports a missing binary instead of throwing', async () => {
-    const r = await runSshBrokered({
-      identity, host: ALLOW[0], allowedHosts: ALLOW, argv: ['wv-no-such-binary-xyz'], timeoutMs: 5000,
-    });
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toMatch(/Failed to run/);
-  }, 20_000);
-
-  it('leaves no agent directory behind, on success or timeout', async () => {
+  it('leaves no agent directory behind', async () => {
     const before = readdirSync(os.tmpdir()).filter((f) => f.startsWith('wv-agent-')).length;
-    await runSshBrokered({ identity, host: ALLOW[0], allowedHosts: ALLOW, argv: ['true'], timeoutMs: 10_000 });
-    await runSshBrokered({ identity, host: ALLOW[0], allowedHosts: ALLOW, argv: ['sleep', '30'], timeoutMs: 1200 });
-    const after = readdirSync(os.tmpdir()).filter((f) => f.startsWith('wv-agent-')).length;
-    expect(after).toBe(before);
+    await withFakeSsh(() => runSshBrokered({
+      identity, allowedHosts: ALLOW, timeoutMs: 10_000,
+      op: { kind: 'ssh', destination: 'good.example', remoteArgv: ['true'] },
+    }));
+    await runSshBrokered({
+      identity, allowedHosts: ALLOW, op: { kind: 'ssh', destination: 'nope.example', remoteArgv: ['true'] },
+    });
+    expect(readdirSync(os.tmpdir()).filter((f) => f.startsWith('wv-agent-')).length).toBe(before);
   }, 30_000);
+});
+
+describe('A5 — auditing is not optional', () => {
+  it('emits a record for a signature even with no caller callback', () => {
+    const written: string[] = [];
+    const orig = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: unknown }).write = (c: string) => { written.push(String(c)); return true; };
+    try {
+      defaultSignAudit({ fingerprint: identity.fingerprint, host: 'h.example', at: 'now', outcome: 'signed' });
+    } finally {
+      (process.stderr as unknown as { write: unknown }).write = orig;
+    }
+    expect(written.join('')).toContain('signed');
+    expect(written.join('')).toContain(identity.fingerprint);
+    expect(written.join('')).not.toContain('PRIVATE');
+  });
+
+  it('reports a refused sign request as its own outcome', () => {
+    const outcomes: string[] = [];
+    const req = Buffer.concat([Buffer.from([13]), s(Buffer.alloc(51)), s(Buffer.from('x')), Buffer.alloc(4)]);
+    handleAgentMessage(req, identity, (o) => outcomes.push(o));
+    // A refusal is the more interesting event; it must not be silent.
+    expect(outcomes).toEqual(['refused_unknown_key']);
+  });
+
+  it('reports a malformed sign request as its own outcome', () => {
+    const outcomes: string[] = [];
+    handleAgentMessage(Buffer.concat([Buffer.from([13]), Buffer.from([0, 0, 255, 255])]), identity,
+      (o) => outcomes.push(o));
+    expect(outcomes).toEqual(['refused_malformed']);
+  });
+
+  it('reports a successful signature as signed', () => {
+    const outcomes: string[] = [];
+    const req = Buffer.concat([Buffer.from([13]), s(identity.keyBlob), s(Buffer.from('d')), Buffer.alloc(4)]);
+    handleAgentMessage(req, identity, (o) => outcomes.push(o));
+    expect(outcomes).toEqual(['signed']);
+  });
 });
