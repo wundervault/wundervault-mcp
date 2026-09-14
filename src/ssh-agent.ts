@@ -558,3 +558,44 @@ export async function runSshBrokered(opts: {
     agent.close();
   }
 }
+
+// ── entry mode gating ──────────────────────────────────────────────────────────
+
+export const BROKER_SSH_AGENT = 'BROKER_SSH_AGENT';
+export const LEGACY_EXEC = 'LEGACY_EXEC';
+
+/**
+ * Which tool an entry may be used through.
+ *
+ * Enforced here, in the client, because the server cannot currently tell the two apart:
+ * the MCP daemon is the client for both vault_exec and vault_ssh_exec and fetches the
+ * same ciphertext either way. Server-side enforcement needs the daemon to authenticate
+ * as itself. Until then this is an authoritative value checked at the point of use —
+ * which stops an entry being used the wrong way by accident or by a confused caller,
+ * and does not stop someone who has already replaced this code.
+ *
+ * Unknown modes fail CLOSED for the broker and OPEN for legacy, so a server that starts
+ * returning a mode this build has never heard of does not silently hand a brokered key
+ * to the generic exec path.
+ */
+export function modeAllowsLegacyExec(mode: string | undefined): boolean {
+  const m = (mode || LEGACY_EXEC).trim().toUpperCase();
+  return m === LEGACY_EXEC;
+}
+
+export function modeAllowsSshBroker(mode: string | undefined): boolean {
+  return (mode || LEGACY_EXEC).trim().toUpperCase() === BROKER_SSH_AGENT;
+}
+
+export function wrongModeMessage(mode: string | undefined, wanted: 'exec' | 'ssh'): string {
+  const m = (mode || LEGACY_EXEC).trim().toUpperCase();
+  if (wanted === 'exec') {
+    return `Refused: this entry is in ${m} mode, so its secret is not handed to a command. `
+      + 'Use vault_ssh_exec, which keeps the key inside this server and returns only the '
+      + 'result. To move it back, change the entry mode in the dashboard — that is an '
+      + 'owner action and it is logged as a downgrade.';
+  }
+  return `Refused: this entry is in ${m} mode, not ${BROKER_SSH_AGENT}. `
+    + 'Convert it in the dashboard first; brokering a key that is still marked legacy '
+    + 'would claim a protection the entry does not have.';
+}

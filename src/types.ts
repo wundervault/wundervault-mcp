@@ -46,6 +46,8 @@ export interface RemoteHost {
 }
 
 export interface SecretResponse {
+  /** LEGACY_EXEC | BROKER_SSH_AGENT — set server-side, enforced client-side. */
+  entry_mode?: string;
   name?: string;
   encrypted_content: string;
   content_nonce: string;

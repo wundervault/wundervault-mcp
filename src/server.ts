@@ -13,7 +13,8 @@ import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmdirSync, exists
 import net from 'node:net';
 import { AgentVaultAPI } from './api-client.js';
 import { loadEncryptionKey, verifyDirectiveSignature, decryptSecretContent } from './crypto.js';
-import { loadOpenSshEd25519, runSshBrokered, type BrokeredOp } from './ssh-agent.js';
+import { loadOpenSshEd25519, runSshBrokered, modeAllowsLegacyExec, modeAllowsSshBroker,
+  wrongModeMessage, type BrokeredOp } from './ssh-agent.js';
 import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey, commandInvokesSudo } from './exec.js';
 import { getRecipe, recipeIds } from './recipes.js';
 import type { Credentials, VaultEntry, RemoteHost } from './types.js';
@@ -423,6 +424,16 @@ export function createServer(args: { url?: string } = {}) {
 
         const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
 
+        // A brokered entry's secret is not handed out. This covers every path that
+        // returns or writes plaintext, not just vault_exec — vault_entry_get would
+        // otherwise put the key straight into the model's context.
+        if (!modeAllowsLegacyExec(secretData.entry_mode)) {
+          return CallToolResultSchema.parse({
+            content: [{ type: 'text', text: wrongModeMessage(secretData.entry_mode, 'exec') }],
+            isError: true,
+          });
+        }
+
         const vaultKey = await api.ensureVaultKey();
         const plaintextBytes = decryptSecretContent(
           vaultKey,
@@ -487,6 +498,16 @@ export function createServer(args: { url?: string } = {}) {
         }
 
         const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
+
+        // A brokered entry's secret is not handed out. This covers every path that
+        // returns or writes plaintext, not just vault_exec — vault_entry_get would
+        // otherwise put the key straight into the model's context.
+        if (!modeAllowsLegacyExec(secretData.entry_mode)) {
+          return CallToolResultSchema.parse({
+            content: [{ type: 'text', text: wrongModeMessage(secretData.entry_mode, 'exec') }],
+            isError: true,
+          });
+        }
         const vaultKey = await api.ensureVaultKey();
         const plaintextBytes = decryptSecretContent(
           vaultKey,
@@ -544,6 +565,12 @@ export function createServer(args: { url?: string } = {}) {
         // are on this path, so a brokered call is authorised and recorded exactly like a
         // direct one.
         const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
+
+        // An entry still marked legacy must not be brokered: doing so would report a
+        // protection the entry has not been converted to have.
+        if (!modeAllowsSshBroker(secretData.entry_mode)) {
+          return fail(wrongModeMessage(secretData.entry_mode, 'ssh'));
+        }
 
         // The allowlist lives on the entry, server-side, where the owner sets it.
         let allowedHosts: string[] = [];
@@ -661,6 +688,15 @@ export function createServer(args: { url?: string } = {}) {
         if (entry_id) {
           // Fetch entry to get tier and exec_config
           const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
+
+          // A brokered entry is not injected into a caller-chosen command.
+          if (!modeAllowsLegacyExec(secretData.entry_mode)) {
+            return CallToolResultSchema.parse({
+              content: [{ type: 'text', text: wrongModeMessage(secretData.entry_mode, 'exec') }],
+              isError: true,
+            });
+          }
+
           tier = secretData.access_tier ?? '1';
           entryName = secretData.name ?? entry_id;
 

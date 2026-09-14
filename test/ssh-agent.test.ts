@@ -16,7 +16,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   loadOpenSshEd25519, handleAgentMessage, startAgent, runSshBrokered, defaultSignAudit,
-  hostOf, rsyncRemoteHost, quoteForRemoteShell, type LoadedIdentity,
+  hostOf, rsyncRemoteHost, quoteForRemoteShell,
+  modeAllowsLegacyExec, modeAllowsSshBroker, wrongModeMessage, type LoadedIdentity,
 } from '../src/ssh-agent.js';
 
 let dir: string;
@@ -446,5 +447,47 @@ describe('hostOf', () => {
   it('strips a user prefix', () => {
     expect(hostOf('root@example.com')).toBe('example.com');
     expect(hostOf('example.com')).toBe('example.com');
+  });
+});
+
+describe('entry mode gating', () => {
+  it('lets a legacy entry through the exec path', () => {
+    expect(modeAllowsLegacyExec('LEGACY_EXEC')).toBe(true);
+    expect(modeAllowsLegacyExec(undefined)).toBe(true);   // pre-migration rows
+    expect(modeAllowsLegacyExec('legacy_exec')).toBe(true);
+    expect(modeAllowsLegacyExec('  LEGACY_EXEC  ')).toBe(true);
+  });
+
+  it('keeps a brokered entry out of every plaintext path', () => {
+    // vault_entry_get, vault_entry_inject_env and vault_exec all gate on this. A
+    // brokered key must not reach the model's context or a caller-chosen command.
+    expect(modeAllowsLegacyExec('BROKER_SSH_AGENT')).toBe(false);
+  });
+
+  it('refuses to broker an entry that is still marked legacy', () => {
+    // Otherwise the tool would report a protection the entry has not been converted to.
+    expect(modeAllowsSshBroker('LEGACY_EXEC')).toBe(false);
+    expect(modeAllowsSshBroker(undefined)).toBe(false);
+  });
+
+  it('accepts the broker mode for the broker', () => {
+    expect(modeAllowsSshBroker('BROKER_SSH_AGENT')).toBe(true);
+    expect(modeAllowsSshBroker('broker_ssh_agent')).toBe(true);
+  });
+
+  it('fails closed on a mode this build has never heard of', () => {
+    // A server returning a newer mode must not have its key handed to the generic exec
+    // path just because the name is unfamiliar.
+    expect(modeAllowsLegacyExec('BROKER_HTTP')).toBe(false);
+    expect(modeAllowsSshBroker('BROKER_HTTP')).toBe(false);
+  });
+
+  it('explains what to do instead, in both directions', () => {
+    const toExec = wrongModeMessage('BROKER_SSH_AGENT', 'exec');
+    expect(toExec).toContain('vault_ssh_exec');
+    expect(toExec).toMatch(/dashboard/);
+    const toSsh = wrongModeMessage('LEGACY_EXEC', 'ssh');
+    expect(toSsh).toContain('BROKER_SSH_AGENT');
+    expect(toSsh).toMatch(/Convert it/);
   });
 });
