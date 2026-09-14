@@ -1,0 +1,121 @@
+{
+  "verdict": "revise",
+  "summary": "The build provides an in-memory ed25519 agent, bounded Unix socket, owner-controlled entry modes, and mode-count reporting. It does not yet satisfy the broker contract: the exposed tool has a different API, remote argv is still interpreted by a remote shell, OpenSSH can use default identity files instead of the broker identity, and some framed messages and rsync audits are handled incorrectly.",
+  "spec_check": [
+    {
+      "requirement": "A1. Parse an OpenSSH ed25519 private key in memory",
+      "status": "met",
+      "evidence": "src/ssh-agent.ts parses openssh-key-v1 entirely from buffers, rejects encrypted keys with an ssh-passphrase-recipe message, rejects non-ed25519 private sections explicitly, and imports the seed directly into a KeyObject."
+    },
+    {
+      "requirement": "A2. Serve the ssh-agent protocol over a unix socket",
+      "status": "partial",
+      "evidence": "The required identity, signing, failure, and framing formats are implemented, including key-blob matching and a maximum frame size. However, an incomplete framed message from a connection that remains open has no timeout or rejection path and consumes later bytes as part of the unfinished frame."
+    },
+    {
+      "requirement": "A3. Bound the socket's lifetime and permissions",
+      "status": "met",
+      "evidence": "startAgent creates a mkdtemp directory, explicitly sets 0700/0600 modes, rejects win32 with a clear message, and runSshBrokered closes the agent in a finally block after success, spawn error, or timeout."
+    },
+    {
+      "requirement": "A4. Expose it as a tool: vault_ssh_exec(entry_id, host, argv[], purpose)",
+      "status": "unmet",
+      "evidence": "The registered schema instead requires destination and one of remote_argv or rsync_args; it does not accept the specified host and argv fields. Its remote_argv is serialized by OpenSSH into a remotely shell-parsed command, and its SSH options leave default IdentityFile candidates enabled."
+    },
+    {
+      "requirement": "A5. Log every signature",
+      "status": "partial",
+      "evidence": "Every processed sign outcome is synchronously written to stderr with timestamp, loaded-key fingerprint, host, and outcome. For rsync, however, the logged host is always op.destination even when a different allowlisted host in rsyncArgs is the actual SSH endpoint."
+    },
+    {
+      "requirement": "B1. agent_vault_entries.entry_mode, non-null",
+      "status": "partial",
+      "evidence": "The supplied tests extract DDL from app/main.py and reportedly demonstrate legacy stamping, a LEGACY_EXEC default, null rejection, and idempotent stamping. The actual app/main.py migration and model definition are not included, so its startup placement and complete value constraint cannot be verified from this excerpt."
+    },
+    {
+      "requirement": "B2. Downgrade is owner-authenticated",
+      "status": "partial",
+      "evidence": "The shown PATCH endpoint requires an owner cookie and CSRF validation, scopes entries to that owner's agents, and logs broker-to-legacy changes. The claim that no agent-authenticated route can write entry_mode depends on agent routes not included in the excerpt."
+    },
+    {
+      "requirement": "B3. Conversion progress is visible",
+      "status": "met",
+      "evidence": "The owner-authenticated /agent-vault/mode-counts endpoint groups entries by mode within the current account and returns per-mode counts plus total, brokered, and legacy totals."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/ssh-agent.ts",
+      "line": 369,
+      "claim": "IdentitiesOnly=yes does not disable OpenSSH's compiled-in default IdentityFile paths, while no identity is supplied to select the vault-only agent key, so SSH can use a disk key or fail to offer the broker key.",
+      "failure_scenario": "With ~/.ssh/id_ed25519 accepted by good.example and a different key stored in the vault, vault_ssh_exec can authenticate with ~/.ssh/id_ed25519, return exit 0, and report zero broker signatures; with no matching default identity file, a host accepting only the vaulted key can instead return Permission denied without ever requesting a broker signature.",
+      "suggested_direction": "Explicitly select the broker's public identity while disabling all default identity files, using a mechanism that does not write private key material to disk, and verify the behavior against a real sshd with an unrelated default key present."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/ssh-agent.ts",
+      "line": 419,
+      "claim": "Passing remote_argv as trailing ssh arguments does not preserve argv semantics because OpenSSH joins the remote command into a string that the remote login shell interprets.",
+      "failure_scenario": "For destination good.example and remote_argv [\"printf\", \"%s\", \"safe; touch /tmp/wv-pwn\"], OpenSSH sends a command string to the remote shell, so the semicolon can terminate printf and execute touch instead of remaining part of one literal argument as acceptance check 12 requires.",
+      "suggested_direction": "Use a remote execution mechanism that preserves argument boundaries, or apply rigorously tested argument encoding before SSH serialization; validate it end-to-end against an actual SSH server with metacharacters, spaces, quotes, and empty arguments."
+    },
+    {
+      "id": "F3",
+      "severity": "blocker",
+      "file": "src/server.ts",
+      "line": 520,
+      "claim": "The registered vault_ssh_exec interface does not implement the specified host and argv parameter names.",
+      "failure_scenario": "A conforming call such as {\"entry_id\":\"key1\",\"host\":\"good.example\",\"argv\":[\"id\"],\"purpose\":\"deploy\"} leaves destination empty and both operation arrays absent, so the handler returns \"vault_ssh_exec needs entry_id, destination and purpose\" instead of executing the command.",
+      "suggested_direction": "Align the public tool schema and handler with the specified entry_id, host, argv, and purpose contract, or formally revise the specification and all clients and acceptance checks to the new operation model."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "src/ssh-agent.ts",
+      "line": 285,
+      "claim": "A client that starts an in-range frame and stops sending is never timed out or rejected, and subsequent bytes on that connection remain trapped in the unfinished frame.",
+      "failure_scenario": "A client writes a big-endian length of 32 followed by only the REQUEST_IDENTITIES byte and keeps the socket open; sending a complete five-byte REQUEST_IDENTITIES frame afterward still leaves fewer than 32 payload bytes buffered, so no reply is produced and the subsequent request is blocked indefinitely.",
+      "suggested_direction": "Put a bounded deadline on incomplete frames and close the offending connection when it expires, while keeping the listener available to other connections; add socket-level tests rather than only direct handleAgentMessage tests."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "src/ssh-agent.ts",
+      "line": 438,
+      "claim": "Rsync signatures can be attributed to a different host from the endpoint that actually requested them because the audit host is fixed from op.destination rather than the validated remote rsync argument.",
+      "failure_scenario": "With allowedHosts [\"good.example\",\"other.example\"], destination \"good.example\", and rsyncArgs [\"-a\",\"./x\",\"other.example:/tmp/\"], validation succeeds and rsync connects to other.example, but every resulting signature line records host=good.example.",
+      "suggested_direction": "Require the rsync remote endpoint to match the declared destination or derive the audit host from the single validated endpoint actually used, and reject ambiguous or multiple remote endpoints."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The specification does not define how entry_mode must gate execution paths, and the shown vault_ssh_exec handler ignores entry_mode while the remainder of the legacy vault_exec handler is omitted.",
+      "why_it_matters": "Unless omitted code rejects legacy delivery for BROKER_SSH_AGENT entries, an agent can continue invoking the old path and cause the private SSH key to be exposed or written to a temporary file, making the mode reporting-only rather than protective."
+    },
+    {
+      "id": "B2",
+      "concern": "Child stdout and stderr are accumulated in unbounded JavaScript strings for up to 900 seconds.",
+      "why_it_matters": "A remote command such as yes, or a noisy failed transfer, can exhaust the MCP daemon's memory before timeout and take unrelated vault operations down with it."
+    },
+    {
+      "id": "B3",
+      "concern": "The rsync remote-host parser does not understand bracketed IPv6 destinations.",
+      "why_it_matters": "An argument such as [2001:db8::1]:/tmp is parsed at its first internal colon as host \"[\", so a correctly allowlisted IPv6 host is refused and IPv6-only deployments cannot use the advertised rsync mode."
+    },
+    {
+      "id": "B4",
+      "concern": "Signature audit records exist only as writes to process stderr, with no stated durable sink, backpressure policy, or correlation identifier.",
+      "why_it_matters": "Service managers that discard or rotate stderr can erase the required accountability trail, and concurrent commands using the same key and host cannot reliably be tied back to the initiating entry or purpose."
+    }
+  ],
+  "_meta": {
+    "round": 6,
+    "at": "2026-09-14T22:38:12+00:00",
+    "package_bytes": 87946,
+    "schema_problems": []
+  }
+}

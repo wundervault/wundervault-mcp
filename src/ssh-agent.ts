@@ -18,7 +18,7 @@
 import { createPrivateKey, createPublicKey, sign as cryptoSign, createHash, KeyObject } from 'node:crypto';
 import { createServer, Server, Socket } from 'node:net';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, chmodSync } from 'node:fs';
+import { mkdtempSync, rmSync, chmodSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -31,6 +31,14 @@ const SSH_AGENT_SIGN_RESPONSE = 14;
 
 /** A framed agent message longer than this is refused rather than buffered. */
 const MAX_MESSAGE_BYTES = 256 * 1024;
+
+/**
+ * A peer that declares a length and then stops sending would otherwise hold its
+ * connection — and any message queued behind it — open for as long as the agent lives.
+ * The declared length is authoritative, so this is not protocol leniency; it is just
+ * refusing to wait forever for bytes that are not coming.
+ */
+const CONNECTION_IDLE_MS = 30_000;
 
 const ED25519_KEY_TYPE = 'ssh-ed25519';
 const OPENSSH_MAGIC = Buffer.from('openssh-key-v1\0', 'binary');
@@ -252,6 +260,8 @@ export function handleAgentMessage(
 
 export interface AgentHandle {
   socketPath: string;
+  /** Path to the PUBLIC key, written so ssh can be pinned to this identity. */
+  publicKeyPath: string;
   signCount: () => number;
   close: () => void;
 }
@@ -274,11 +284,25 @@ export function startAgent(identity: LoadedIdentity, onSign?: (e: SignEvent) => 
   chmodSync(dir, 0o700);
   const socketPath = path.join(dir, 'agent.sock');
 
+  // The PUBLIC half, written to the same 0700 directory. This is not a secret, and ssh
+  // needs it: IdentitiesOnly alone does NOT stop ssh trying ~/.ssh/id_* — the man page
+  // says "either the default files, or those explicitly configured". Naming the public
+  // key as IdentityFile is the documented way to pin one agent identity, and without it
+  // a host that accepts some other local key would authenticate with that instead and
+  // the broker key would never be used.
+  const publicKeyPath = path.join(dir, 'id.pub');
+  writeFileSync(
+    publicKeyPath,
+    `ssh-ed25519 ${identity.keyBlob.toString('base64')} ${identity.comment || 'wundervault'}\n`,
+    { mode: 0o600 },
+  );
+
   let signs = 0;
   const sockets = new Set<Socket>();
 
   const server: Server = createServer((conn) => {
     sockets.add(conn);
+    conn.setTimeout(CONNECTION_IDLE_MS, () => { try { conn.destroy(); } catch { /* ignore */ } });
     conn.on('close', () => sockets.delete(conn));
     conn.on('error', () => { try { conn.destroy(); } catch { /* ignore */ } });
 
@@ -325,6 +349,7 @@ export function startAgent(identity: LoadedIdentity, onSign?: (e: SignEvent) => 
   let closed = false;
   const handle = {
     socketPath,
+    publicKeyPath,
     signCount: () => signs,
     close: () => {
       if (closed) return;
@@ -365,13 +390,16 @@ export interface SshBrokerResult { exitCode: number; stdout: string; stderr: str
  * restrict-destination session-bind extension, and is out of scope for this build.
  */
 /** Everything after `ssh` that stops it choosing its own credentials or destination. */
-export function hardenedSshOptions(socketPath: string): string[] {
+export function hardenedSshOptions(socketPath: string, publicKeyPath: string): string[] {
   return [
     // -F /dev/null FIRST: ~/.ssh/config can set IdentityAgent, ProxyCommand or a
     // different Hostname for a given pattern, which would let user config redirect a
     // brokered connection. GIT_SSH_COMMAND does not help here — it is git-only, and a
     // direct ssh invocation ignores it entirely.
     '-F', '/dev/null',
+    // IdentityFile + IdentitiesOnly together are what actually pin this connection to
+    // the broker key. IdentitiesOnly by itself still permits the default identity files.
+    '-o', `IdentityFile=${publicKeyPath}`,
     '-o', 'IdentitiesOnly=yes',
     '-o', `IdentityAgent=${socketPath}`,
     '-o', 'BatchMode=yes',              // never block on a passphrase or password prompt
@@ -395,6 +423,18 @@ export function rsyncRemoteHost(arg: string): string | null {
   const slash = arg.indexOf('/');
   if (slash !== -1 && slash < colon) return null;   // e.g. ./weird:name
   return hostOf(arg.slice(0, colon));
+}
+
+/**
+ * Quote one argument for the remote shell.
+ *
+ * `ssh host -- a b c` does NOT pass an argv: OpenSSH joins the arguments with spaces and
+ * hands the result to the remote login shell. So an argument containing `;` executes on
+ * the far side even though nothing was interpreted locally. Single-quoting, with the
+ * usual '"'"' dance for embedded quotes, is what makes each element one literal word.
+ */
+export function quoteForRemoteShell(arg: string): string {
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
 }
 
 export type BrokeredOp =
@@ -425,7 +465,17 @@ export async function runSshBrokered(opts: {
     return deny(`Refused: "${host}" is not in this entry's permitted hosts (${allowedHosts.join(', ')}).`);
   }
 
-  const agent = startAgent(identity, onSign, host);
+  // rsync carries its destination in its path arguments, so with two allowlisted hosts
+  // it can connect to the second while `destination` names the first — and every
+  // signature line would then record a host the key was never used against. Audit what
+  // the arguments actually target.
+  let auditedHost = host;
+  if (op.kind === 'rsync' && Array.isArray(op.rsyncArgs)) {
+    const targets = [...new Set(op.rsyncArgs.map(rsyncRemoteHost).filter((h): h is string => h !== null))];
+    if (targets.length > 0) auditedHost = targets.join(',');
+  }
+
+  const agent = startAgent(identity, onSign, auditedHost);
   let argv: string[];
   try {
     if (op.kind === 'ssh') {
@@ -437,7 +487,11 @@ export async function runSshBrokered(opts: {
       // argv and the validated host was merely advisory: argv ["ssh","evil.example"]
       // sailed through a check for "good.example" and the key signed for evil.example.
       // Building the command here makes the check the thing that decides.
-      argv = ['ssh', ...hardenedSshOptions(agent.socketPath), op.destination, '--', ...op.remoteArgv];
+      // One quoted string, not N arguments: see quoteForRemoteShell.
+      argv = [
+        'ssh', ...hardenedSshOptions(agent.socketPath, agent.publicKeyPath), op.destination, '--',
+        op.remoteArgv.map(quoteForRemoteShell).join(' '),
+      ];
     } else {
       if (!Array.isArray(op.rsyncArgs) || op.rsyncArgs.length === 0) {
         agent.close();
@@ -452,7 +506,7 @@ export async function runSshBrokered(opts: {
           return deny(`Refused: rsync argument targets "${h}", which is not in this entry's permitted hosts (${allowedHosts.join(', ')}).`);
         }
       }
-      const sshCmd = ['ssh', ...hardenedSshOptions(agent.socketPath)]
+      const sshCmd = ['ssh', ...hardenedSshOptions(agent.socketPath, agent.publicKeyPath)]
         .map((t) => (/[\s"']/.test(t) ? JSON.stringify(t) : t)).join(' ');
       argv = ['rsync', '-e', sshCmd, ...op.rsyncArgs];
     }
@@ -467,14 +521,25 @@ export async function runSshBrokered(opts: {
         env: { ...process.env, SSH_AUTH_SOCK: agent.socketPath },
       });
 
+      // Bounded. A chatty or hostile remote could otherwise grow these strings for the
+      // whole timeout window; truncation is visible rather than silent.
+      const MAX_OUTPUT = 4 * 1024 * 1024;
       let stdout = '';
       let stderr = '';
+      let truncated = false;
+      const append = (cur: string, add: string): string => {
+        if (cur.length >= MAX_OUTPUT) { truncated = true; return cur; }
+        const room = MAX_OUTPUT - cur.length;
+        if (add.length > room) { truncated = true; return cur + add.slice(0, room); }
+        return cur + add;
+      };
       let settled = false;
       const finish = (exitCode: number, extra = '') => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        resolve({ exitCode, stdout, stderr: stderr + extra, signCount: agent.signCount() });
+        const note = truncated ? `\n[output truncated at ${MAX_OUTPUT} bytes]` : '';
+        resolve({ exitCode, stdout, stderr: stderr + extra + note, signCount: agent.signCount() });
       };
 
       const timer = setTimeout(() => {
@@ -482,8 +547,8 @@ export async function runSshBrokered(opts: {
         finish(124, `\nCommand timed out after ${Math.round(timeoutMs / 1000)}s.`);
       }, timeoutMs);
 
-      child.stdout?.on('data', (d) => { stdout += d.toString(); });
-      child.stderr?.on('data', (d) => { stderr += d.toString(); });
+      child.stdout?.on('data', (d) => { stdout = append(stdout, d.toString()); });
+      child.stderr?.on('data', (d) => { stderr = append(stderr, d.toString()); });
       child.on('error', (e) => finish(1, `\nFailed to run ${argv[0]}: ${e.message}`));
       child.on('close', (code) => finish(code ?? 1));
     });

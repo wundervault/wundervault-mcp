@@ -1,0 +1,12 @@
+{"round": 6, "decisions": [
+ {"id":"F1","action":"fixed","claim":"ssh can authenticate with a default identity file instead of the broker key",
+  "reason":"confirmed, and I had IdentitiesOnly backwards — it restricts AGENT-offered identities to configured ones, it does not stop ssh using ~/.ssh/id_*. Fix: write the PUBLIC key (not secret) into the 0700 dir and pass -o IdentityFile=<pub> with IdentitiesOnly=yes, the documented way to pin one agent identity."},
+ {"id":"F2","action":"fixed","claim":"remote_argv is joined and re-interpreted by the remote shell",
+  "reason":"confirmed. `ssh host -- a b c` concatenates into ONE string for the remote shell, so a `;` in an argument executes. Local argv safety was never remote argv safety. Each element is now shell-quoted for the remote side."},
+ {"id":"F3","action":"rejected","claim":"the tool API does not match the spec's vault_ssh_exec(entry_id, host, argv[], purpose)",
+  "reason":"the spec is stale, not the code. That exact signature IS round 1's F2 bug — an argv carrying its own destination alongside an advisory host field. Changing the API was the fix. Updating SPEC.md to match rather than reintroducing the vulnerability."},
+ {"id":"F4","action":"fixed","claim":"a bogus frame length stalls the connection forever",
+  "reason":"the length is authoritative so a client declaring 32 and sending 1 is malformed, but hanging on it is still wrong. Added a per-connection idle timeout so a stalled peer is dropped rather than held open."},
+ {"id":"F5","action":"fixed","claim":"rsync audit records the destination, not the host actually connected to",
+  "reason":"confirmed. With two allowlisted hosts, rsync can target the second while every signature line names the first. The audited host now comes from the rsync arguments themselves."}
+]}

@@ -44,13 +44,26 @@ Implement the subset OpenSSH actually uses for a signing-only agent:
 - Refuse to run on Windows with a clear message (unix sockets + POSIX modes).
 
 ### A4. Expose it as a tool
-`vault_ssh_exec(entry_id, host, argv[], purpose)`:
-- `host` is validated against an allowlist supplied by the entry's config; if the entry
-  names no allowlist, the call is refused (fail closed, not open).
-- `argv` is an **array**, passed without a shell.
-- Runs the command with `SSH_AUTH_SOCK` pointed at the broker socket and
-  `IdentitiesOnly`/`IdentityAgent` set so ssh cannot silently fall back to another key.
-- Returns exit code, stdout, stderr.
+`vault_ssh_exec(entry_id, destination, purpose, remote_argv[] | rsync_args[])`.
+
+**Revised after round 1.** The original signature was `(entry_id, host, argv[], purpose)`,
+which is the vulnerability itself: `argv` carries its own destination, so `host` was an
+advisory field beside it and `argv: ["ssh","evil.example"]` passed a check for
+`good.example`. The broker must **construct** the command from the validated destination.
+
+- `destination` is `[user@]host`; the host part is validated against `ssh_hosts` on the
+  entry. No allowlist means the entry authorises nothing (fail closed).
+- Exactly one of `remote_argv` or `rsync_args`.
+- `remote_argv` elements are each quoted for the **remote** shell. `ssh host -- a b c`
+  joins its arguments into one string for the remote login shell, so local argv safety
+  is not remote argv safety.
+- Every `[user@]host:path` in `rsync_args` is validated against the same allowlist,
+  because rsync carries its destination inside its paths.
+- ssh is pinned to the broker identity with `IdentityFile=<the public key>` **and**
+  `IdentitiesOnly=yes`. `IdentitiesOnly` alone is not enough — it still permits the
+  default identity files, so ssh could authenticate with `~/.ssh/id_*` and never use the
+  broker key at all. `-F /dev/null` stops `~/.ssh/config` redirecting the connection.
+- Returns exit code, stdout, stderr, and the number of signatures issued.
 
 ### A5. Log every signature
 Each sign request logs: the identity fingerprint (SHA256, base64, OpenSSH style), the
@@ -93,8 +106,12 @@ host the command was authorised for, and the timestamp. Never log key material.
     temp dir during and after a run).
 11. `vault_ssh_exec` refuses a host not in the entry's allowlist, and refuses when the
     entry supplies no allowlist.
-12. `vault_ssh_exec` passes argv without a shell — a command containing `;` or `|` is
-    passed as a literal argument, not interpreted.
+12. Remote arguments survive as literal words: `["printf","%s","a; touch /tmp/pwn"]`
+    must not execute `touch` on the remote host.
+12b. The constructed ssh command line names the broker public key as `IdentityFile`, so
+    ssh cannot authenticate with a default identity file instead.
+12c. An rsync audit line names the host rsync actually connects to, not the
+    `destination` field, when the two differ and both are allowlisted.
 13. Every sign request produces one audit line carrying the key fingerprint and the
     authorised host, and no key material.
 14. The migration stamps all pre-existing entries `LEGACY_EXEC`; no row is left null.

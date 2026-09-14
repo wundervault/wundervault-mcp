@@ -16,7 +16,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   loadOpenSshEd25519, handleAgentMessage, startAgent, runSshBrokered, defaultSignAudit,
-  hostOf, rsyncRemoteHost, type LoadedIdentity,
+  hostOf, rsyncRemoteHost, quoteForRemoteShell, type LoadedIdentity,
 } from '../src/ssh-agent.js';
 
 let dir: string;
@@ -257,11 +257,16 @@ describe('A4 — brokered execution', () => {
       op: { kind: 'ssh', destination: 'good.example', remoteArgv: ['ssh', 'evil.example'] },
     }));
     const args = r.stdout.split('\n').filter(Boolean);
-    // The destination we validated appears exactly once, as the ssh destination, and the
-    // caller's "evil.example" is only ever a remote-command argument after the -- guard.
+    // The destination we validated is the ssh destination, and it comes before the --.
     expect(args).toContain('good.example');
     expect(args.indexOf('good.example')).toBeLessThan(args.indexOf('--'));
-    expect(args.indexOf('evil.example')).toBeGreaterThan(args.indexOf('--'));
+    // The caller's "evil.example" survives only as a quoted word inside the remote
+    // command string — it is never a connection target. It is no longer a standalone
+    // argv element at all, because remote arguments are quoted and joined.
+    expect(args).not.toContain('evil.example');
+    const remote = args[args.length - 1];
+    expect(remote).toContain(`'evil.example'`);
+    expect(args.indexOf(remote)).toBeGreaterThan(args.indexOf('--'));
   }, 20_000);
 
   it('hardens the ssh command line so user config cannot redirect it', async () => {
@@ -277,6 +282,34 @@ describe('A4 — brokered execution', () => {
     expect(out).toContain('IdentitiesOnly=yes');
     expect(out).toMatch(/IdentityAgent=/);
     expect(out).toContain('BatchMode=yes');
+  }, 20_000);
+
+  it('pins ssh to the broker key so a default identity file cannot be used', async () => {
+    // IdentitiesOnly alone still permits ~/.ssh/id_*: the man page says "either the
+    // default files, or those explicitly configured". Naming the public key is what
+    // actually pins it.
+    const r = await withFakeSsh(() => runSshBrokered({
+      identity, allowedHosts: ALLOW, timeoutMs: 10_000,
+      op: { kind: 'ssh', destination: 'good.example', remoteArgv: ['whoami'] },
+    }));
+    const args = r.stdout.split('\n').filter(Boolean);
+    const idFile = args.find((a) => a.startsWith('IdentityFile='));
+    expect(idFile).toBeDefined();
+    expect(idFile).toMatch(/\.pub$/);
+    expect(args).toContain('IdentitiesOnly=yes');
+  }, 20_000);
+
+  it('quotes remote arguments so a semicolon cannot run a second command', async () => {
+    // `ssh host -- a b c` hands ONE string to the remote login shell, so an unquoted
+    // semicolon executes there even though nothing was interpreted locally.
+    const r = await withFakeSsh(() => runSshBrokered({
+      identity, allowedHosts: ALLOW, timeoutMs: 10_000,
+      op: { kind: 'ssh', destination: 'good.example', remoteArgv: ['printf', '%s', 'safe; touch /tmp/wv-pwn'] },
+    }));
+    const args = r.stdout.split('\n').filter(Boolean);
+    const remote = args[args.length - 1];
+    expect(remote).toContain(`'safe; touch /tmp/wv-pwn'`);
+    expect(remote.startsWith(`'printf'`)).toBe(true);
   }, 20_000);
 
   it('checks every rsync path argument against the allowlist', async () => {
@@ -367,5 +400,51 @@ describe('A5 — auditing is not optional', () => {
     const req = Buffer.concat([Buffer.from([13]), s(identity.keyBlob), s(Buffer.from('d')), Buffer.alloc(4)]);
     handleAgentMessage(req, identity, (o) => outcomes.push(o));
     expect(outcomes).toEqual(['signed']);
+  });
+});
+
+
+describe('remote-shell quoting', () => {
+  it('wraps an argument in single quotes', () => {
+    expect(quoteForRemoteShell('plain')).toBe("'plain'");
+  });
+
+  it('neutralises shell metacharacters', () => {
+    expect(quoteForRemoteShell('a; touch /tmp/x')).toBe("'a; touch /tmp/x'");
+    expect(quoteForRemoteShell('$(id)')).toBe("'$(id)'");
+    expect(quoteForRemoteShell('a|b&c')).toBe("'a|b&c'");
+  });
+
+  it('survives an embedded single quote', () => {
+    // The classic escape hatch: a lone ' would otherwise close the quoting and hand the
+    // rest of the argument to the remote shell.
+    const q = quoteForRemoteShell("it's");
+    expect(q).toBe(`'it'\\''s'`);
+    expect(q.startsWith("'")).toBe(true);
+    expect(q.endsWith("'")).toBe(true);
+  });
+});
+
+describe('rsync destination parsing', () => {
+  it('reads the host out of a remote path', () => {
+    expect(rsyncRemoteHost('host.example:/tmp/')).toBe('host.example');
+    expect(rsyncRemoteHost('user@host.example:/tmp/')).toBe('host.example');
+  });
+
+  it('treats a local path as local', () => {
+    expect(rsyncRemoteHost('./local/path')).toBeNull();
+    expect(rsyncRemoteHost('/abs/path')).toBeNull();
+    expect(rsyncRemoteHost('-a')).toBeNull();
+  });
+
+  it('does not mistake a colon after a slash for a host', () => {
+    expect(rsyncRemoteHost('./weird:name')).toBeNull();
+  });
+});
+
+describe('hostOf', () => {
+  it('strips a user prefix', () => {
+    expect(hostOf('root@example.com')).toBe('example.com');
+    expect(hostOf('example.com')).toBe('example.com');
   });
 });
