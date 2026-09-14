@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readdirSync } from 'node:fs';
 import os from 'node:os';
-import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, coerceExecConfig } from '../src/exec.js';
+import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, coerceExecConfig, commandInvokesSudo } from '../src/exec.js';
 import { getRecipe, recipeIds, RECIPES } from '../src/recipes.js';
 
 
@@ -106,5 +106,42 @@ POSIX_ONLY('askpass mechanism (git / ssh)', () => {
     const before = count();
     runWithSecretAskpass(SECRET, '"$TEST_ASKPASS" | wc -c', { askpassVar: 'TEST_ASKPASS' });
     expect(count()).toBeLessThanOrEqual(before);
+  });
+});
+
+describe('commandInvokesSudo — the stdin route into root', () => {
+  // Gating only credential_type "sudo" would be a gate in name only: an entry with no
+  // server-side exec_config lets the caller pick mechanism "stdin" freely, and 49 of 50
+  // entries have none. This matches the sudo INVOCATION so that route is closed too.
+  it('matches sudo at the start of a command', () => {
+    expect(commandInvokesSudo('sudo -S apt-get update')).toBe(true);
+  });
+
+  it('matches an absolute path to sudo', () => {
+    expect(commandInvokesSudo('/usr/bin/sudo -S id')).toBe(true);
+    expect(commandInvokesSudo('/bin/sudo id')).toBe(true);
+  });
+
+  it('matches sudo after a shell separator, not just at position zero', () => {
+    expect(commandInvokesSudo('echo hi; sudo -S id')).toBe(true);
+    expect(commandInvokesSudo('true && sudo id')).toBe(true);
+    expect(commandInvokesSudo('cat x | sudo tee y')).toBe(true);
+    expect(commandInvokesSudo('( sudo id )')).toBe(true);
+  });
+
+  it('does not match a file merely named like sudo', () => {
+    expect(commandInvokesSudo('cat /etc/sudoers')).toBe(false);
+    expect(commandInvokesSudo('grep pseudo-tty config')).toBe(false);
+  });
+
+  it('does not match sudo quoted inside an argument', () => {
+    // rsync's remote-side sudo is a different mechanism and blocking it would break
+    // legitimate transfers; the local process is not being handed the password here.
+    expect(commandInvokesSudo('rsync --rsync-path="sudo rsync" a b')).toBe(false);
+  });
+
+  it('leaves ordinary commands alone', () => {
+    expect(commandInvokesSudo('npm login')).toBe(false);
+    expect(commandInvokesSudo('docker login -u me --password-stdin')).toBe(false);
   });
 });

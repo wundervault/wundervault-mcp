@@ -142,6 +142,23 @@ const DANGEROUS_EXEC_PATTERNS = [
   /\bsed\s+-i\b/,
 ];
 
+/**
+ * `sudo -S` reads a password from stdin, so ANY stdin delivery aimed at a sudo command
+ * is a root-escalation primitive regardless of whether the entry names the `sudo`
+ * recipe. Gating only `credential_type: "sudo"` would be a gate in name only: an entry
+ * with no server-side exec_config lets the caller choose `mechanism: "stdin"` freely,
+ * and 49 of 50 entries currently have none.
+ *
+ * Matches the sudo *invocation*, not the word: `sudo` at the start of the command or
+ * immediately after a shell separator, so `rsync --rsync-path="sudo rsync"` and a file
+ * called `sudoers` do not trip it.
+ */
+const SUDO_INVOCATION = /(^|[|&;]\s*|\(\s*)\s*(?:\/usr\/bin\/|\/bin\/)?sudo\b/;
+
+export function commandInvokesSudo(command: string): boolean {
+  return SUDO_INVOCATION.test(command);
+}
+
 /** Reject commands that could exfiltrate a secret to disk. Returns an error message, or null if safe. */
 function rejectDangerous(command: string): string | null {
   for (const pattern of DANGEROUS_EXEC_PATTERNS) {

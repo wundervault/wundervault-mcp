@@ -13,7 +13,7 @@ import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmdirSync, exists
 import net from 'node:net';
 import { AgentVaultAPI } from './api-client.js';
 import { loadEncryptionKey, verifyDirectiveSignature, decryptSecretContent } from './crypto.js';
-import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey } from './exec.js';
+import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey, commandInvokesSudo } from './exec.js';
 import { getRecipe, recipeIds } from './recipes.js';
 import type { Credentials, VaultEntry, RemoteHost } from './types.js';
 import { STRIP_FROM_CHILD_ENV, resolveInjectTarget, writeInjectedLine } from './templates.js';
@@ -722,6 +722,27 @@ export function createServer(args: { url?: string } = {}) {
           // spawnSync's own cwd has neither problem and needs no restoring. It is
           // validated up top, before the secret is fetched, so a typo cannot burn one.
           if (mechanism === 'stdin') {
+            // The server decides whether this account may pipe a secret into sudo, and
+            // says so by storing credential_type "sudo" on the entry. A caller-chosen
+            // stdin mechanism cannot buy that capability for itself.
+            // cfg.credential_type is set by resolveDeliveryConfig ONLY from the
+            // server-side exec_config — a caller-supplied credential_type is discarded
+            // there. So this reads the owner's decision, never the caller's request.
+            const serverSaysSudo =
+              String(cfg?.credential_type ?? '').trim().toLowerCase() === 'sudo';
+            if (commandInvokesSudo(fullCommand) && !serverSaysSudo) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: 'Refused: piping a vault secret into `sudo` is disabled for this '
+                      + 'entry. It hands the caller arbitrary root, and a `sudo` earlier on '
+                      + 'PATH would capture the password.\n\nGrant the specific commands in '
+                      + '/etc/sudoers with NOPASSWD instead — no password is transmitted, and '
+                      + 'the blast radius is an explicit allowlist rather than full root.',
+                }],
+                isError: true,
+              };
+            }
             execResult = runWithSecretStdin(plaintext, fullCommand, { appendNewline, cwd: workingDir });
           } else if (mechanism === 'askpass') {
             execResult = runWithSecretAskpass(plaintext, fullCommand, { askpassVar: askpassVar as string, wrap, cwd: workingDir });
