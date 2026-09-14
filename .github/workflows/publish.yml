@@ -1,0 +1,54 @@
+name: Publish
+
+# Trusted publishing (OIDC). There is no NPM_TOKEN here by design: npm caps granular
+# write tokens at 90 days, so a stored token guarantees a dead release every quarter —
+# which is exactly how 1.7.2 stalled. The OIDC identity is minted per job and expires
+# with it. The trusted publisher is configured on npmjs.com against THIS filename
+# (publish.yml); renaming this file silently breaks publishing until it is re-registered.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  id-token: write   # mint the OIDC token npm exchanges for publish rights
+  contents: write   # cut the GitHub release from the same tag
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest   # self-hosted runners are not supported for trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # setup-node's bundled npm trails the 11.5.1 floor that trusted publishing needs.
+      - run: npm install -g npm@latest
+
+      # The tag is the only thing a human types here, so it is the only thing that can
+      # disagree with the package. Three files carry the version and all three must
+      # match the tag, or we publish a number nobody asked for.
+      - name: Tag must match package.json and server.json
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./package.json').version")
+          SRV=$(node -p "require('./server.json').version")
+          SRVPKG=$(node -p "require('./server.json').packages[0].version")
+          echo "tag=$TAG package.json=$PKG server.json=$SRV server.json.packages[0]=$SRVPKG"
+          test "$TAG" = "$PKG" && test "$TAG" = "$SRV" && test "$TAG" = "$SRVPKG"
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+      # --provenance is redundant on paper (trusted publishing attests by default) but
+      # is reported to be needed in practice often enough that asking twice is cheaper
+      # than shipping the one release that silently lacks an attestation.
+      - run: npm publish --access public --provenance
+
+      - name: Cut the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --target main --generate-notes
