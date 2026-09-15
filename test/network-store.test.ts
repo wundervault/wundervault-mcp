@@ -10,7 +10,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   load, save, recordDestination, destinationsFor,
-  newDestinationNotice, defaultStorePath,
+  newDestinationNotice, defaultStorePath, recordingEnabled,
 } from '../src/network-store.js';
 
 let dir: string;
@@ -138,5 +138,69 @@ describe('store location', () => {
       if (prev === undefined) delete process.env.WUNDERVAULT_NETWORK_STORE;
       else process.env.WUNDERVAULT_NETWORK_STORE = prev;
     }
+  });
+});
+
+describe('round 1 fixes', () => {
+  it('records nothing and notices nothing when recording is off', () => {
+    // The metadata IS the control, so opting out of the record opts out of the notice.
+    // A notice without a record would fire on every single call.
+    const prev = process.env.WUNDERVAULT_RECORD_DESTINATIONS;
+    process.env.WUNDERVAULT_RECORD_DESTINATIONS = '0';
+    try {
+      const r = recordDestination('e1', 'https://h.example:443', store);
+      expect(r.recorded).toBe(false);
+      expect(r.isNew).toBe(false);
+      expect(existsSync(store)).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.WUNDERVAULT_RECORD_DESTINATIONS;
+      else process.env.WUNDERVAULT_RECORD_DESTINATIONS = prev;
+    }
+  });
+
+  it.each(['0', 'false', 'off', 'no', 'OFF'])('treats %s as off', (v) => {
+    const prev = process.env.WUNDERVAULT_RECORD_DESTINATIONS;
+    process.env.WUNDERVAULT_RECORD_DESTINATIONS = v;
+    try { expect(recordingEnabled()).toBe(false); }
+    finally {
+      if (prev === undefined) delete process.env.WUNDERVAULT_RECORD_DESTINATIONS;
+      else process.env.WUNDERVAULT_RECORD_DESTINATIONS = prev;
+    }
+  });
+
+  it('records by default', () => {
+    expect(recordingEnabled()).toBe(true);
+  });
+
+  it('does not tell a Tier 2 caller the destination stayed local', () => {
+    // Tier 2 approval is exactly where the destination WAS disclosed, so the Tier 1
+    // wording would be false — and false reassurance is worse than none.
+    const t2 = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/x', '2');
+    expect(t2.toolNote).not.toMatch(/not sent to the server/i);
+    expect(t2.toolNote).toMatch(/approved this operation/i);
+    expect(t2.stderrLine).toContain('tier=2');
+  });
+
+  it('still tells a Tier 1 caller the destination stayed local', () => {
+    const t1 = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/x', '1');
+    expect(t1.toolNote).toMatch(/not sent to the server/i);
+    expect(t1.toolNote).toMatch(/notice rather than a block/i);
+  });
+
+  it('does not lose a record when two writers interleave', () => {
+    // Seven agents run under one uid on this machine, so concurrent writers are the
+    // normal case. Last-write-wins would silently drop a destination, which then reports
+    // as new again.
+    const a = load(store);
+    a.seen.push({ entryId: 'eA', origin: 'https://a.example:443', firstSeen: 'x', lastSeen: 'x', count: 1 });
+    save(a, store);
+    recordDestination('eB', 'https://b.example:443', store);
+    const after = load(store);
+    expect(after.seen.map((s) => s.entryId).sort()).toEqual(['eA', 'eB']);
+  });
+
+  it('leaves no lock file behind', () => {
+    recordDestination('e1', 'https://h.example:443', store);
+    expect(existsSync(`${store}.lock`)).toBe(false);
   });
 });

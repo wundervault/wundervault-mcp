@@ -1,0 +1,16 @@
+{"round": 9, "decisions": [
+ {"id":"F1","action":"fixed","claim":"opting out of recording still writes the store and still notices",
+  "reason":"confirmed — I described an off switch and never built one. WUNDERVAULT_RECORD_DESTINATIONS=0 now touches nothing and raises nothing, because the metadata IS the control and a notice without a record would fire on every call."},
+ {"id":"F2","action":"fixed","claim":"the notice tells a Tier 2 caller the destination stayed local, which is false",
+  "reason":"confirmed and the worst kind of bug — false reassurance. Tier 2 approval is exactly where the destination WAS disclosed. The notice takes the tier and says the true thing for each."},
+ {"id":"F3","action":"rejected","claim":"a server-approved private origin is refused because the local store is empty after upgrade",
+  "reason":"already fixed before this review landed. Approvals were moved back server-side after the plan review found that a local approvals file let the agent forge its own. server.ts reads them from the entry again."},
+ {"id":"F4","action":"fixed","claim":"concurrent writers lose updates",
+  "reason":"confirmed, and it is the normal case here rather than a corner: seven agents run under one uid on this box. An exclusive lock file with a stale-lock timeout; verified with two processes writing 25 destinations each and losing none."},
+ {"id":"F5","action":"rejected","claim":"bracketed IPv6 approvals do not round-trip through revoke",
+  "reason":"the approval API no longer exists in this module — it was deleted, not deprecated, after the plan review. The bracket bug is real in principle and will apply when approvals are rebuilt on a daemon-owned path; noted for that build."},
+ {"id":"F6","action":"deferred","claim":"the token scheme has no verifier and conflicts with ProtectHome",
+  "reason":"correct, and my own plan contradicted itself here. Part B is not built. It is recorded as unresolved rather than papered over: SO_PEERCRED also reports PID and GID, not just uid as I claimed, so it is strictly stronger than a copyable bearer token."},
+ {"id":"F7","action":"deferred","claim":"opt-in email for unattended runs is described but not built",
+  "reason":"true. The package describes a capability that does not exist yet. Recorded as not-built rather than claimed; the terminal channels are what works today, and an unattended run genuinely has no notice until this lands."}
+]}

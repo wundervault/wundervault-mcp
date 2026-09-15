@@ -691,7 +691,8 @@ export function createServer(args: { url?: string } = {}) {
           let noticeForAgent = '';
           if (isNew) {
             const notice = newDestinationNotice(
-              secretData.name ?? entry_id, originStr, def.route.method, def.route.path);
+              secretData.name ?? entry_id, originStr, def.route.method, def.route.path,
+              verdict.tier);
             emitToStderr(notice);
             noticeForAgent = `\n\n${notice.toolNote}`;
           }

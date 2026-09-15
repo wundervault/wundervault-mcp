@@ -30,7 +30,8 @@
  *
  * The line: this file records what happened. It never decides what is allowed.
  */
-import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, chmodSync,
+  openSync, closeSync, unlinkSync, statSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -51,6 +52,17 @@ const EMPTY: NetworkShape = { version: 1, seen: [] };
 
 /** Bounded, so a long-lived install cannot grow this without limit. */
 const MAX_SEEN = 2000;
+
+/**
+ * Recording can be turned off. The metadata IS the control, so opting out of the record
+ * opts out of first-sighting notices too — there is no honest way to have the second
+ * without the first, and pretending otherwise would leave someone believing they were
+ * being warned.
+ */
+export function recordingEnabled(): boolean {
+  const v = (process.env.WUNDERVAULT_RECORD_DESTINATIONS ?? '').trim().toLowerCase();
+  return !(v === '0' || v === 'false' || v === 'off' || v === 'no');
+}
 
 export function defaultStorePath(): string {
   // After the uid split this becomes /var/lib/wundervault/network.json, owned by the
@@ -91,7 +103,12 @@ export function save(shape: NetworkShape, storePath = defaultStorePath()): void 
  */
 export function recordDestination(
   entryId: string, origin: string, storePath = defaultStorePath(),
-): { isNew: boolean } {
+): { isNew: boolean; recorded: boolean } {
+  // Opted out: touch nothing, say nothing. Returning isNew:false here is deliberate —
+  // a notice without a record would fire on every single call.
+  if (!recordingEnabled()) return { isNew: false, recorded: false };
+
+  return withStoreLock(storePath, () => {
   const shape = load(storePath);
   const now = new Date().toISOString();
   const key = origin.trim().toLowerCase();
@@ -101,7 +118,7 @@ export function recordDestination(
     existing.count += 1;
     existing.lastSeen = now;
     save(shape, storePath);
-    return { isNew: false };
+    return { isNew: false, recorded: true };
   }
 
   shape.seen.push({ entryId, origin: key, firstSeen: now, lastSeen: now, count: 1 });
@@ -112,7 +129,49 @@ export function recordDestination(
     shape.seen = shape.seen.slice(shape.seen.length - MAX_SEEN);
   }
   save(shape, storePath);
-  return { isNew: true };
+  return { isNew: true, recorded: true };
+  });
+}
+
+/**
+ * Serialise read-modify-write across processes.
+ *
+ * Several agents run under one user here — seven on this machine — so two MCP processes
+ * writing at once is the normal case, not a corner. Without this, both load the same
+ * store, both write, and the later rename silently discards the other's destination,
+ * which then reports as new again. An exclusive lock file with a stale-lock timeout is
+ * enough: contention is brief and the failure mode of waiting is better than the failure
+ * mode of losing a record.
+ */
+function withStoreLock<T>(storePath: string, fn: () => T): T {
+  const lockPath = `${storePath}.lock`;
+  const deadline = Date.now() + 5000;
+  let fd: number | undefined;
+  for (;;) {
+    try {
+      fd = openSync(lockPath, 'wx');
+      break;
+    } catch {
+      // A lock left by a crashed process must not block every later call for ever.
+      try {
+        const age = Date.now() - statSync(lockPath).mtimeMs;
+        if (age > 30_000) { unlinkSync(lockPath); continue; }
+      } catch { /* vanished under us: retry */ }
+      if (Date.now() > deadline) {
+        // Proceed unlocked rather than fail a vault call over bookkeeping. Worst case is
+        // the lost-update this guards against, which costs one spurious notice.
+        return fn();
+      }
+      const wait = Date.now() + 25;
+      while (Date.now() < wait) { /* brief spin; this is a millisecond-scale section */ }
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try { closeSync(fd!); } catch { /* ignore */ }
+    try { unlinkSync(lockPath); } catch { /* ignore */ }
+  }
 }
 
 export function destinationsFor(entryId: string, storePath = defaultStorePath()): SeenDestination[] {
@@ -153,18 +212,27 @@ export interface DestinationNotice {
  */
 export function newDestinationNotice(
   secretName: string, origin: string, method: string, path: string,
+  /** Which tier authorised this call. The notice must not describe the wrong one. */
+  tier: string = '1',
 ): DestinationNotice {
   const at = new Date().toISOString();
-  return {
-    stderrLine:
-      `[wundervault] NEW DESTINATION ${at} secret="${secretName}" ${method} ${origin}${path}\n`,
-    toolNote:
-      `⚠ First use of "${secretName}" against ${origin}.\n`
-      + `   ${method} ${origin}${path}\n`
-      + `   Tier 1 does not gate destinations, so this is a notice rather than a block. `
+  const isTier2 = String(tier) === '2';
+
+  // Tier 2 already required the owner to see and approve this exact operation, so
+  // telling them "this was not gated" and "the destination stayed on this machine"
+  // would both be false — the approval is precisely where it was disclosed.
+  const explanation = isTier2
+    ? `   You approved this operation, so it was gated. The destination was sent to the `
+      + `server as part of that approval; it is also recorded here.`
+    : `   Tier 1 does not gate destinations, so this is a notice rather than a block. `
       + `If you did not expect it, revoke this agent and rotate the secret at the provider. `
       + `Moving the secret to Tier 2 makes each new request wait for approval.\n`
-      + `   Recorded on this machine only — the destination was not sent to the server.`,
+      + `   Recorded on this machine only — the destination was not sent to the server.`;
+
+  return {
+    stderrLine:
+      `[wundervault] NEW DESTINATION ${at} tier=${tier} secret="${secretName}" ${method} ${origin}${path}\n`,
+    toolNote: `⚠ First use of "${secretName}" against ${origin}.\n   ${method} ${origin}${path}\n${explanation}`,
   };
 }
 

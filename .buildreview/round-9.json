@@ -1,0 +1,184 @@
+{
+  "verdict": "revise",
+  "summary": "This round moves destination history and private-origin approvals into a local store, adds first-sighting notices, and outlines the later Linux, macOS, and Windows isolation models. The pre-UID-split caveat is acceptable only if this is marketed strictly as a privacy improvement rather than reliable audit or alert integrity, and an explicitly consented relay-without-storage option is defensible with narrow wording. The build is not ready to present because the required off switch is absent, Tier 2 receives a false no-server-disclosure notice, existing private approvals are dropped, concurrent writers lose data, and the Linux token proposal is not equivalent to peer credentials as currently specified.",
+  "spec_check": [
+    {
+      "requirement": "Tier 1 destinations never leave the customer's machine.",
+      "status": "partial",
+      "evidence": "The shown Tier 1 path records the origin through recordDestination and does not add an outbound server call carrying it, but the excerpt does not include all existing telemetry or audit code needed to prove the end-to-end claim."
+    },
+    {
+      "requirement": "seen destinations (the \"new destination\" baseline) | local file",
+      "status": "met",
+      "evidence": "recordDestination persists entryId, canonicalized origin, timestamps, and count in the local network.json file."
+    },
+    {
+      "requirement": "approved private origins | local file",
+      "status": "partial",
+      "evidence": "server.ts now reads approvals through localApprovedOrigins, but existing server-side approvals are ignored without migration and IPv6 origins are stored in a malformed canonical form."
+    },
+    {
+      "requirement": "Tier 1 fact-of-call (entry, agent, time) | server | unchanged \u2014 stays server-side",
+      "status": "partial",
+      "evidence": "The diff does not remove visible audit calls, but the server-side fact-of-call implementation is outside the excerpt and therefore cannot be confirmed."
+    },
+    {
+      "requirement": "Tier 2 requested operation | server | unchanged \u2014 approval needs it",
+      "status": "partial",
+      "evidence": "The result still handles verdict.tier, but the approval transport is outside the excerpt; additionally, the new notice incorrectly tells Tier 2 users that the destination was not sent to the server."
+    },
+    {
+      "requirement": "This is therefore a privacy improvement and NOT an integrity control until Part B moves it to a daemon-owned path.",
+      "status": "met",
+      "evidence": "The module header clearly states that the same-UID agent can edit the store and that the file is not an integrity control before the UID split."
+    },
+    {
+      "requirement": "The daemon detects a first sighting locally.",
+      "status": "met",
+      "evidence": "recordDestination returns isNew for each entryId/origin pair, and server.ts emits stderr and tool-result notices when it is true."
+    },
+    {
+      "requirement": "Email becomes opt-in for unattended runs, labelled as the option that relays the destination.",
+      "status": "partial",
+      "evidence": "The comments describe this policy, but no email configuration, relay call, or unattended-delivery implementation appears in the shown changes."
+    },
+    {
+      "requirement": "an explicit off switch for destination recording, accepting that it disables alerting",
+      "status": "unmet",
+      "evidence": "server.ts calls recordDestination unconditionally, and network-store.ts exposes no recording or alerting setting."
+    },
+    {
+      "requirement": "shorter retention option (7 days) for the server-side log",
+      "status": "unmet",
+      "evidence": "No retention setting or server-side audit retention change is present in the package."
+    },
+    {
+      "requirement": "Linux: system account wundervault; key material in /var/lib/wundervault; hardened system unit; signed .deb/.rpm",
+      "status": "partial",
+      "evidence": "These are stated as future plan items rather than delivered artifacts, and the token registration and verifier-side authentication design remains unspecified."
+    },
+    {
+      "requirement": "macOS: Keychain ACLs, hardened runtime, and caller audit-token/code-signature verification",
+      "status": "partial",
+      "evidence": "The intended controls are named, but the plan does not specify the native Mach/Security implementation, pinned code requirement, update policy, or entitlement configuration needed to establish the claimed boundary."
+    },
+    {
+      "requirement": "Windows: Service account via the SCM; named pipes with security descriptors; Authenticode verification; DPAPI",
+      "status": "partial",
+      "evidence": "The components are listed as a future platform plan, but process-verification details, credential scope, enrollment, and lifecycle behavior are not yet defined."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/server.ts",
+      "line": 684,
+      "claim": "The required destination-recording off switch is absent because every brokered HTTP request unconditionally calls recordDestination.",
+      "failure_scenario": "A customer opts out of destination recording and alerting, then makes a Tier 1 call to https://api.example.com:443; network.json is still created or updated and a first-sighting notice is still emitted.",
+      "suggested_direction": "Define one explicit setting that is checked before both persistence and notice generation, and document what happens to history already stored when the setting is disabled."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/server.ts",
+      "line": 686,
+      "claim": "First-sighting notice generation is not gated on verdict.tier, so Tier 2 calls receive a false Tier 1 and no-server-disclosure statement.",
+      "failure_scenario": "An owner approves a Tier 2 request to a previously unseen origin; after success, the tool result says \"Tier 1 does not gate destinations\" and \"the destination was not sent to the server\" even though Tier 2 approval required disclosing that operation to the server.",
+      "suggested_direction": "Select notice and recording behavior by tier, reserving the local-only privacy statement for Tier 1 and accurately describing the consented disclosure for Tier 2."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "src/server.ts",
+      "line": 680,
+      "claim": "The switch to local approvals ignores existing secretData.allowed_private_origins without any migration or reapproval transition.",
+      "failure_scenario": "An existing entry has https://10.0.0.5:9000 approved on the server and the local store is empty after upgrade; server.ts passes an empty approval list to performOperation, so a private-origin call that worked before the upgrade is refused.",
+      "suggested_direction": "Provide a deliberate one-time migration into the local store or a blocking reapproval workflow before the server-side field stops being honored, and expose a local owner interface for managing the approvals."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "src/network-store.ts",
+      "line": 95,
+      "claim": "The store uses an unlocked read-modify-write sequence, so concurrent agent processes sharing network.json overwrite one another's destination records or approvals.",
+      "failure_scenario": "Process A and process B both load an empty store, A records origin X and B records origin Y, then each renames its independently written file; whichever rename happens last leaves only its origin, causing the other destination to be reported as new again and potentially discarding an approval.",
+      "suggested_direction": "Serialize updates across processes or route all mutations through one authoritative local daemon, and test simultaneous destination and approval updates rather than only sequential calls."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "src/network-store.ts",
+      "line": 145,
+      "claim": "IPv6 approval canonicalization removes the mandatory address brackets, producing a malformed stored origin that cannot be revoked using the same valid input.",
+      "failure_scenario": "approvePrivateOrigin('e1', 'https://[fd00::1]:8443') stores https://fd00::1:8443, then revokePrivateOrigin('e1', 'https://[fd00::1]:8443') compares the bracketed input with the unbracketed stored value and leaves the approval in place; downstream exact-origin matching is also likely to reject it.",
+      "suggested_direction": "Use one URL-aware origin canonicalization routine for approval, revocation, recording, and enforcement, retaining brackets around IPv6 literals."
+    },
+    {
+      "id": "F6",
+      "severity": "major",
+      "file": "",
+      "line": null,
+      "claim": "The Linux plan does not define verifier-side token registration or lifecycle, and a replayable bearer token is not equivalent to kernel-reported SO_PEERCRED.",
+      "failure_scenario": "After enrollment the only described token copy is mode 0600 in the agent user's home while the wundervault service is isolated by ProtectHome, so the service has no stated trusted value against which to compare the presented token; if a copied token is accepted later over the world-connectable socket, a different UID can replay it even after the original process or account compromise has ended, whereas SO_PEERCRED would still report the actual connecting UID.",
+      "suggested_direction": "Specify authenticated enrollment into daemon-owned verifier state, store only an appropriate verifier where possible, bind records to the intended OS account, and define rotation, revocation, replay, deletion, and account-removal behavior while documenting that this has different guarantees from SO_PEERCRED."
+    },
+    {
+      "id": "F7",
+      "severity": "major",
+      "file": "",
+      "line": null,
+      "claim": "In the shown package the claimed opt-in email channel exists only in comments, so if no unshown component implements it, unattended first sightings have no owner-visible alert.",
+      "failure_scenario": "A scheduled agent first sends a Tier 1 secret to an unexpected origin at 03:00 with stderr redirected to a service log and no person reading the tool result; no email is sent despite the package saying opt-in email covers this case.",
+      "suggested_direction": "Implement and test the opt-in relay end to end, including the consent label, server logging policy, delivery failure behavior, and an explicit indication when unattended alert delivery is not configured."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "Relay-without-storage still discloses the destination to server infrastructure and normally to an email provider that may retain message bodies.",
+      "why_it_matters": "The distinction is honest rather than a fig leaf only if the claim is narrowly \"we process but do not intentionally retain,\" request bodies are excluded from access logs, traces, crash reports, support tooling, and queues, and the separate email-provider retention is disclosed."
+    },
+    {
+      "id": "B2",
+      "concern": "Server-side entry identity and timestamps may already reveal much of the destination profile by correlation.",
+      "why_it_matters": "An entry named or typed for a single provider can make each fact-of-call strongly imply that provider, so localizing the origin buys protection for exact hosts, ports, paths, and private topology but does not make the call unlinkable or justify an absolute claim that the server knows nothing about where it went."
+    },
+    {
+      "id": "B3",
+      "concern": "The store has no customer, tenant, or OS-account namespace beyond entryId and one path derived from the current home directory.",
+      "why_it_matters": "A shared workstation, account switch, restored home backup, or second customer under the same OS user can mix histories in one file; globally unique entry IDs may prevent direct approval collisions, but local listing, retention, deletion, and ownership semantics still become ambiguous."
+    },
+    {
+      "id": "B4",
+      "concern": "The excerpt does not show whether private-origin and metadata enforcement revalidates every DNS answer and redirect target at connection time.",
+      "why_it_matters": "An approved hostname can later resolve to a metadata or loopback address, or a public endpoint can redirect there; a string blocklist at approval time cannot prevent credential delivery unless all resolved addresses and redirects are checked immediately before connection."
+    },
+    {
+      "id": "B5",
+      "concern": "The macOS design depends on native Mach audit-token and Security.framework operations even though the implementation is currently Node-based and the Linux rationale rejects native dependencies.",
+      "why_it_matters": "Without a specified native helper or platform rewrite, the daemon cannot obtain and verify the claimed caller identity; even when implemented, signing plus Keychain ACLs can provide comparable resistance to ordinary same-user processes but has different trust assumptions from UID separation and requires pinned code requirements, safe update rules, no debug entitlements, and protection of the signing pipeline."
+    },
+    {
+      "id": "B6",
+      "concern": "A syntactically valid version-1 store is not structurally validated.",
+      "why_it_matters": "For example, a file containing a version-1 seen array with null as an element passes load, then recordDestination dereferences s.entryId and throws on every vault call; atomic writes prevent partial JSON but not disk corruption, manual edits, faulty older writers, or restored malformed backups."
+    },
+    {
+      "id": "B7",
+      "concern": "The pre-split first-sighting notice can be suppressed before generation even though stderr itself bypasses the model.",
+      "why_it_matters": "A same-UID compromised agent can prepopulate the malicious entry/origin pair in network.json, making isNew false and producing no stderr line at all, so documentation should limit the \"cannot suppress\" claim to a notice that has already been generated and state explicitly that alerting is not trustworthy before the UID split."
+    },
+    {
+      "id": "B8",
+      "concern": "Using the same broad word such as \"strong\" for Linux, macOS, and Windows would hide materially different authentication guarantees.",
+      "why_it_matters": "Linux as proposed authenticates possession of a bearer token and ultimately an account-level principal, while macOS and Windows aim to authenticate signed program identity; customers need platform-specific threat-model statements or they will reasonably assume the weakest platform has the strongest platform's caller-verification guarantee."
+    }
+  ],
+  "_meta": {
+    "round": 9,
+    "at": "2026-09-15T05:10:43+00:00",
+    "package_bytes": 51914,
+    "schema_problems": []
+  }
+}
