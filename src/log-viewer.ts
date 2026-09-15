@@ -29,7 +29,7 @@
  * What it IS: one self-contained HTML file with the data already inside it, written
  * 0600 next to the store, which you open with your own browser and delete when done.
  */
-import { writeFileSync, mkdirSync, chmodSync, accessSync, constants } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, chmodSync, chownSync, accessSync, existsSync, constants } from 'node:fs';
 import * as net from 'node:net';
 import * as path from 'node:path';
 import { load, defaultStorePath, type NetworkShape } from './network-store.js';
@@ -268,7 +268,27 @@ export function writeViewer(storePath = defaultStorePath(), outPath?: string,
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   writeFileSync(target, renderViewer(shape, storePath), { mode: 0o600 });
   try { chmodSync(target, 0o600); } catch { /* best effort */ }
+
+  // Reading the store requires root, so this normally runs under sudo — and a page written
+  // 0600 root:root in someone's home is one they cannot open. Handing it back to the user
+  // who asked is the difference between the feature working and appearing to.
+  giveBackToSudoUser(target);
+  giveBackToSudoUser(path.dirname(target));
   return target;
+}
+
+/** chown a path to the user who invoked sudo. A no-op when not running as root. */
+function giveBackToSudoUser(target: string): void {
+  const uid = (process as unknown as { getuid?: () => number }).getuid?.();
+  const sudoUser = process.env.SUDO_USER;
+  if (uid !== 0 || !sudoUser || sudoUser === 'root') return;
+  try {
+    const entry = readFileSync('/etc/passwd', 'utf8')
+      .split('\n').find(l => l.startsWith(`${sudoUser}:`));
+    const parts = entry?.split(':');
+    if (!parts) return;
+    chownSync(target, Number(parts[2]), Number(parts[3]));
+  } catch { /* best effort: a readable page in the wrong ownership still beats no page */ }
 }
 
 
@@ -299,6 +319,28 @@ export function writeViewer(storePath = defaultStorePath(), outPath?: string,
 export async function collectShape(
   storePath = defaultStorePath(),
 ): Promise<{ shape: NetworkShape; source: 'daemon' | 'file' }> {
+  // "Not there yet" and "not allowed" are different answers and were being given the same
+  // one. On a fresh install the store does not exist until the first vault call records a
+  // destination, and root was being told to go and check the file's owner and mode — for a
+  // file that was simply not there. The distinction is whether the daemon's DIRECTORY can
+  // be read: if it can, and the store is absent, then nothing has been recorded and saying
+  // so is the truth rather than an empty page pretending to be data.
+  const dir = path.dirname(storePath);
+  if (!existsSync(storePath)) {
+    let dirReadable = true;
+    try { accessSync(dir, constants.R_OK | constants.X_OK); } catch { dirReadable = false; }
+    if (dirReadable) {
+      return { shape: { version: 1, seen: [] }, source: 'file' };
+    }
+    throw new Error(
+      `Cannot read the destination log.\n` +
+      `  store: ${storePath}\n` +
+      `It belongs to the daemon's own account, which is what stops your agents\n` +
+      `reading where every other agent has sent its secrets.\n\n` +
+      `  sudo wundervault-agent --destinations\n`,
+    );
+  }
+
   try {
     accessSync(storePath, constants.R_OK);
   } catch {

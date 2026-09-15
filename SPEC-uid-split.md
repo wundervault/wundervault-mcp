@@ -128,8 +128,14 @@ package whose whole pitch is that you can read it. So identity is the per-agent 
 - E1. A **system** unit, `User=wundervault`, `Group=wundervault`.
 - E2. `NoNewPrivileges=yes`, `CapabilityBoundingSet=` (empty), `ProtectSystem=strict`,
       `ProtectHome=yes`, `PrivateTmp=yes`, `RestrictSUIDSGID=yes`,
-      `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `MemoryDenyWriteExecute=yes`,
+      `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`,
       `LockPersonality=yes`, `ProtectProc=invisible`, `LimitCORE=0`.
+- E2a. **`MemoryDenyWriteExecute` must NOT be set.** It forbids writable-and-executable
+      memory, which is what V8 needs to compile. With it on, the daemon dies at startup
+      with SIGTRAP before reaching our code — verified on a real install and reproduced with
+      a unit running nothing but `node -e console.log`. It was in this list for two commits,
+      so the test that asserted the list was enforcing the setting that broke the service.
+      No test had ever started it.
 - E3. `ReadWritePaths=/var/lib/wundervault` and nothing else writable.
 - E4. `RuntimeDirectory=wundervault` so the socket directory is created and cleaned up by
       systemd rather than by our code guessing at `/run`.

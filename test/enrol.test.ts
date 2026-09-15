@@ -370,10 +370,19 @@ describe('parsing a setup link', () => {
       .toThrow(/after the #/);
   });
 
-  it('refuses plaintext http even on the right hostname', () => {
-    // The blob is encrypted, but the token is a bearer credential in the path.
-    process.env.WUNDERVAULT_SETUP_ORIGIN = 'https://wundervault.com';
-    expect(() => parseSetupUrl('http://wundervault.com/setup/agent/abc#p')).toThrow(/must come from/);
+  it('refuses plaintext http to a real host even if it were allowlisted', () => {
+    // The blob is encrypted, but the token is a bearer credential in the path, so http to
+    // anything but loopback puts it on the wire. This check sits ON TOP of the allowlist:
+    // configuring an origin must not be a way to turn https off.
+    process.env.WUNDERVAULT_SETUP_ORIGIN = 'http://wundervault.com';
+    expect(() => parseSetupUrl('http://wundervault.com/setup/agent/abc#p')).toThrow(/must be https/);
+  });
+
+  it('permits http on loopback, so a local rehearsal is possible', () => {
+    // Never leaves the machine, and a development server with a real certificate is a
+    // bigger ask than this is worth. Still allowlisted — the origin must be configured.
+    process.env.WUNDERVAULT_SETUP_ORIGIN = 'http://localhost:8090';
+    expect(parseSetupUrl('http://localhost:8090/setup/agent/abc#p').token).toBe('abc');
   });
 
   it('refuses something that is not a setup link at all', () => {

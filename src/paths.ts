@@ -45,9 +45,30 @@ export function systemRoot(): string {
   return process.env.WUNDERVAULT_SYSTEM_ROOT || DEFAULT_SYSTEM_ROOT;
 }
 
-/** The agent's own directory: its token, and its view of things. */
+/**
+ * The agent's own directory: its token, and its view of things.
+ *
+ * Under `sudo`, `os.homedir()` is /root — so `sudo wundervault-agent --destinations`, which
+ * is the ONLY supported way to read the destination log, wrote its page into root's home
+ * where the person who asked for it cannot open it. `SUDO_USER` is honoured so the output
+ * lands in the home of whoever invoked sudo.
+ *
+ * Only consulted when actually running as root: an agent cannot use it to redirect
+ * anything, because setting SUDO_USER without being root changes nothing here.
+ */
 export function userRoot(): string {
-  return process.env.WUNDERVAULT_USER_ROOT || path.join(os.homedir(), '.wundervault');
+  if (process.env.WUNDERVAULT_USER_ROOT) return process.env.WUNDERVAULT_USER_ROOT;
+  const uid = (process as unknown as { getuid?: () => number }).getuid?.();
+  const sudoUser = process.env.SUDO_USER;
+  if (uid === 0 && sudoUser && sudoUser !== 'root') {
+    try {
+      const entry = fs.readFileSync('/etc/passwd', 'utf8')
+        .split('\n').find(l => l.startsWith(`${sudoUser}:`));
+      const dir = entry?.split(':')[5];
+      if (dir) return path.join(dir, '.wundervault');
+    } catch { /* fall through to root's own home */ }
+  }
+  return path.join(os.homedir(), '.wundervault');
 }
 
 /**

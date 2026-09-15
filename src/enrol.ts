@@ -91,6 +91,16 @@ export function parseSetupUrl(raw: string): ParsedLink {
   // So: exactly one origin, from the DAEMON's own environment, which systemd sets and no
   // agent controls. The test override lives there too and is therefore unreachable by a
   // caller — an agent cannot set the daemon's environment any more than it can set its uid.
+  // https everywhere except loopback, ON TOP of the allowlist. The allowlist replaced the
+  // old protocol check outright, which quietly meant a configured origin could be plain
+  // http to any host on the network — the token is a bearer credential in the URL path, so
+  // that hands it to anything on the wire. Loopback stays permitted because a local
+  // rehearsal against a development server is a real need and never leaves the machine.
+  const loopback = ['127.0.0.1', '::1', 'localhost'].includes(u.hostname);
+  if (u.protocol !== 'https:' && !loopback) {
+    throw new Error(`A setup link must be https. Got ${u.protocol.replace(':', '')}.`);
+  }
+
   const allowed = allowedOrigins();
   if (!allowed.includes(u.origin)) {
     throw new Error(

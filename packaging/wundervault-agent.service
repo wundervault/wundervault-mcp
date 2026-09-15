@@ -60,7 +60,22 @@ ProcSubset=pid
 LimitCORE=0
 
 # ── execution ────────────────────────────────────────────────────────────────
-MemoryDenyWriteExecute=yes
+# MemoryDenyWriteExecute is NOT set, and must not be added back.
+#
+# It forbids memory that is both writable and executable, which is exactly what a JIT
+# needs. This daemon is Node, so V8 compiles at runtime: with the setting on, the process
+# dies during startup with SIGTRAP and "Fatal javascript OOM in MemoryChunk allocation
+# failed during deserialization" — before it runs a line of our code. Verified on a real
+# install, and separately with a unit that does nothing but `node -e console.log`, which
+# core-dumps the same way.
+#
+# It was in the spec's hardening list and in the unit for two commits, which meant the test
+# asserting the list was enforcing a setting that made the daemon unable to start. The only
+# reason nothing caught it is that no test had ever launched the service.
+#
+# The protection it offers is real but not available to us here; a runtime that compiles
+# cannot run under W^X enforcement. The uid split, not this, is what keeps the agent out of
+# this process.
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes

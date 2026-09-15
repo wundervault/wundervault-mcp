@@ -484,12 +484,21 @@ describe('the unit file says what the code relies on', () => {
     for (const d of [
       'NoNewPrivileges=yes', 'CapabilityBoundingSet=', 'ProtectSystem=strict',
       'ProtectHome=yes', 'PrivateTmp=yes', 'RestrictSUIDSGID=yes',
-      'MemoryDenyWriteExecute=yes', 'LockPersonality=yes', 'ProtectProc=invisible',
+      'LockPersonality=yes', 'ProtectProc=invisible',
       'LimitCORE=0', 'RuntimeDirectory=wundervault',
       'ReadWritePaths=/var/lib/wundervault',
     ]) {
       expect(unit).toContain(d);
     }
+  });
+
+  it('does NOT set MemoryDenyWriteExecute, which would stop the daemon booting', () => {
+    // This was in the hardening list, so this very test file was asserting a directive that
+    // made the service die at startup with SIGTRAP — V8 compiles at runtime and cannot run
+    // without writable-executable memory. Nothing caught it because no test had ever
+    // launched the unit. Asserting its ABSENCE is what stops it coming back.
+    expect(unit).not.toMatch(/^MemoryDenyWriteExecute=yes$/m);
+    expect(unit).toMatch(/MemoryDenyWriteExecute is NOT set/);
   });
 
   it('does not claim LimitCORE makes the process non-dumpable', () => {
