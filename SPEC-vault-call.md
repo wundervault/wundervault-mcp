@@ -61,9 +61,14 @@ Stored on the entry, plaintext, alongside its signature.
 ### D2. Verification
 - A definition with a missing or invalid signature is **refused**, never "used anyway".
 - The salt travels with the signature, as in the directive mechanism.
-- PBKDF2 at 600k iterations is ~0.5s, so the derived key is cached per (entry, salt) for
-  the life of the process. The cache is keyed by salt so a re-signed definition does not
-  verify against a stale key.
+- PBKDF2 at 600k iterations is ~0.5s, so the derived key is cached per
+  (entry, salt, secret-hash) — all three, because keying on entry and salt alone let a
+  DIFFERENT secret reuse a cached key and verify successfully.
+- The cache is **bounded** (64 entries, oldest evicted). An earlier draft said "for the
+  life of the process", which is not compatible with a bound: past 64 distinct
+  combinations, an evicted key is re-derived and that call pays ~0.5s again. Bounded is
+  the right trade — an unbounded cache in a long-lived daemon grows with every secret it
+  has ever seen — and the cost falls on a re-verification, not on every call.
 
 ## E. Request construction
 

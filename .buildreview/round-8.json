@@ -1,0 +1,170 @@
+{
+  "verdict": "revise",
+  "summary": "The build implements signed typed operations, pinned HTTPS requests, argument validation, response allowlisting, and mode gating, and it fixes the previously reported catalogue-binding and response-leak issues in part. It is not ready to ship because alternative IPv6 loopback spellings bypass SSRF filtering, percent-encoded credential-management routes bypass the explicit flag, exact credentials can still escape through JSON property names, and compressed over-limit responses can leave calls unresolved.",
+  "spec_check": [
+    {
+      "requirement": "One canonical JSON form (sorted keys, no insignificant whitespace) is what gets signed and what gets verified.",
+      "status": "met",
+      "evidence": "canonicalJson recursively sorts object keys and verifyOperationDefinition computes the HMAC over that canonical representation."
+    },
+    {
+      "requirement": "A definition with a missing or invalid signature is refused, never \"used anyway\".",
+      "status": "met",
+      "evidence": "verifyOperationDefinition refuses missing, malformed, wrong-length, and mismatched signatures before returning a definition."
+    },
+    {
+      "requirement": "The derived key is cached per (entry, salt) for the life of the process. The cache is keyed by salt so a re-signed definition does not verify against a stale key.",
+      "status": "partial",
+      "evidence": "The cache key includes entry, salt, and a plaintext hash, so a new salt forces derivation, but the 64-entry eviction policy means a key is not retained for the life of the process."
+    },
+    {
+      "requirement": "vault_call(entry_id, operation_id, args, purpose). No URL, no headers, no raw body.",
+      "status": "met",
+      "evidence": "The shown server path passes only the verified definition, validated callArgs, and decrypted secret to performOperation; request location, headers, and body are constructed internally."
+    },
+    {
+      "requirement": "Exact scheme + host + port. HTTPS only. Normal WebPKI validation.",
+      "status": "met",
+      "evidence": "validateShape requires https and a valid-range port, while httpsRequest uses the definition host and port with rejectUnauthorized enabled."
+    },
+    {
+      "requirement": "SNI and certificate verification against the original hostname even when dialling a pinned IP.",
+      "status": "met",
+      "evidence": "httpsRequest receives host and servername from the original origin while its custom lookup returns the previously resolved address."
+    },
+    {
+      "requirement": "A 3xx is returned to the caller as a result. It is never followed with the credential attached.",
+      "status": "met",
+      "evidence": "The response callback handles every 300-399 status directly, does not issue another request, and no longer returns the Location header."
+    },
+    {
+      "requirement": "Reject loopback, link-local, RFC1918, ULA, multicast, unspecified, CGNAT, benchmarking and cloud-metadata ranges \u2014 including IPv4-mapped IPv6 forms.",
+      "status": "unmet",
+      "evidence": "isBlockedAddress blocks canonical :: and ::1, but allows equivalent expanded forms such as 0:0:0:0:0:0:0:1 and 0:0:0:0:0:0:0:0 because the special-case comparison is performed against the original text."
+    },
+    {
+      "requirement": "Only static_headers from the definition plus the credential binding. Nothing caller-supplied.",
+      "status": "met",
+      "evidence": "performOperation constructs headers from static_headers and the credential binding; arguments cannot add request headers."
+    },
+    {
+      "requirement": "The credential header name is refused if it also appears in static_headers, in any case variant.",
+      "status": "met",
+      "evidence": "validateShape lowercases both the binding name and static header names and refuses a collision."
+    },
+    {
+      "requirement": "Request and response byte caps, and a cap on the decompressed response.",
+      "status": "unmet",
+      "evidence": "The code counts request, wire-response, and decompressed bytes, but the compressed-response abort path destroys the source without settling the promise or handling source abort/error events."
+    },
+    {
+      "requirement": "Connect, TLS, header, total and idle timeouts.",
+      "status": "partial",
+      "evidence": "A socket timeout and a 60-second timer exist after resolution, but DNS resolution occurs before either timer and can leave the overall operation pending indefinitely; separate phase-specific timeout handling is not shown."
+    },
+    {
+      "requirement": "Only fields named in response.allow are returned to the caller. Everything else is dropped, including headers.",
+      "status": "met",
+      "evidence": "filterResponse constructs a new top-level object containing only own properties named in response.allow, and no response headers are returned."
+    },
+    {
+      "requirement": "The credential never appears in the returned result for a well-formed response.",
+      "status": "unmet",
+      "evidence": "scrubSecret replaces the secret in string values but copies object property names unchanged, so an allowed nested object can return the exact credential as a JSON key."
+    },
+    {
+      "requirement": "A definition whose route matches a known credential-management shape (paths containing token, key, credential, secret, password) must set \"allows_credential_management\": true explicitly, or be refused at verification time.",
+      "status": "unmet",
+      "evidence": "The regular expression examines the encoded route string without URL-decoding it, so a route such as /v1/%74oken passes validation but reaches /v1/token at a typical HTTP application."
+    },
+    {
+      "requirement": "An entry in BROKER_HTTP mode is refused by vault_exec, vault_entry_get and vault_entry_inject_env.",
+      "status": "partial",
+      "evidence": "The tests show modeAllowsLegacyExec('BROKER_HTTP') is false, but the handlers for all three named tools are not included in this excerpt, so their actual use of that gate cannot be confirmed here."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/http-broker.ts",
+      "line": 120,
+      "claim": "The IPv6 filter allows expanded textual forms of the unspecified and loopback addresses.",
+      "failure_scenario": "A signed definition uses origin.host \"0:0:0:0:0:0:0:1\"; isIP identifies it as IPv6, expandIPv6 produces ::1, the mapped-address branch deliberately skips it, and the later textual check only recognizes \"::1\", so resolvePinned accepts the address and the credential is sent to a loopback service.",
+      "suggested_direction": "Classify unspecified and loopback addresses from the expanded binary groups rather than comparing only canonical text, and test compressed, expanded, and dotted-compatible spellings of both addresses."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/http-broker.ts",
+      "line": 45,
+      "claim": "Response scrubbing leaves the exact credential intact when it appears in a JSON property name.",
+      "failure_scenario": "With secret \"sk-live-123\" and response.allow containing \"content\", an upstream response of {\"content\":{\"sk-live-123\":\"echo\"}} passes the allowlist; scrubSecret copies the nested key unchanged, and the server's JSON.stringify output returns \"sk-live-123\" to the caller.",
+      "suggested_direction": "Apply exact-secret handling to object keys as well as string values, using a collision-safe policy such as rejecting or redacting the affected response object before serialization."
+    },
+    {
+      "id": "F3",
+      "severity": "blocker",
+      "file": "src/http-broker.ts",
+      "line": 252,
+      "claim": "Aborting an over-limit compressed response can leave performOperation permanently unsettled instead of returning the required size-limit refusal.",
+      "failure_scenario": "An upstream sends a gzip response whose compressed wire stream exceeds response_bytes before EOF; the res data listener calls req.destroy(), but error handling is attached to the gunzip stream rather than the IncomingMessage source, the gunzip stream receives no normal end, and req close clears the total timer, leaving no guaranteed event that calls finish.",
+      "suggested_direction": "Treat crossing either cap as an immediate terminal result, explicitly tear down both the response source and decompressor, and handle aborted/error/close events on both streams without clearing the fallback timer before settlement."
+    },
+    {
+      "id": "F4",
+      "severity": "blocker",
+      "file": "src/opdef.ts",
+      "line": 47,
+      "claim": "Percent-encoded credential-management path words bypass the mandatory allows_credential_management check.",
+      "failure_scenario": "A validly signed definition for route.path \"/v1/%74oken\" omits allows_credential_management; the regex does not see \"token\", validation succeeds, and a typical upstream URL router decodes the request to its /v1/token credential-management endpoint.",
+      "suggested_direction": "Check a safely normalized and percent-decoded path representation in addition to the raw route, rejecting malformed encodings and encoded forms of the protected path terms."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "src/http-broker.ts",
+      "line": 184,
+      "claim": "The total operation timeout does not cover hostname resolution.",
+      "failure_scenario": "If the system resolver stalls while resolving a valid public hostname, resolvePinned never settles and performOperation never reaches the code that creates the 60-second timer, so vault_call can remain pending indefinitely instead of observing a total timeout.",
+      "suggested_direction": "Start the overall deadline before resolution and ensure DNS, connection, TLS, headers, and body processing are all bounded by that deadline and their required phase-specific timeouts."
+    },
+    {
+      "id": "F6",
+      "severity": "minor",
+      "file": "src/opdef.ts",
+      "line": 88,
+      "claim": "The 64-entry eviction policy contradicts the required process-lifetime derived-key cache.",
+      "failure_scenario": "After 65 distinct entry-and-salt combinations have verified, the first derived key is evicted; calling that operation again reruns the synchronous 600,000-round PBKDF2, adding roughly half a second of event-loop blocking even though the spec requires that key to remain cached for the process lifetime.",
+      "suggested_direction": "Reconcile the memory bound with the process-lifetime cache requirement explicitly, using a capacity or storage strategy that does not cause ordinary valid operation catalogues to repeatedly rederive keys."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The argument schema constrains only broad JavaScript types, not allowed values, nested shapes, enums, or fixed discriminator fields.",
+      "why_it_matters": "A fixed /graphql or /rpc route can still accept a caller-selected mutation or method string, recreating the effective-action problem the typed-operation design is intended to prevent even though the request passes schema validation."
+    },
+    {
+      "id": "B2",
+      "concern": "There is no specified concurrency, rate, or cost budget per entry or operation.",
+      "why_it_matters": "A same-UID caller can issue many valid calls concurrently, consuming upstream quotas or incurring material API charges; cache misses also perform synchronous PBKDF2 and can stall unrelated server work."
+    },
+    {
+      "id": "B3",
+      "concern": "Query-string credential bindings are supported without an operational warning or policy distinction from header bindings.",
+      "why_it_matters": "Even when the request reaches the approved origin, bearer credentials in URLs are commonly persisted by upstream access logs, reverse proxies, tracing systems, and monitoring products, making accidental long-term credential exposure substantially more likely."
+    },
+    {
+      "id": "B4",
+      "concern": "Signed operation definitions have no expiry, revision, or revocation semantics described beyond deleting or replacing stored data.",
+      "why_it_matters": "An old definition can remain usable after the owner changes their authorization intent, and restoring an overwritten older signed definition may silently re-enable an operation unless another layer tracks current approved versions."
+    }
+  ],
+  "_meta": {
+    "round": 8,
+    "at": "2026-09-15T01:22:16+00:00",
+    "package_bytes": 71517,
+    "schema_problems": []
+  }
+}

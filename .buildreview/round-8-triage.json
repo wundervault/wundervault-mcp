@@ -1,0 +1,14 @@
+{"round": 8, "decisions": [
+ {"id":"F1","action":"fixed","claim":"0:0:0:0:0:0:0:1 reaches loopback",
+  "reason":"confirmed. Round 1 fixed the mapped spelling and I left the plain expanded one — the textual `=== \"::1\"` check only knew the compressed form. The decision is made entirely on the expanded groups now; no string comparisons remain."},
+ {"id":"F2","action":"fixed","claim":"scrubSecret misses object keys",
+  "reason":"confirmed — {\"content\":{\"sk-live\":\"echo\"}} kept the secret in the key and JSON.stringify returned it. Keys are scrubbed too."},
+ {"id":"F3","action":"fixed","claim":"destroying on wire overflow can leave the promise unsettled",
+  "reason":"confirmed: error handling sat on the gunzip stream, so destroying the request left the decompressor with neither end nor error. The wire-overflow path settles immediately, and error/aborted are handled on the source."},
+ {"id":"F4","action":"fixed","claim":"a percent-encoded path defeats the credential-management check",
+  "reason":"confirmed. Decoded repeatedly until stable before matching, and a path that will not decode is refused rather than guessed at."},
+ {"id":"F5","action":"fixed","claim":"DNS has no deadline and runs before the total timer",
+  "reason":"confirmed — a stalled resolver would hang with nothing to settle it. resolvePinned has its own 5s deadline."},
+ {"id":"F6","action":"fixed","claim":"cache eviction contradicts the spec's process-lifetime caching",
+  "reason":"the CODE is right and the SPEC was wrong. An unbounded cache in a long-lived daemon grows with every secret it has ever seen. The spec now describes the bound and its cost honestly instead of promising something a bound cannot deliver."}
+]}

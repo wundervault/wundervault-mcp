@@ -40,7 +40,11 @@ export function scrubSecret(value: unknown, secret: string): unknown {
   if (Array.isArray(value)) return value.map((v) => scrubSecret(v, secret));
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = scrubSecret(v, secret);
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      // Keys too. An upstream returning {"content":{"sk-live":"echo"}} put the secret in
+      // the KEY, and scrubbing only values left it in the stringified output.
+      out[k.split(secret).join('[REDACTED]')] = scrubSecret(v, secret);
+    }
     return out;
   }
   return value;
@@ -49,6 +53,7 @@ export function scrubSecret(value: unknown, secret: string): unknown {
 const DEFAULT_RESPONSE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_REQUEST_BYTES = 1024 * 1024;
 const CONNECT_TIMEOUT_MS = 10_000;
+const DNS_TIMEOUT_MS = 5_000;
 const TOTAL_TIMEOUT_MS = 60_000;
 
 /**
@@ -106,27 +111,31 @@ export function isBlockedAddress(ip: string): boolean {
   if (v === 4) return isBlockedIPv4(ip);
   if (v !== 6) return true;                                  // not an address at all
 
-  const lower = ip.toLowerCase();
+  // Decide on the EXPANDED groups, never on the string. Textual checks kept missing
+  // spellings: first the fully-expanded IPv4-mapped form, then 0:0:0:0:0:0:0:1, which
+  // is loopback written the long way and which a `=== "::1"` comparison waves through.
+  const g = expandIPv6(ip.toLowerCase());
+  if (!g) return true;                                       // unparseable: refuse
 
-  // IPv4-mapped forms smuggle a v4 address through a v6 check, and they have MANY
-  // spellings: ::ffff:127.0.0.1, ::ffff:7f00:1, and the fully-expanded
-  // 0:0:0:0:0:ffff:127.0.0.1 — an earlier version matched only the compressed ones and
-  // let the expanded form through to loopback. Expand to eight groups first, then
-  // decide once.
-  const expanded = expandIPv6(lower);
-  if (expanded) {
-    const g = expanded;
-    const isMapped = g.slice(0, 5).every((x) => x === 0) && (g[5] === 0xffff || g[5] === 0);
-    if (isMapped && !(g[5] === 0 && g[6] === 0 && g[7] <= 1)) {
-      const v4 = [g[6] >> 8, g[6] & 255, g[7] >> 8, g[7] & 255].join('.');
-      return isBlockedIPv4(v4);
-    }
+  const allZeroTop5 = g.slice(0, 5).every((x) => x === 0);
+
+  // ::ffff:a.b.c.d — a v4 address wearing v6 notation. Apply the v4 rules to it.
+  if (allZeroTop5 && g[5] === 0xffff) {
+    return isBlockedIPv4([g[6] >> 8, g[6] & 255, g[7] >> 8, g[7] & 255].join('.'));
   }
 
-  if (lower === '::' || lower === '::1') return true;        // unspecified, loopback
-  if (/^f[cd]/.test(lower)) return true;                     // unique local fc00::/7
-  if (/^fe[89ab]/.test(lower)) return true;                  // link-local fe80::/10
-  if (/^ff/.test(lower)) return true;                        // multicast
+  // :: (unspecified) and ::1 (loopback), in any spelling.
+  if (allZeroTop5 && g[5] === 0 && g[6] === 0 && g[7] <= 1) return true;
+
+  // ::a.b.c.d — deprecated IPv4-compatible form, still routes to a v4 destination.
+  if (allZeroTop5 && g[5] === 0 && !(g[6] === 0 && g[7] === 0)) {
+    return isBlockedIPv4([g[6] >> 8, g[6] & 255, g[7] >> 8, g[7] & 255].join('.'));
+  }
+
+  const top = g[0];
+  if ((top & 0xfe00) === 0xfc00) return true;                // fc00::/7  unique local
+  if ((top & 0xffc0) === 0xfe80) return true;                // fe80::/10 link-local
+  if ((top & 0xff00) === 0xff00) return true;                // ff00::/8  multicast
   return false;
 }
 
@@ -138,7 +147,19 @@ export function resolvePinned(host: string): Promise<{ address: string; family: 
       if (isBlockedAddress(host)) return reject(new Error(`refuses to connect to ${host}: internal or reserved address`));
       return resolve({ address: host, family: isIP(host) });
     }
+    // A stalled resolver would otherwise hang forever: resolution happens BEFORE the
+    // total-operation timer is installed, so nothing else would ever settle this.
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`timed out resolving ${host} after ${DNS_TIMEOUT_MS / 1000}s`));
+    }, DNS_TIMEOUT_MS);
+
     dnsLookup(host, { all: true }, (err, addrs) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if (err) return reject(new Error(`could not resolve ${host}: ${err.message}`));
       const usable = addrs.filter((a) => !isBlockedAddress(a.address));
       if (usable.length === 0) {
@@ -254,8 +275,17 @@ export async function performOperation(
       // noticed — the decompressed cap catches bombs, this one catches the download.
       res.on('data', (c: Buffer) => {
         wire += c.length;
-        if (wire > maxRes) { over = true; req.destroy(); }
+        if (wire > maxRes) {
+          over = true;
+          req.destroy();
+          // Settle HERE. Destroying the request may leave the decompressor with neither
+          // 'end' nor 'error', and the promise would hang for the whole total timeout —
+          // error handling was attached to the gunzip stream, not to this source.
+          finish({ ok: false, status, error: `Response exceeded ${maxRes} bytes on the wire.` });
+        }
       });
+      res.on('error', (e: Error) => finish({ ok: false, status, error: `Response error: ${e.message}` }));
+      res.on('aborted', () => finish({ ok: false, status, error: 'Upstream closed the response early.' }));
       (stream as NodeJS.ReadableStream).on('data', (c: Buffer) => {
         // Counted AFTER decompression, so a small compressed bomb cannot expand past
         // the cap unnoticed.

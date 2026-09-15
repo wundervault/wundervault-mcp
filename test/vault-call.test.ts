@@ -306,3 +306,48 @@ describe('IPv6 expansion', () => {
     expect(expandIPv6('1::2::3')).toBeNull();
   });
 });
+
+describe('round 2 regressions', () => {
+  const base = {
+    op: 'x', origin: { scheme: 'https', host: 'h.example', port: 443 },
+    credential_binding: { in: 'header' as const, name: 'a', template: '{secret}' },
+  };
+
+  // Round 1 fixed the mapped form and left the plain expanded one. Decide on groups,
+  // never on the spelling.
+  it.each(['0:0:0:0:0:0:0:1', '0:0:0:0:0:0:0:0', '::1', '::'])('blocks loopback written as %s', (ip) => {
+    expect(isBlockedAddress(ip)).toBe(true);
+  });
+
+  it.each(['fe80:0:0:0:0:0:0:1', 'fc00:0:0:0:0:0:0:1', 'ff02:0:0:0:0:0:0:1'])('blocks expanded %s', (ip) => {
+    expect(isBlockedAddress(ip)).toBe(true);
+  });
+
+  it('still permits a real public IPv6 address in expanded form', () => {
+    expect(isBlockedAddress('2606:4700:4700:0:0:0:0:1111')).toBe(false);
+  });
+
+  it('scrubs the secret out of object KEYS, not only values', () => {
+    // {"content":{"sk-live":"echo"}} put the secret in the key, and value-only scrubbing
+    // left it in the stringified output.
+    const out = scrubSecret({ content: { 'sk-live-123': 'echo' } }, 'sk-live-123');
+    expect(JSON.stringify(out)).not.toContain('sk-live-123');
+  });
+
+  it('refuses a percent-encoded credential-management path', () => {
+    // "/v1/%74oken" is "/v1/token" to any normal router; a raw substring test never sees it.
+    expect(validateShape({ ...base, route: { method: 'GET', path: '/v1/%74oken' } }).ok).toBe(false);
+  });
+
+  it('refuses a double-encoded one too', () => {
+    expect(validateShape({ ...base, route: { method: 'GET', path: '/v1/%2574oken' } }).ok).toBe(false);
+  });
+
+  it('refuses a path that is not valid percent-encoding rather than guessing', () => {
+    expect(validateShape({ ...base, route: { method: 'GET', path: '/v1/%zz' } }).ok).toBe(false);
+  });
+
+  it('leaves an ordinary path alone after decoding', () => {
+    expect(validateShape({ ...base, route: { method: 'POST', path: '/v1/mess%61ges' } }).ok).toBe(true);
+  });
+});

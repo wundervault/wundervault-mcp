@@ -228,8 +228,21 @@ export function validateShape(raw: unknown): VerifyResult {
 
   // An operation that mints or lists credentials defeats never releasing the original,
   // so it has to be an explicit decision rather than an accident of routing.
-  if (CREDENTIAL_MANAGEMENT.test(r.path) && d.allows_credential_management !== true) {
-    return { ok: false, reason: `Operation "${d.op}" targets a credential-management path ("${r.path}") without allows_credential_management. An operation that can mint or read credentials defeats the point of never releasing this one; set the flag deliberately if that is intended.` };
+  //
+  // Decoded before matching: "/v1/%74oken" is "/v1/token" to any normal upstream router,
+  // and a raw substring test never sees it. Decoding is repeated until stable so a
+  // double-encoded form cannot hide one layer deeper, and a path that will not decode is
+  // refused outright rather than guessed at.
+  let decodedPath = r.path;
+  for (let i = 0; i < 3; i += 1) {
+    let next: string;
+    try { next = decodeURIComponent(decodedPath); }
+    catch { return { ok: false, reason: `Operation "${d.op}" route path is not valid percent-encoding.` }; }
+    if (next === decodedPath) break;
+    decodedPath = next;
+  }
+  if (CREDENTIAL_MANAGEMENT.test(decodedPath) && d.allows_credential_management !== true) {
+    return { ok: false, reason: `Operation "${d.op}" targets a credential-management path ("${decodedPath}") without allows_credential_management. An operation that can mint or read credentials defeats the point of never releasing this one; set the flag deliberately if that is intended.` };
   }
 
   return { ok: true, definition: d };
