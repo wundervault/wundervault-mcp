@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { JSDOM } from 'jsdom';
-import { mkdtempSync, rmSync, writeFileSync, statSync, readFileSync } from 'node:fs';
+import fs, { mkdtempSync, rmSync, writeFileSync, statSync, readFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { renderViewer, writeViewer } from '../src/log-viewer.js';
@@ -193,27 +193,37 @@ describe('it is a viewer, not a payload', () => {
 });
 
 describe('the file it writes', () => {
-  it('lands beside the store, readable only by its owner', () => {
-    // Beside the store rather than in /tmp: the page holds the same profile the store
-    // does, and a world-readable temp directory is the wrong home for it.
-    const store = path.join(dir, 'network.json');
+  it('lands in the USER directory, readable only by its owner', () => {
+    // It used to land beside the store. After the uid split the store belongs to the
+    // daemon and the person running this cannot write there — so the page goes to their
+    // own directory. Still not /tmp: it holds the same profile the store does, and a
+    // world-readable temp directory is the wrong home for it.
+    const store = path.join(dir, 'state', 'network.json');
+    fs.mkdirSync(path.dirname(store), { recursive: true });
     writeFileSync(store, JSON.stringify(SHAPE));
-    const out = writeViewer(store);
-    expect(path.dirname(out)).toBe(dir);
-    expect(statSync(out).mode & 0o777).toBe(0o600);
-    expect(readFileSync(out, 'utf8')).toContain('api.cloudflare.com');
+    const userRoot = path.join(dir, 'home');
+    process.env.WUNDERVAULT_USER_ROOT = userRoot;
+    try {
+      const out = writeViewer(store);
+      expect(path.dirname(out)).toBe(userRoot);
+      expect(statSync(out).mode & 0o777).toBe(0o600);
+      expect(readFileSync(out, 'utf8')).toContain('api.cloudflare.com');
+    } finally { delete process.env.WUNDERVAULT_USER_ROOT; }
   });
 
   it('leaves the store untouched', () => {
     const store = path.join(dir, 'network.json');
     const original = JSON.stringify(SHAPE);
     writeFileSync(store, original);
-    writeViewer(store);
+    process.env.WUNDERVAULT_USER_ROOT = path.join(dir, 'home2');
+    try { writeViewer(store); } finally { delete process.env.WUNDERVAULT_USER_ROOT; }
     expect(readFileSync(store, 'utf8')).toBe(original);
   });
 
   it('writes a usable page even when the store does not exist', () => {
+    process.env.WUNDERVAULT_USER_ROOT = path.join(dir, 'home3');
     const out = writeViewer(path.join(dir, 'missing.json'));
+    delete process.env.WUNDERVAULT_USER_ROOT;
     const doc = new JSDOM(readFileSync(out, 'utf8'), { runScripts: 'dangerously' }).window.document;
     expect(doc.getElementById('empty')!.hasAttribute('hidden')).toBe(false);
   });

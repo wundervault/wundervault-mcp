@@ -48,8 +48,8 @@
  */
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, chmodSync,
   openSync, closeSync, unlinkSync, statSync } from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
+import { networkStorePath } from './paths.js';
 
 export interface SeenDestination {
   entryId: string;
@@ -103,10 +103,10 @@ export function recordingEnabled(): boolean {
 }
 
 export function defaultStorePath(): string {
-  // After the uid split this becomes /var/lib/wundervault/network.json, owned by the
-  // daemon account. Same shape, same code — only the path and the owner change.
-  return process.env.WUNDERVAULT_NETWORK_STORE
-    || path.join(os.homedir(), '.wundervault', 'network.json');
+  // Daemon-owned since phase 4. This is what turns the file from an observation into an
+  // integrity control: before the split it sat in the agent's own home, so the party
+  // being audited could edit the evidence.
+  return process.env.WUNDERVAULT_NETWORK_STORE || networkStorePath();
 }
 
 export function load(storePath = defaultStorePath()): NetworkShape {

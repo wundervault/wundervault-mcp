@@ -33,22 +33,27 @@ const { values } = parseArgs({
 // the daemon is down, when the credential is held by another agent, and when you are
 // looking at this precisely because something is wrong.
 if (values.destinations) {
-  const { writeViewer } = await import('./log-viewer.js');
-  const { destinationsFor, defaultStorePath, load } = await import('./network-store.js');
+  const { writeViewer, collectShape } = await import('./log-viewer.js');
+  const { defaultStorePath } = await import('./network-store.js');
   const store = defaultStorePath();
-  const shape = load(store);
-  const out = writeViewer(store);
-  const calls = shape.seen.reduce((n, s) => n + s.count, 0);
-  console.log(`
+  try {
+    const { shape, source } = await collectShape(store);
+    const out = writeViewer(store, undefined, shape);
+    const calls = shape.seen.reduce((n, s) => n + s.count, 0);
+    console.log(`
 Destination log — ${shape.seen.length} destination(s), ${calls} call(s)
-  store:  ${store}
+  store:  ${store}${source === 'daemon' ? ' (read by the daemon on your behalf)' : ''}
   viewer: ${out}
 
 Open that file in your browser. It contains the data already, loads nothing, and is
 blocked by its own content-security policy from making any network request. Nothing was
 sent anywhere to produce it.
 `);
-  process.exit(0);
+    process.exit(0);
+  } catch (e) {
+    console.error((e as Error).message);
+    process.exit(1);
+  }
 }
 
 if (values.help) {

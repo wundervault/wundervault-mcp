@@ -1,0 +1,73 @@
+# The daemon, as its own user.
+#
+# This unit is the phase-4 boundary. Everything the vault claims about a key "never
+# reaching the agent" was, before this, true only against an agent that did not try: same
+# uid meant the agent could read the key files, read this process's memory through
+# /proc/<pid>/mem, and rewrite the record of where it had sent things.
+#
+# User= is what does the work. The hardening below is defence in depth, and is described
+# as that rather than as the guarantee.
+
+[Unit]
+Description=Wundervault agent credential daemon
+Documentation=https://wundervault.com/install
+After=network.target
+
+[Service]
+Type=simple
+User=wundervault
+Group=wundervault
+ExecStart=/usr/bin/wundervault-agent
+Restart=always
+RestartSec=2
+
+# systemd creates and removes /run/wundervault. Our own mkdir would leave a stale socket
+# behind after a crash, and the next start would bind elsewhere while agents kept talking
+# to the old path.
+RuntimeDirectory=wundervault
+RuntimeDirectoryMode=0755
+StateDirectory=wundervault
+StateDirectoryMode=0700
+
+# ── privilege ────────────────────────────────────────────────────────────────
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+
+# ── filesystem ───────────────────────────────────────────────────────────────
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/wundervault
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# ── process visibility ───────────────────────────────────────────────────────
+# ProtectProc hides other users' processes from this one. What stops the AGENT reading
+# THIS process is the uid separation above, not a line in this file: ptrace and
+# /proc/<pid>/mem require a matching uid or CAP_SYS_PTRACE.
+ProtectProc=invisible
+ProcSubset=pid
+
+# LimitCORE=0 prevents a core file being written. It does NOT make the process
+# non-dumpable — an earlier draft of the plan claimed it did. It is here so a crash does
+# not spill credentials onto the disk, and that is all it does.
+LimitCORE=0
+
+# ── execution ────────────────────────────────────────────────────────────────
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

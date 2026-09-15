@@ -18,6 +18,7 @@ import { loadOpenSshEd25519, runSshBrokered, modeAllowsLegacyExec, modeAllowsSsh
   modeAllowsHttpBroker, wrongModeMessage, type BrokeredOp } from './ssh-agent.js';
 import { verifyOperationDefinition, validateArguments } from './opdef.js';
 import { recordDestination, newDestinationNotice, emitToStderr } from './network-store.js';
+import { agentTokenPath, agentSocketPath, legacy } from './paths.js';
 import { definitionFromAgentRequest, originString, isApprovedPrivateOrigin, type AgentRequest } from './http-broker.js';
 import { performOperation } from './http-broker.js';
 import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey, commandInvokesSudo } from './exec.js';
@@ -88,25 +89,53 @@ async function getCredentials(): Promise<Credentials> {
     );
   }
 
-  const tokenFilePath = path.join(os.homedir(), '.wundervault', 'agents', agentName + '.token');
+  const tokenFilePath = agentTokenPath(agentName);
   const agentToken = process.env.WUNDERVAULT_AGENT_TOKEN ||
     (fsExistsSync(tokenFilePath) ? readFileSync(tokenFilePath, 'utf8').trim() : '');
 
-  const sockPath = path.join(os.homedir(), '.wundervault', 'agents', agentName + '.sock');
-  const daemonCreds = await tryDaemonConnect(sockPath, agentToken);
+  // The system daemon first, then the pre-split socket in the user's home.
+  //
+  // The fallback exists so a machine mid-migration keeps working, and it ANNOUNCES itself
+  // rather than being silent: an install that still reaches the old socket has the old
+  // threat model — same uid, key files readable, memory readable — while the release notes
+  // say otherwise. Someone should be told they are not yet behind the boundary they think
+  // they are behind.
+  const sockPath = agentSocketPath(agentName);
+  let daemonCreds = await tryDaemonConnect(sockPath, agentToken);
+  let usedLegacy = false;
+
+  if (!daemonCreds) {
+    const legacySock = legacy.agentSocket(agentName);
+    if (legacySock !== sockPath && fsExistsSync(legacySock)) {
+      daemonCreds = await tryDaemonConnect(legacySock, agentToken);
+      if (daemonCreds) {
+        usedLegacy = true;
+        // stderr, not the tool result: this is a property of the install, not something
+        // the model needs to reason about or could act on.
+        process.stderr.write(
+          `[wundervault] Using the pre-phase-4 daemon socket at ${legacySock}.\n` +
+          `[wundervault] That daemon runs as YOUR user, so it shares a uid with this agent:\n` +
+          `[wundervault] its key material and memory are readable by anything you run.\n` +
+          `[wundervault] Finish the split:  sudo sh packaging/install-daemon.sh && wundervault-agent --migrate\n`,
+        );
+      }
+    }
+  }
 
   if (!daemonCreds) {
     const sockExists = fsExistsSync(sockPath);
     throw new Error(
       sockExists
         ? `wundervault-agent crashed — socket exists but daemon is not responding for '${agentName}'.\n` +
-          `Restart it: systemctl --user restart wundervault-agent\n` +
+          `Restart it: sudo systemctl restart wundervault-agent\n` +
           `Socket: ${sockPath}`
         : `wundervault-agent daemon not running for agent '${agentName}'.\n` +
           `Expected socket: ${sockPath}\n` +
-          `Run onboard.py to register and start the daemon, then retry any vault tool.`
+          `Install the daemon:  sudo sh packaging/install-daemon.sh\n` +
+          `Then enrol:          run onboard.py, or wundervault-agent --migrate if you had it before.`
     );
   }
+  void usedLegacy;
 
   const creds: Credentials = {
     agent_vault_url: _credsUrl || daemonCreds.vault_url || 'https://wundervault.com',

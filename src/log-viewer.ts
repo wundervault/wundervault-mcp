@@ -29,9 +29,11 @@
  * What it IS: one self-contained HTML file with the data already inside it, written
  * 0600 next to the store, which you open with your own browser and delete when done.
  */
-import { writeFileSync, mkdirSync, chmodSync } from 'node:fs';
+import { writeFileSync, mkdirSync, chmodSync, accessSync, constants } from 'node:fs';
+import * as net from 'node:net';
 import * as path from 'node:path';
 import { load, defaultStorePath, type NetworkShape } from './network-store.js';
+import { mgmtSocketPath, viewerPath } from './paths.js';
 
 /** Escape for embedding inside an HTML text node or attribute. */
 function esc(s: string): string {
@@ -256,11 +258,78 @@ render();
  * automatically — this is a daemon, and a daemon that launches a browser is a daemon doing
  * something nobody asked it to.
  */
-export function writeViewer(storePath = defaultStorePath(), outPath?: string): string {
-  const shape = load(storePath);
-  const target = outPath ?? path.join(path.dirname(storePath), 'destinations.html');
+export function writeViewer(storePath = defaultStorePath(), outPath?: string,
+                            shapeOverride?: NetworkShape): string {
+  const shape = shapeOverride ?? load(storePath);
+  // The USER's directory, not the daemon's. After the split the store lives somewhere the
+  // person running this cannot write, and dropping the page beside it would fail — or,
+  // worse, succeed for the one user who still owns both.
+  const target = outPath ?? viewerPath();
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   writeFileSync(target, renderViewer(shape, storePath), { mode: 0o600 });
   try { chmodSync(target, 0o600); } catch { /* best effort */ }
   return target;
+}
+
+
+/**
+ * Get the destinations, from wherever they can honestly be got.
+ *
+ * After the uid split the store belongs to the daemon and the person running this cannot
+ * read it. That is the boundary working. But `load()` swallows a read error and returns
+ * an empty shape — which would render a page saying this machine's agents have never sent
+ * a secret anywhere, to someone who is looking precisely because they want to know. A
+ * wrong answer delivered confidently is worse than an error.
+ *
+ * So: ask the daemon first, fall back to reading the file, and if neither works say which
+ * one failed rather than showing an empty table.
+ */
+export async function collectShape(
+  storePath = defaultStorePath(),
+): Promise<{ shape: NetworkShape; source: 'daemon' | 'file' }> {
+  let daemonSaid: string | null = null;
+  const viaDaemon = await askDaemon().catch((e: Error) => {
+    // Distinguish "no daemon there" from "the daemon says something is wrong". The first
+    // is a fallback; the second is the answer.
+    if (!/ENOENT|ECONNREFUSED|timed out/.test(e.message)) daemonSaid = e.message;
+    return null;
+  });
+  if (viaDaemon) return { shape: viaDaemon, source: 'daemon' };
+  if (daemonSaid) throw new Error(daemonSaid);
+
+  try {
+    accessSync(storePath, constants.R_OK);
+  } catch {
+    throw new Error(
+      `Cannot read the destination log, and the daemon did not answer.\n` +
+      `  store:  ${storePath} (not readable by you — this is the uid split working)\n` +
+      `  daemon: ${mgmtSocketPath()}\n` +
+      `Start it:  sudo systemctl start wundervault-agent\n` +
+      `Refusing to show you an empty page, which is what this used to do.`,
+    );
+  }
+  return { shape: load(storePath), source: 'file' };
+}
+
+function askDaemon(timeoutMs = 3_000): Promise<NetworkShape | null> {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection(mgmtSocketPath());
+    let buf = '';
+    const fin = (fn: () => void) => { clearTimeout(timer); sock.destroy(); fn(); };
+    const timer = setTimeout(() => fin(() => reject(new Error('daemon timed out'))), timeoutMs);
+    sock.on('connect', () => sock.write(JSON.stringify({ action: 'destinations' }) + '\n'));
+    sock.on('data', (d) => {
+      buf += d.toString();
+      if (!buf.includes('\n')) return;
+      try {
+        const reply = JSON.parse(buf.trim());
+        // A daemon that answered with an error has told us something worth repeating.
+        // Treating it as "no answer" would fall through to the file and, if that happened
+        // to be readable, quietly disagree with the daemon about what the truth is.
+        if (reply?.error) { fin(() => reject(new Error(String(reply.error)))); return; }
+        fin(() => resolve(reply?.ok && reply.shape ? reply.shape as NetworkShape : null));
+      } catch { fin(() => reject(new Error('unparseable reply'))); }
+    });
+    sock.on('error', (e) => fin(() => reject(e)));
+  });
 }
