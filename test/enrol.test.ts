@@ -31,8 +31,9 @@ let burned: string[] = [];
 
 const PASSPHRASE = 'correct horse battery staple';
 
-function makeBlob(creds: object, passphrase = PASSPHRASE): string {
-  const key = crypto.pbkdf2Sync(passphrase, 'wv-agent-setup-v1', 100_000, 32, 'sha256');
+function makeBlob(creds: object, passphrase = PASSPHRASE,
+                  salt = 'wv-agent-setup-v2', rounds = 600_000): string {
+  const key = crypto.pbkdf2Sync(passphrase, salt, rounds, 32, 'sha256');
   const nonce = crypto.randomBytes(12);
   const c = crypto.createCipheriv('aes-256-gcm', key, nonce);
   const body = Buffer.concat([c.update(JSON.stringify(creds), 'utf8'), c.final()]);
@@ -353,6 +354,33 @@ describe('the origin is the whole security property', () => {
     });
     expect(res.error).toMatch(/must come from/);
   });
+});
+
+describe('the setup-link KDF', () => {
+  it('opens a v2 link at 600,000 iterations', async () => {
+    const blob = makeBlob({ api_key: 'k_v2', encryption_key: 'e' });
+    await startServer({ tok1: { name: 'Byte', blob } });
+    daemon = await freshDaemon();
+    const res = await speak(mgmt(), {
+      action: 'enrol', setup_url: `${baseUrl}/setup/agent/tok1#${PASSPHRASE}`,
+      socket_token: crypto.randomBytes(32).toString('hex'),
+    });
+    expect(res.ok).toBe(true);
+  }, 30_000);
+
+  it('still opens a v1 link minted just before the deploy', async () => {
+    // Links live fifteen minutes, so a deploy always catches some in flight. Refusing them
+    // would strand whoever was mid-setup at the moment we shipped.
+    const blob = makeBlob({ api_key: 'k_v1', encryption_key: 'e' },
+                          PASSPHRASE, 'wv-agent-setup-v1', 100_000);
+    await startServer({ tok1: { name: 'Byte', blob } });
+    daemon = await freshDaemon();
+    const res = await speak(mgmt(), {
+      action: 'enrol', setup_url: `${baseUrl}/setup/agent/tok1#${PASSPHRASE}`,
+      socket_token: crypto.randomBytes(32).toString('hex'),
+    });
+    expect(res.ok).toBe(true);
+  }, 30_000);
 });
 
 describe('parsing a setup link', () => {

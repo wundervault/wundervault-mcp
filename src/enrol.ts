@@ -48,8 +48,22 @@ export function allowedOrigins(): string[] {
   return configured.split(',').map(o => o.trim()).filter(Boolean);
 }
 
-const PBKDF2_SALT = 'wv-agent-setup-v1';
-const PBKDF2_ROUNDS = 100_000;
+/**
+ * The setup-link KDF, v2 first and v1 behind it.
+ *
+ * 600,000 iterations, up from 100,000: the same figure the vault passphrase uses and the
+ * current OWASP recommendation for PBKDF2-HMAC-SHA256. The link lives fifteen minutes, which
+ * bounds the window but says nothing about what a captured link costs to attack inside it —
+ * and there was no reason for this one path to be six times weaker than everything else.
+ *
+ * The version lives in the salt so both can be understood at once. A link minted just before
+ * the deploy is v1 and still has its fifteen minutes; this tries v2 and falls back. The v1
+ * entry can be removed once no v1 link can possibly still exist.
+ */
+const KDF_VERSIONS: ReadonlyArray<{ salt: string; rounds: number }> = [
+  { salt: 'wv-agent-setup-v2', rounds: 600_000 },
+  { salt: 'wv-agent-setup-v1', rounds: 100_000 },
+];
 const UA = 'WunderVault-Agent-Daemon/1.0';
 /** A credential blob is a couple of hundred bytes. This is three orders of magnitude of slack. */
 const MAX_RESPONSE_BYTES = 256 * 1024;
@@ -208,16 +222,20 @@ export async function redeemSetupLink(
   const blob = Buffer.from(b64, 'base64');
   if (blob.length < 29) throw new Error('The credential blob is too short to be valid.');
 
-  const key = crypto.pbkdf2Sync(passphrase, PBKDF2_SALT, PBKDF2_ROUNDS, 32, 'sha256');
-  let plain: Buffer;
-  try {
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, blob.subarray(0, 12));
-    // GCM in this format carries its tag at the END of the ciphertext, the way the Python
-    // AESGCM.decrypt() on the other side expects to find it.
-    const ct = blob.subarray(12, blob.length - 16);
-    decipher.setAuthTag(blob.subarray(blob.length - 16));
-    plain = Buffer.concat([decipher.update(ct), decipher.final()]);
-  } catch {
+  let plain: Buffer | null = null;
+  for (const { salt, rounds } of KDF_VERSIONS) {
+    const key = crypto.pbkdf2Sync(passphrase, salt, rounds, 32, 'sha256');
+    try {
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, blob.subarray(0, 12));
+      // GCM in this format carries its tag at the END of the ciphertext, the way the Python
+      // AESGCM.decrypt() on the other side expects to find it.
+      const ct = blob.subarray(12, blob.length - 16);
+      decipher.setAuthTag(blob.subarray(blob.length - 16));
+      plain = Buffer.concat([decipher.update(ct), decipher.final()]);
+      break;
+    } catch { /* wrong version or wrong passphrase; try the next */ }
+  }
+  if (!plain) {
     throw new Error(
       'Could not decrypt those credentials — the part of the link after the # is wrong, ' +
       'or the link was mangled in transit. Nothing has been changed and the link is unused.',

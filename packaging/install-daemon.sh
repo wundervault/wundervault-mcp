@@ -210,10 +210,56 @@ ACTUAL=$(stat -c '%a' "$STATE_DIR" 2>/dev/null || stat -f '%Lp' "$STATE_DIR")
 [ "$ACTUAL" = "700" ] || { echo "ERROR: ${STATE_DIR} is mode ${ACTUAL}, expected 700." >&2; exit 1; }
 echo "state dir ${STATE_DIR}: 0700 ${ACCOUNT}"
 
+# ── 2b. the sealed store key ─────────────────────────────────────────────────
+#
+# A random 32-byte key, sealed so that the file on disk is useless on its own.
+#
+# What this replaces: a key DERIVED from /etc/machine-id and the account's uid, with the
+# salt stored beside the ciphertext. Every input to that is readable by anyone who can read
+# the directory, so the key was recomputable — the directory mode was doing all the work and
+# the encryption was decoration. Someone who walked off with the disk had everything.
+#
+# `systemd-creds encrypt` seals to the TPM where there is one, and to the root-only host key
+# otherwise. Either way the blob does not open on another machine, and the broker never needs
+# TPM access itself: systemd unseals it as root at start and hands it over through a private
+# tmpfs (LoadCredentialEncrypted= in the unit).
+SEALED_KEY="${STATE_DIR}/store.key.cred"
+if [ -f "$SEALED_KEY" ]; then
+  echo "store key: already sealed at ${SEALED_KEY}"
+elif command -v systemd-creds >/dev/null 2>&1; then
+  TPM_STATE=$(systemd-creds has-tpm2 2>/dev/null | head -1 || echo no)
+  if head -c 32 /dev/urandom \
+      | systemd-creds encrypt --name=wv-store-key - "$SEALED_KEY" 2>/dev/null; then
+    chown "${ACCOUNT}:$(id -gn "$ACCOUNT")" "$SEALED_KEY"
+    chmod 0600 "$SEALED_KEY"
+    case "$TPM_STATE" in
+      yes) echo "store key: sealed to this machine's TPM" ;;
+      *)   echo "store key: sealed to the host key (no TPM found — still not portable,"
+           echo "           but a disk copy plus root would open it)" ;;
+    esac
+  else
+    echo "WARNING: could not seal a store key with systemd-creds." >&2
+    echo "         The broker will fall back to a key derived from /etc/machine-id and its" >&2
+    echo "         uid, which anyone able to read ${STATE_DIR} can recompute. The directory" >&2
+    echo "         mode still protects it; the encryption does not." >&2
+  fi
+else
+  echo "WARNING: systemd-creds not found, so the store key cannot be sealed." >&2
+  echo "         The broker falls back to a derived, recomputable key. See the docs." >&2
+fi
+
 # ── 3. the unit ──────────────────────────────────────────────────────────────
 # The template is shipped alongside this script and read from disk rather than written
 # inline, so what lands in /etc/systemd/system is the file you reviewed in the repo.
 sed "s|^ExecStart=.*|ExecStart=${EXEC}|" "$UNIT_SRC" > "$UNIT_PATH"
+
+# No sealed key on this machine? Then the unit must not ask systemd for one: a missing
+# credential source is fatal (243/CREDENTIALS), and a broker that will not start is worse
+# than one running on the derived key and saying so.
+if [ ! -f "$SEALED_KEY" ]; then
+  sed -i '/^LoadCredentialEncrypted=wv-store-key:/d' "$UNIT_PATH"
+  echo "unit: no sealed key, so the credential line was removed"
+fi
 chmod 0644 "$UNIT_PATH"
 grep -q "^User=${ACCOUNT}\$" "$UNIT_PATH" || {
   echo "ERROR: the installed unit does not run as ${ACCOUNT}. Refusing to continue." >&2
@@ -231,6 +277,25 @@ systemctl enable "$UNIT_NAME"
 systemctl restart "$UNIT_NAME"
 
 sleep 1
+
+# Did the sealing actually take EFFECT? Sealing a key and delivering it are separate things,
+# and the gap between them is silent: systemd can set CREDENTIALS_DIRECTORY and still fail to
+# materialise the file, which leaves the broker on the derived key while a sealed blob sits
+# on disk looking like proof of something. Ask the broker what key it is actually using.
+if [ -f "$SEALED_KEY" ] && systemctl is-active --quiet "$UNIT_NAME"; then
+  sleep 1
+  if journalctl -u "$UNIT_NAME" -n 20 --no-pager 2>/dev/null | grep -q "Store key: DERIVED"; then
+    echo >&2
+    echo "WARNING: a sealed key exists but the broker is NOT using it." >&2
+    echo "         systemd did not deliver the credential — check:" >&2
+    echo "           systemd-creds decrypt --name=wv-store-key ${SEALED_KEY} -" >&2
+    echo "           journalctl -u ${UNIT_NAME} | grep -i credential" >&2
+    echo "         The store is running on a key derived from /etc/machine-id and the" >&2
+    echo "         broker's uid, which anyone able to read ${STATE_DIR} can recompute." >&2
+    echo "         Do not describe this machine as having a sealed store." >&2
+  fi
+fi
+
 if systemctl is-active --quiet "$UNIT_NAME"; then
   echo
   echo "The secret broker is running. ${STATE_DIR} is readable only by ${ACCOUNT},"

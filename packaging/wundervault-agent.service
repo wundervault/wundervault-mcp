@@ -24,6 +24,12 @@ RestartSec=2
 # systemd creates and removes /run/wundervault. Our own mkdir would leave a stale socket
 # behind after a crash, and the next start would bind elsewhere while agents kept talking
 # to the old path.
+# The store key, unsealed by systemd (as root) and handed to this service in a private
+# tmpfs at $CREDENTIALS_DIRECTORY. The broker therefore never touches /dev/tpmrm0 and never
+# needs the host key; it just reads a file only it can see. Absent on a machine that could
+# not seal one, in which case the broker falls back to a derived key and says so loudly.
+LoadCredentialEncrypted=wv-store-key:/var/lib/wundervault/store.key.cred
+
 RuntimeDirectory=wundervault
 RuntimeDirectoryMode=0755
 StateDirectory=wundervault

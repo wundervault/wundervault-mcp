@@ -109,6 +109,29 @@ export function runtimeDir(): string {
   return path.join(systemRoot(), 'run');
 }
 
+/**
+ * Where systemd drops credentials it has unsealed for us.
+ *
+ * `LoadCredentialEncrypted=` in the unit has systemd decrypt a sealed blob AS ROOT and place
+ * the plaintext in a private tmpfs readable only by this service. That is the whole trick:
+ * the broker never needs access to /dev/tpmrm0 or to the host key, and the sealed file on
+ * disk is useless to anyone who copies it — on another machine the TPM will not unseal it,
+ * and on this one it takes root.
+ */
+export const CREDENTIAL_NAME = 'wv-store-key';
+
+export function systemdCredential(name = CREDENTIAL_NAME): Buffer | null {
+  const dir = process.env.CREDENTIALS_DIRECTORY;
+  if (!dir) return null;
+  try {
+    const buf = fs.readFileSync(path.join(dir, name));
+    return buf.length >= 32 ? buf : null;
+  } catch { return null; }
+}
+
+/** The sealed blob on disk. Written by the installer, read by systemd, never by us. */
+export const sealedKeyPath = () => path.join(systemRoot(), 'store.key.cred');
+
 // ── daemon-side paths ─────────────────────────────────────────────────────────
 
 export const profilesPath = () => path.join(systemRoot(), 'agent-profiles.enc');

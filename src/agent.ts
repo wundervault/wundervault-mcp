@@ -37,7 +37,7 @@ import { redeemSetupLink, peekAgentName } from './enrol.js';
 import {
   systemRoot, profilesPath, saltPath, mgmtSocketPath, agentSocketPath,
   runtimeDir, ensureSystemRoot, safeName, SYSTEM_ACCOUNT, mgmtDir, networkStorePath,
-  splitAvailable,
+  splitAvailable, systemdCredential,
 } from './paths.js';
 import { load as loadNetworkShape } from './network-store.js';
 
@@ -95,7 +95,32 @@ function refuseRoot(): void {
   }
 }
 
-function deriveMachineKey(): Buffer {
+/**
+ * The key the profile store is encrypted with.
+ *
+ * TWO MODES, AND THE DIFFERENCE IS THE WHOLE POINT.
+ *
+ * SEALED (preferred). systemd unseals a random 32-byte key for us — sealed to this
+ * machine's TPM where there is one, to the root-only host key otherwise — and drops it in a
+ * private tmpfs only this service can read. The key is not derived from anything; it is a
+ * secret. Copy the disk to another machine and the store does not open, because the TPM
+ * that sealed it is not there.
+ *
+ * DERIVED (fallback, and what this used to be exclusively). HKDF over
+ * sha256(machine-id : uid) with a salt stored beside the ciphertext. Every input to that is
+ * readable by anyone who can read the directory, so the key is RECOMPUTABLE: it is not a
+ * secret, it is an obfuscation, and the directory mode was doing all the real work. That is
+ * fine as defence in depth and was always described as such — it is not fine as the only
+ * thing standing between a stolen disk and every credential on it.
+ *
+ * Both are supported because the fallback has to exist: no TPM, an older systemd, a
+ * container, a hand-started broker. What must not happen is a machine silently sitting in
+ * the weaker mode while the release notes describe the stronger one, so the mode in force is
+ * reported at startup and by `ping`.
+ */
+type KeyMode = 'sealed' | 'derived';
+
+function legacyDerivedKey(): Buffer {
   let machineId = 'unknown';
   try { machineId = fs.readFileSync('/etc/machine-id', 'utf8').trim(); } catch { /* not linux */ }
   const uid = (process as unknown as { getuid?: () => number }).getuid?.() ?? 0;
@@ -111,6 +136,22 @@ function deriveMachineKey(): Buffer {
     fs.writeFileSync(sp, salt, { mode: 0o600 });
   }
   return crypto.hkdfSync('sha256', ikm, salt, Buffer.from('wundervault-agent-v1'), 32) as unknown as Buffer;
+}
+
+function sealedKey(): Buffer | null {
+  const raw = systemdCredential();
+  if (!raw) return null;
+  // Expanded rather than used raw, so the stored secret is never the working key and can be
+  // re-purposed later (a second context string gives a second independent key).
+  return crypto.hkdfSync(
+    'sha256', raw, Buffer.alloc(0), Buffer.from('wundervault-store-v2'), 32,
+  ) as unknown as Buffer;
+}
+
+function deriveMachineKey(): { key: Buffer; mode: KeyMode } {
+  const sealed = sealedKey();
+  if (sealed) return { key: sealed, mode: 'sealed' };
+  return { key: legacyDerivedKey(), mode: 'derived' };
 }
 
 function encryptProfiles(store: ProfileStore, key: Buffer): Buffer {
@@ -215,9 +256,14 @@ class AgentDaemon {
 
   constructor() {
     ensureSystemRoot();
-    this.key = deriveMachineKey();
+    const { key, mode } = deriveMachineKey();
+    this.key = key;
+    this.keyMode = mode;
     this.loadProfiles();
   }
+
+  /** 'sealed' when the key came from the TPM via systemd; 'derived' when it is recomputable. */
+  keyMode: KeyMode = 'derived';
 
   /**
    * A store we could not read is NOT an empty store.
@@ -241,7 +287,28 @@ class AgentDaemon {
     try {
       this.profiles = decryptProfiles(fs.readFileSync(pp), this.key).profiles;
       this.unreadableStore = null;
+      return;
     } catch (err) {
+      // Before giving up: a store written under the OLD derived key is not corrupt, it is
+      // just addressed to a key we have stopped using. Try that key, and if it opens,
+      // rewrite the store under the sealed one immediately. Migration has to be automatic —
+      // an upgrade that leaves every existing install unable to start is not an upgrade, and
+      // one that needs a manual step is one most people will not take.
+      if (this.keyMode === 'sealed') {
+        try {
+          const viaLegacy = decryptProfiles(fs.readFileSync(pp), legacyDerivedKey()).profiles;
+          this.profiles = viaLegacy;
+          this.unreadableStore = null;
+          this.saveProfiles();
+          console.error(
+            '[wundervault-agent] Re-sealed the profile store: it was encrypted with a key ' +
+            'derived from public inputs, and is now sealed to this machine.',
+          );
+          // The old salt is no longer an input to anything. Leaving it implies otherwise.
+          try { fs.unlinkSync(saltPath()); } catch { /* already gone */ }
+          return;
+        } catch { /* genuinely unreadable; fall through to the refusal below */ }
+      }
       this.unreadableStore = (err as Error).message;
       this.profiles = [];
       console.error(
@@ -561,6 +628,7 @@ class AgentDaemon {
             // asks for them explicitly below.
             socket.write(JSON.stringify({
               ok: true, version: VERSION, store_unreadable: this.storeUnreadable,
+              key_mode: this.keyMode,
             }) + '\n');
           } else if (msg.action === 'known_agents') {
             // Names only, never credentials. This is what lets migration tell you which of
@@ -624,6 +692,20 @@ class AgentDaemon {
     console.log(
       `[wundervault-agent] Started with ${this.agentServers.size} agent(s). State: ${systemRoot()}`,
     );
+    // Said out loud, every start. A machine quietly running in the weaker mode while the
+    // documentation describes the stronger one is the failure this line exists to prevent.
+    if (this.keyMode === 'sealed') {
+      console.log(
+        '[wundervault-agent] Store key: SEALED to this machine (systemd/TPM). ' +
+        'A copy of the disk does not open it.',
+      );
+    } else {
+      console.error(
+        '[wundervault-agent] Store key: DERIVED from machine-id and uid, which are not secret.\n' +
+        '[wundervault-agent] Anyone who can read this directory can recompute it, so the\n' +
+        '[wundervault-agent] directory mode is what protects the store — not the encryption.',
+      );
+    }
   }
 
   shutdown(): void {
