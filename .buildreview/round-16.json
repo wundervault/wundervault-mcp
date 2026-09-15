@@ -1,0 +1,217 @@
+{
+  "verdict": "revise",
+  "summary": "The build moves daemon state behind a separate system uid, directly reads the destination store under sudo, and drops privilege before writing the viewer, addressing the demonstrated root symlink exploit. It is not ready to ship because the installer still accepts some human-owned low-uid accounts as the daemon identity, which removes the uid boundary entirely; there are also failure and race paths that can produce inaccessible or misleading destination output.",
+  "spec_check": [
+    {
+      "requirement": "daemon uid: the user's -> `wundervault` system account",
+      "status": "unmet",
+      "evidence": "The unit is intended to use `wundervault`, but `install-daemon.sh` treats every existing account below uid 1000 as a system account and merely warns about a login shell, so an existing human account with uid 500 is accepted."
+    },
+    {
+      "requirement": "key material and destination store: `/var/lib/wundervault/`, 0700",
+      "status": "partial",
+      "evidence": "`systemRoot()` defaults to `/var/lib/wundervault`, the network store resolves beneath it, and the installer enforces mode 0700; however, the directory can be assigned to the agent's own uid through the account-classification defect in F1."
+    },
+    {
+      "requirement": "B1. The only way a profile enters the daemon is `enrol`, carrying a setup link. There is no `register_profile`.",
+      "status": "partial",
+      "evidence": "The shown dispatch contains `--enrol`, but the daemon handler and the rest of `agent.ts` are withheld, so absence of `register_profile` cannot be independently verified from this excerpt."
+    },
+    {
+      "requirement": "B2. The daemon performs the exchange: `GET /api/setup/agent/<token>`, PBKDF2-SHA256, AES-256-GCM, then `POST .../burn`.",
+      "status": "partial",
+      "evidence": "The implementation is in withheld `src/server.ts`; the package reports tests, but the exchange, cryptographic parameters, and credential confinement are not visible here."
+    },
+    {
+      "requirement": "B2a. A link is accepted only from an origin in the daemon's own configuration.",
+      "status": "partial",
+      "evidence": "Origin validation is in withheld daemon code and cannot be checked from the provided files."
+    },
+    {
+      "requirement": "B2b. The link is read from stdin, never argv.",
+      "status": "partial",
+      "evidence": "The shown `agent.ts` dispatch documents stdin-only enrolment and places `--enrol` after the destinations branch, but the actual stdin parsing code begins beyond the supplied extract."
+    },
+    {
+      "requirement": "B2c. Redirects are refused and a non-JSON content-type is refused.",
+      "status": "partial",
+      "evidence": "The network request implementation is withheld."
+    },
+    {
+      "requirement": "B4. The burn happens after the profile is stored.",
+      "status": "partial",
+      "evidence": "Profile storage and burn ordering are in withheld daemon code."
+    },
+    {
+      "requirement": "B4a. One enrolment per connection.",
+      "status": "partial",
+      "evidence": "The management connection handler is withheld."
+    },
+    {
+      "requirement": "B6. Removing an agent is authorised by that agent's own token.",
+      "status": "partial",
+      "evidence": "The removal handler is not included in the review excerpt."
+    },
+    {
+      "requirement": "C1. The sockets are world-connectable, including the management socket.",
+      "status": "partial",
+      "evidence": "`paths.ts` places the management socket under the systemd runtime directory and documents the world-connectable design, but the code that creates the directory and applies socket modes is withheld."
+    },
+    {
+      "requirement": "C2-C3. Tokens are compared in constant time; wrong tokens charge only the failing caller while valid tokens remain serviceable.",
+      "status": "partial",
+      "evidence": "Authentication, delay, and connection-deadline logic are in withheld server code."
+    },
+    {
+      "requirement": "D1. The agent's uid cannot read `/var/lib/wundervault`.",
+      "status": "unmet",
+      "evidence": "Mode 0700 and ownership normally enforce this, but F1 provides an accepted installer state in which `wundervault` is the human/agent uid, making the directory readable by the agent."
+    },
+    {
+      "requirement": "D2. The agent cannot read the daemon's memory.",
+      "status": "unmet",
+      "evidence": "Uid separation normally supplies this control, but F1 allows the daemon and agent to run under the same existing low-numbered human uid, restoring same-uid `/proc` access."
+    },
+    {
+      "requirement": "D3. The destination store is not served over the management socket; `--destinations` reads the file as root.",
+      "status": "partial",
+      "evidence": "`collectShape()` reads the store directly and the shown `--destinations` branch deliberately permits root, but absence of a management-socket read operation cannot be confirmed because the server is withheld."
+    },
+    {
+      "requirement": "D4. `LimitCORE=0` is described only as crash-dump defence, not as the memory boundary.",
+      "status": "partial",
+      "evidence": "The supplied test asserts the corrective description, but the actual unit file and surrounding documentation are not included."
+    },
+    {
+      "requirement": "D5. At-rest encryption is defence in depth, not the boundary.",
+      "status": "met",
+      "evidence": "`paths.ts` explicitly states that directory ownership and mode are the control and that the adjacent machine-derived encryption key is only defence in depth."
+    },
+    {
+      "requirement": "E1. A system unit, `User=wundervault`, `Group=wundervault`.",
+      "status": "partial",
+      "evidence": "The installer verifies `User=wundervault`, but the unit template is not shown, and F1 means the named account is not necessarily a system account."
+    },
+    {
+      "requirement": "E2-E4. The required hardening directives, only `/var/lib/wundervault` writable, and `RuntimeDirectory=wundervault`.",
+      "status": "partial",
+      "evidence": "The unit template is absent, so its complete directive set, omission of `MemoryDenyWriteExecute`, writable paths, and runtime-directory setting cannot be independently checked."
+    },
+    {
+      "requirement": "E5. The daemon must refuse to start as root.",
+      "status": "partial",
+      "evidence": "The daemon startup code containing the root refusal is outside the supplied extract; only the destinations exception is visible."
+    },
+    {
+      "requirement": "F1-F5. Migration carries no credentials, removes the old user unit, preserves socket tokens, conditionally deletes the old store, and is idempotent.",
+      "status": "partial",
+      "evidence": "Migration paths are defined in `paths.ts`, but the migration implementation is not included."
+    },
+    {
+      "requirement": "G1. One privileged step, doing only: create the system user, install the unit, create `/var/lib/wundervault`, enable the service.",
+      "status": "partial",
+      "evidence": "The script performs only local account, state-directory, unit, and service operations and does not download the binary, but it does not reliably establish that an existing `wundervault` identity is a separate system account."
+    },
+    {
+      "requirement": "G2. Not `curl | sudo sh`.",
+      "status": "met",
+      "evidence": "The supplied privileged script performs no download or network operation and is invoked from a local file."
+    },
+    {
+      "requirement": "G3. Either ship a repository or verify a detached signature before installing a downloaded package.",
+      "status": "partial",
+      "evidence": "This privileged script does not download or install a package, but the unprivileged package acquisition path is not included."
+    },
+    {
+      "requirement": "G4. The privileged step is printed in full before it runs, and is re-runnable.",
+      "status": "partial",
+      "evidence": "The script prints an action summary and now restarts an already-running service, but the calling flow that prints the complete command is not shown, and a valid system account allocated at uid 1000 or above would be rejected on a later run."
+    },
+    {
+      "requirement": "Acceptance check 12. `--destinations` refuses rather than showing an empty page to a user who cannot read the store, and names sudo as the way through.",
+      "status": "partial",
+      "evidence": "`collectShape()` reports permission failure and prints `sudo wundervault-agent --destinations`, but its second read can still be converted by `load()` into an empty shape after the explicit validation read succeeds."
+    },
+    {
+      "requirement": "Acceptance check 14. Nothing in the codebase resolves daemon state through `os.homedir()` any more.",
+      "status": "met",
+      "evidence": "Daemon paths derive from `systemRoot()`; `os.homedir()` remains only in `userRoot()` for agent-owned tokens, migration files, and viewer output."
+    },
+    {
+      "requirement": "Acceptance check 15. The installer refuses an `ExecStart` under a home directory, symlinks resolved.",
+      "status": "met",
+      "evidence": "The installer resolves the executable using `readlink -f` and rejects both the supplied and resolved paths beneath `/home`, `/root`, or `/run/user`."
+    },
+    {
+      "requirement": "Acceptance check 20. `--destinations` is dispatched by the binary every message names, and does not refuse to run as root.",
+      "status": "met",
+      "evidence": "`src/agent.ts` dispatches `--destinations` before the normal root refusal and directly imports the viewer implementation."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "packaging/install-daemon.sh",
+      "line": 133,
+      "claim": "The installer equates uid below 1000 with a system account and therefore can run the daemon under the same human uid as its agents, eliminating the required uid boundary.",
+      "failure_scenario": "On a system where a regular login user named `wundervault` has uid 500 and shell `/bin/bash`, the numeric check passes, the shell check only warns, and the installer chowns `/var/lib/wundervault` and starts the daemon as uid 500; agents running as that user can then read the profile store and the daemon's `/proc/<pid>/mem`.",
+      "suggested_direction": "Do not use a fixed uid threshold as proof that an existing account is safe; refuse existing identities unless they are verifiably dedicated, non-login, and different from the invoking user's identity, while retaining a reliable marker or validation path for reinstallation."
+    },
+    {
+      "id": "F2",
+      "severity": "major",
+      "file": "src/log-viewer.ts",
+      "line": 415,
+      "claim": "`collectShape()` validates one read of the audit store but returns a second read through `load()`, allowing a later read or parse failure to become a successful empty report.",
+      "failure_scenario": "If `/var/lib/wundervault/network.json` contains recorded destinations during the first `readFileSync`, but is truncated or becomes temporarily unreadable before `load(storePath)` reopens it, the explicit validation succeeds and `load()` converts the second failure into `{seen: []}`; the command then reports zero destinations instead of reporting damaged evidence.",
+      "suggested_direction": "Parse and validate one captured snapshot and return that same parsed value, so no permissive second loader can replace a validated audit record with an empty shape."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "src/log-viewer.ts",
+      "line": 283,
+      "claim": "Failure to resolve a present `SUDO_USER` is silently treated like a non-sudo invocation, so the process remains root and writes the viewer through the fallback root-side path.",
+      "failure_scenario": "On a minimal host without `getent`, or during an NSS/SSSD lookup failure, `sudo wundervault-agent --destinations` makes `resolveSudoUser()` return null; the branch skips `dropToSudoUser()` and writes a 0600 page under root's resolved `userRoot()`, leaving the invoking owner unable to open the generated viewer and potentially restoring root path-following if a root environment override redirects `userRoot()`.",
+      "suggested_direction": "Distinguish absence of sudo from failure to resolve a supplied sudo identity, and fail closed with a clear error rather than performing viewer filesystem writes while still root."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "src/log-viewer.ts",
+      "line": 269,
+      "claim": "The viewer writes sensitive content before applying mode 0600, and an existing output file retains its old permissions throughout the write.",
+      "failure_scenario": "If `~/.wundervault/destinations.html` already exists with mode 0644, `writeFileSync(..., {mode: 0o600})` truncates and rewrites that existing inode without changing its mode; another local uid can read the destination record during the write, and a process kill before the later `chmodSync` leaves the complete record world-readable.",
+      "suggested_direction": "Publish the viewer through a newly created private file with restrictive permissions and an atomic replacement strategy, rather than rewriting an existing inode and correcting its mode afterward."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The privilege drop discards all of the invoking user's supplementary groups instead of establishing that user's normal group set.",
+      "why_it_matters": "A legitimate user whose home is traversable only through a supplementary group, such as `/home/alice` owned by `root:staff` at 0770 with `alice` in `staff`, will pass sudo authentication but receive EACCES when the dropped process tries to create or write `.wundervault`; the current tests cover uid change, not real group-dependent homes."
+    },
+    {
+      "id": "B2",
+      "concern": "An existing low-uid, non-login `wundervault` account may belong to an unrelated service rather than being dedicated to this daemon.",
+      "why_it_matters": "The installer accepts that account without proving ownership, so every process already running under the shared service uid can read the profile store and daemon memory even though the human agent uid remains separate."
+    },
+    {
+      "id": "B3",
+      "concern": "`getent passwd` is a synchronous, unbounded NSS operation on the destination-viewer path.",
+      "why_it_matters": "With an unavailable LDAP or SSSD backend, the sudo command can hang before showing the audit record, and there is no timeout or diagnostic distinguishing an NSS stall from a stuck credential-reading operation."
+    },
+    {
+      "id": "B4",
+      "concern": "Destination-store validation checks only `version` and that `seen` is an array, not the field types consumed by the generated JavaScript.",
+      "why_it_matters": "A record with a numeric or null `origin`, `entryId`, or purpose can pass the preflight and produce a viewer that reports successful generation but throws on calls such as `toLowerCase()` when the owner searches it, precisely when damaged audit data needs a reliable diagnostic."
+    }
+  ],
+  "_meta": {
+    "round": 16,
+    "at": "2026-09-15T21:26:40+00:00",
+    "package_bytes": 89147,
+    "schema_problems": []
+  }
+}

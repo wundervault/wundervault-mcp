@@ -129,27 +129,48 @@ if id -u "$ACCOUNT" >/dev/null 2>&1; then
   # gone and every message says it is there, which is worse than not installing at all.
   EXISTING_UID=$(id -u "$ACCOUNT")
   EXISTING_SHELL=$(getent passwd "$ACCOUNT" | cut -d: -f7)
-  if [ "$EXISTING_UID" -ge 1000 ] 2>/dev/null; then
-    cat >&2 <<EOM
-ERROR: an account named '${ACCOUNT}' already exists with uid ${EXISTING_UID}.
+  INVOKER_UID=""
+  [ -n "${SUDO_UID:-}" ] && INVOKER_UID="$SUDO_UID"
 
-That is a regular login account, not a system account. This daemon exists to hold
-credentials somewhere the accounts running your agents cannot reach — so it must not run
-as an account a person logs into. Installing anyway would report success while leaving
-every credential readable by whoever uses that account.
-
-If that account is yours, the daemon needs a different name: create a system account
-and pass it through, or rename the existing one.
-EOM
+  # The decisive test is NOT the uid number.
+  #
+  # An earlier version refused only uid >= 1000, on the assumption that below that means a
+  # system account. That is a convention, not a rule — plenty of hosts have human logins at
+  # uid 500 — and getting it wrong means running the daemon as the very account its agents
+  # use, with the installer printing that the directory is readable only by wundervault.
+  #
+  # So: refuse if this is the account that invoked us, and refuse if it can log in. A
+  # daemon account has no shell; if it has one, a person can become it, and everything this
+  # phase builds rests on nobody being able to.
+  if [ -n "$INVOKER_UID" ] && [ "$EXISTING_UID" = "$INVOKER_UID" ]; then
+    echo "ERROR: '${ACCOUNT}' is the account you are running as (uid ${EXISTING_UID})." >&2
+    echo "       The daemon must not run as the account its agents run as — that is the" >&2
+    echo "       entire boundary. Use a different account name for the daemon." >&2
     exit 1
   fi
+
   case "$EXISTING_SHELL" in
-    */nologin|*/false|"") ;;
+    */nologin|*/false) ;;
     *)
-      echo "WARNING: ${ACCOUNT} has login shell ${EXISTING_SHELL}." >&2
-      echo "         A daemon account should not be able to log in. Consider:" >&2
-      echo "         sudo usermod -s /usr/sbin/nologin ${ACCOUNT}" >&2 ;;
+      cat >&2 <<EOM
+ERROR: an account named '${ACCOUNT}' already exists with uid ${EXISTING_UID} and login
+shell ${EXISTING_SHELL:-<none>}.
+
+A daemon account must not be able to log in. This one can, so a person can become it and
+read every credential the daemon holds — while the install reports that the directory is
+readable only by ${ACCOUNT}. That is worse than not installing at all.
+
+If this account is meant to be the daemon's:
+  sudo usermod -s /usr/sbin/nologin ${ACCOUNT}
+If it belongs to a person or another service, the daemon needs a different name.
+EOM
+      exit 1 ;;
   esac
+
+  if [ "$EXISTING_UID" -ge 1000 ] 2>/dev/null; then
+    echo "NOTE: ${ACCOUNT} has uid ${EXISTING_UID}, which is usually a login range." >&2
+    echo "      It has no login shell, so continuing." >&2
+  fi
   echo "account ${ACCOUNT}: already exists (uid ${EXISTING_UID}, system account)"
 else
   # --system: no ageing, a low uid, and no login. --shell nologin so a credential leak

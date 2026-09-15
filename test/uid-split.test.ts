@@ -522,6 +522,21 @@ describe('a root process must not follow paths an agent controls', () => {
     expect(src).not.toMatch(/chownSync/);
   });
 
+  it('refuses to continue as root when SUDO_USER cannot be resolved', () => {
+    // Returning null there meant staying root and writing through root's own path
+    // resolution — the caller cannot open the result, and the path-following is back.
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'log-viewer.ts'), 'utf8');
+    expect(src).toMatch(/Refusing to continue as root/);
+  });
+
+  it('writes the viewer through an exclusive temp file and renames', () => {
+    // writeFileSync's mode applies only on create, so an existing 0644 page was refilled
+    // with the whole destination record while still world-readable.
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'log-viewer.ts'), 'utf8');
+    expect(src).toMatch(/O_EXCL/);
+    expect(src).toMatch(/renameSync/);
+  });
+
   it('resolves the sudo user through NSS, not by parsing /etc/passwd', () => {
     // An LDAP or SSSD account is a valid sudo user with no line in /etc/passwd.
     const src = fs.readFileSync(path.join(ROOT, 'src', 'log-viewer.ts'), 'utf8');
@@ -547,11 +562,17 @@ describe('a root process must not follow paths an agent controls', () => {
 describe('the installer will not hand the boundary to a human account', () => {
   const script = fs.readFileSync(path.join(ROOT, 'packaging', 'install-daemon.sh'), 'utf8');
 
-  it('refuses an existing wundervault account with a login uid', () => {
-    // Skipping creation for a human account named wundervault chowns the credential store
-    // to the agent's own uid and then reports that it is readable only by wundervault.
-    expect(script).toMatch(/EXISTING_UID.*-ge 1000|-ge 1000.*EXISTING_UID/s);
-    expect(script).toMatch(/regular login account, not a system account/);
+  it('refuses an existing account that can log in, whatever its uid', () => {
+    // The uid number is a convention, not a rule — human logins at uid 500 exist. What
+    // actually matters is whether a person can become that account, and whether it is the
+    // account running the installer.
+    expect(script).toMatch(/A daemon account must not be able to log in/);
+    expect(script).toMatch(/\*\/nologin\|\*\/false/);
+  });
+
+  it('refuses to run the daemon as the account invoking the installer', () => {
+    expect(script).toMatch(/SUDO_UID/);
+    expect(script).toMatch(/must not run as the account its agents run as/);
   });
 
   it('restarts a running daemon rather than leaving the old config live', () => {

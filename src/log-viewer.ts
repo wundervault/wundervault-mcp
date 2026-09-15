@@ -29,7 +29,8 @@
  * What it IS: one self-contained HTML file with the data already inside it, written
  * 0600 next to the store, which you open with your own browser and delete when done.
  */
-import { writeFileSync, readFileSync, mkdirSync, chmodSync, accessSync, existsSync, constants } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, chmodSync, accessSync, existsSync,
+         openSync, closeSync, renameSync, unlinkSync, constants } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import * as net from 'node:net';
 import * as path from 'node:path';
@@ -267,8 +268,25 @@ export function writeViewer(storePath = defaultStorePath(), outPath?: string,
   // worse, succeed for the one user who still owns both.
   const target = outPath ?? viewerPath();
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  writeFileSync(target, renderViewer(shape, storePath), { mode: 0o600 });
-  try { chmodSync(target, 0o600); } catch { /* best effort */ }
+
+  // Write a NEW file, then rename over the target.
+  //
+  // Writing straight to `target` looked safe because of the `mode` option, but that option
+  // applies only when the call CREATES the file: an existing destinations.html at 0644 is
+  // truncated and refilled with the whole destination record while still world-readable,
+  // and a kill before the chmod leaves it that way permanently. The temp file is created
+  // exclusively, so it cannot be an attacker's pre-placed symlink either, and rename is
+  // atomic — a reader sees the old page or the new one, never a half-written record.
+  const tmp = `${target}.tmp-${process.pid}`;
+  try { unlinkSync(tmp); } catch { /* nothing to clear */ }
+  const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  try {
+    writeFileSync(fd, renderViewer(shape, storePath));
+  } finally {
+    closeSync(fd);
+  }
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, target);
 
   return target;
 }
@@ -284,14 +302,32 @@ export function resolveSudoUser(): { uid: number; gid: number; home: string } | 
   const uid = (process as unknown as { getuid?: () => number }).getuid?.();
   const sudoUser = process.env.SUDO_USER;
   if (uid !== 0 || !sudoUser || sudoUser === 'root') return null;
+  // A SUDO_USER that is PRESENT but unresolvable is an error, not a non-sudo run.
+  //
+  // Returning null there meant carrying on as root and writing the page through root's own
+  // path resolution — the caller cannot open the result, and the root path-following this
+  // whole change removed would be back. If we were invoked under sudo we either become
+  // that user or we stop.
+  let out: string;
   try {
-    const out = execFileSync('getent', ['passwd', sudoUser], { encoding: 'utf8' }).trim();
-    const f = out.split(':');
-    if (f.length < 6) return null;
-    const u = Number(f[2]); const g = Number(f[3]);
-    if (!Number.isInteger(u) || !Number.isInteger(g) || u === 0) return null;
-    return { uid: u, gid: g, home: f[5] };
-  } catch { return null; }
+    out = execFileSync('getent', ['passwd', sudoUser], { encoding: 'utf8' }).trim();
+  } catch (e) {
+    throw new Error(
+      `Ran under sudo as '${sudoUser}', but that account could not be resolved ` +
+      `(${(e as Error).message}).\n` +
+      `Refusing to continue as root: this command writes into your home directory and ` +
+      `must not do that with root's authority.`,
+    );
+  }
+  const f = out.split(':');
+  const u = Number(f[2]); const g = Number(f[3]);
+  if (f.length < 6 || !Number.isInteger(u) || !Number.isInteger(g) || u === 0 || !f[5]) {
+    throw new Error(
+      `Ran under sudo as '${sudoUser}', but its passwd entry is unusable. ` +
+      `Refusing to continue as root.`,
+    );
+  }
+  return { uid: u, gid: g, home: f[5] };
 }
 
 /**
@@ -398,9 +434,15 @@ export async function collectShape(
   } catch (e) {
     throw new Error(`Cannot read ${storePath}: ${(e as Error).message}`);
   }
+  // Validated and RETURNED from the same read. An earlier version validated `raw` and then
+  // called load(), which re-opens and re-parses — so a store that was fine on the first
+  // read and truncated by the second passed validation and came back as an empty log,
+  // which is the exact lie this check exists to prevent.
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.seen)) {
+    parsed = JSON.parse(raw);
+    const p = parsed as { version?: unknown; seen?: unknown };
+    if (!p || p.version !== 1 || !Array.isArray(p.seen)) {
       throw new Error('not a version-1 destination store');
     }
   } catch (e) {
@@ -410,6 +452,6 @@ export async function collectShape(
       `secrets, and "none" is a very different answer from "unreadable".`,
     );
   }
-  return { shape: load(storePath), source: 'file' };
+  return { shape: parsed as NetworkShape, source: 'file' };
 }
 

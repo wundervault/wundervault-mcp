@@ -690,7 +690,16 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
     // Read as root — that is the only reason this needs privilege — then give it up before
     // writing anything into a home directory. Root must not follow paths an agent can
     // rearrange under it; doing so was a working escalation to a root cron job.
-    const sudoUser = resolveSudoUser();
+    // resolveSudoUser throws when SUDO_USER is set but cannot be resolved — refusing to
+    // carry on as root is correct, but it has to read as a message rather than a stack
+    // trace, and it happens before the promise chain that handles everything else.
+    let sudoUser: { uid: number; gid: number; home: string } | null = null;
+    try {
+      sudoUser = resolveSudoUser();
+    } catch (e) {
+      console.error((e as Error).message);
+      process.exit(1);
+    }
     collectShape(store)
       .then(({ shape }) => {
         let target: string | undefined;
