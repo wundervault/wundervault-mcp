@@ -110,7 +110,7 @@ describe('the notice, and where it goes', () => {
 
   it('says plainly that the destination did not go to the server', () => {
     // The whole point of the local store; if the notice does not say so, nobody knows.
-    expect(n().toolNote).toMatch(/not sent to the server/i);
+    expect(n().toolNote).toMatch(/not sent to Wundervault/i);
   });
 
   it('describes itself as a notice, not a block', () => {
@@ -176,14 +176,14 @@ describe('round 1 fixes', () => {
     // Tier 2 approval is exactly where the destination WAS disclosed, so the Tier 1
     // wording would be false — and false reassurance is worse than none.
     const t2 = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/x', '2');
-    expect(t2.toolNote).not.toMatch(/not sent to the server/i);
+    expect(t2.toolNote).not.toMatch(/not sent to Wundervault/i);
     expect(t2.toolNote).toMatch(/approved this operation/i);
     expect(t2.stderrLine).toContain('tier=2');
   });
 
   it('still tells a Tier 1 caller the destination stayed local', () => {
     const t1 = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/x', '1');
-    expect(t1.toolNote).toMatch(/not sent to the server/i);
+    expect(t1.toolNote).toMatch(/not sent to Wundervault/i);
     expect(t1.toolNote).toMatch(/notice rather than a block/i);
   });
 
