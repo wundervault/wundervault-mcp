@@ -10,7 +10,6 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   load, save, recordDestination, destinationsFor,
-  approvePrivateOrigin, approvedPrivateOrigins, revokePrivateOrigin,
   newDestinationNotice, defaultStorePath,
 } from '../src/network-store.js';
 
@@ -82,52 +81,20 @@ describe('durability', () => {
   });
 });
 
-describe('locally approved private origins', () => {
-  it('accepts an exact scheme://host:port', () => {
-    const r = approvePrivateOrigin('e1', 'https://10.0.0.5:9000', store);
-    expect(r.ok).toBe(true);
-    expect(approvedPrivateOrigins('e1', store)).toEqual(['https://10.0.0.5:9000']);
+describe('approvals are NOT stored here', () => {
+  it('exposes no way to record an approval locally', async () => {
+    // A control in an agent-writable file is not a control: the agent could approve its
+    // own internal destination and walk through the SSRF filter it is constrained by.
+    const mod = await import('../src/network-store.js');
+    expect('approvePrivateOrigin' in mod).toBe(false);
+    expect('approvedPrivateOrigins' in mod).toBe(false);
+    expect('revokePrivateOrigin' in mod).toBe(false);
   });
 
-  it('refuses a range or wildcard', () => {
-    // A range is not something an owner can realistically evaluate.
-    expect(approvePrivateOrigin('e1', 'https://10.0.0.0/24', store).ok).toBe(false);
-    expect(approvePrivateOrigin('e1', 'https://*.local:9000', store).ok).toBe(false);
-  });
-
-  it('refuses an origin with no port', () => {
-    expect(approvePrivateOrigin('e1', 'https://10.0.0.5', store).ok).toBe(false);
-  });
-
-  it('refuses cloud metadata endpoints outright', () => {
-    for (const h of ['169.254.169.254', 'metadata.google.internal', '100.100.100.200']) {
-      const r = approvePrivateOrigin('e1', `https://${h}:80`, store);
-      expect(r.ok).toBe(false);
-      expect(r.reason).toMatch(/metadata/i);
-    }
-  });
-
-  it('does not leak approvals between entries', () => {
-    approvePrivateOrigin('e1', 'https://10.0.0.5:9000', store);
-    expect(approvedPrivateOrigins('e2', store)).toEqual([]);
-  });
-
-  it('caps how many an entry may approve', () => {
-    for (let i = 1; i <= 10; i += 1) approvePrivateOrigin('e1', `https://10.0.0.${i}:9000`, store);
-    expect(approvePrivateOrigin('e1', 'https://10.0.0.99:9000', store).ok).toBe(false);
-  });
-
-  it('is idempotent', () => {
-    approvePrivateOrigin('e1', 'https://10.0.0.5:9000', store);
-    approvePrivateOrigin('e1', 'https://10.0.0.5:9000', store);
-    expect(approvedPrivateOrigins('e1', store)).toHaveLength(1);
-  });
-
-  it('revokes one without disturbing the others', () => {
-    approvePrivateOrigin('e1', 'https://10.0.0.5:9000', store);
-    approvePrivateOrigin('e1', 'https://10.0.0.6:9000', store);
-    revokePrivateOrigin('e1', 'https://10.0.0.5:9000', store);
-    expect(approvedPrivateOrigins('e1', store)).toEqual(['https://10.0.0.6:9000']);
+  it('keeps no approval field in the persisted shape', () => {
+    recordDestination('e1', 'https://h.example:443', store);
+    const raw = JSON.parse(readFileSync(store, 'utf8'));
+    expect(Object.keys(raw).sort()).toEqual(['seen', 'version']);
   });
 });
 
