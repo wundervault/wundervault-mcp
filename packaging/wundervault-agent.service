@@ -9,7 +9,7 @@
 # as that rather than as the guarantee.
 
 [Unit]
-Description=Wundervault agent credential daemon
+Description=Wundervault secret broker (holds agent credentials)
 Documentation=https://wundervault.com/install
 After=network.target
 

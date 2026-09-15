@@ -74,8 +74,8 @@ interface ProfileStore {
 function announceBoundary(): void {
   if (splitAvailable()) return;
   console.error(
-    `[wundervault-agent] Running on ${process.platform}, where the uid split is not yet\n` +
-    `[wundervault-agent] available. State is in your own directory and this daemon runs as\n` +
+    `[wundervault-agent] Running on ${process.platform}, where the secret broker cannot yet\n` +
+    `[wundervault-agent] have its own account. State is in your own directory and it runs as\n` +
     `[wundervault-agent] YOU — so its key material and memory are readable by anything you\n` +
     `[wundervault-agent] run, including your agents. That is the pre-split threat model.\n` +
     `[wundervault-agent] The boundary is Linux-only for now.`,
@@ -87,7 +87,7 @@ function refuseRoot(): void {
   if (uid === 0) {
     console.error(
       `[wundervault-agent] Refusing to run as root.\n` +
-      `  This daemon holds credentials and must run as its own unprivileged account.\n` +
+      `  The secret broker holds credentials and must run as its own unprivileged account.\n` +
       `  Expected User=${SYSTEM_ACCOUNT} in the unit file.\n` +
       `  If you installed by hand, re-run packaging/install-daemon.sh.`,
     );
@@ -674,21 +674,22 @@ if (invokedDirectly && !process.env.WUNDERVAULT_AGENT_NO_AUTOSTART) {
 
   if (argv.includes('--help') || argv.includes('-h')) {
     console.log(`
-Wundervault agent daemon ${VERSION}
+Wundervault secret broker ${VERSION}
 
 Usage: wundervault-agent [--enrol] [--migrate [--finish]] [--destinations]
 
-With no arguments it runs as the daemon. It is normally started by systemd as the
+With no arguments it runs as the secret broker: the process that holds your agents'
+credentials so the agents cannot read them. It is normally started by systemd as the
 '${SYSTEM_ACCOUNT}' account, not by hand.
 
   --enrol       Add an agent using a setup link from the dashboard. Prompts for the link
                 rather than taking it as an argument: a command line is readable by every
-                process on this machine. The daemon redeems the link itself, so the
+                process on this machine. The broker redeems the link itself, so the
                 credentials never pass through this process.
-  --migrate     Show which pre-split agents still need moving across, and how.
-  --finish      With --migrate: delete the pre-split store, once every agent is across.
+  --migrate     Show which agents still need moving to the broker, and how.
+  --finish      With --migrate: delete the old store, once every agent is across.
   --destinations  Show where your agents have sent secrets. Needs sudo: the record
-                belongs to the daemon so your agents cannot read it. The page is opened
+                belongs to the broker so your agents cannot read it. The page is opened
                 and then DELETED, because it is a copy your agents could otherwise read.
   --keep        With --destinations: leave the page on disk instead.
 
@@ -797,7 +798,7 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
     const { enrol } = await import('./migrate.js');
     enrol(url)
       .then((r) => {
-        console.log(`Enrolled ${r.agent_name}. Its credentials are in ${systemRoot()}, ` +
+        console.log(`Enrolled ${r.agent_name}. Its credentials are held by the broker in ${systemRoot()}, ` +
                     `which your agents cannot read.`);
         if (!r.linkBurned) {
           console.log('');

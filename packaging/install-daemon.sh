@@ -1,5 +1,8 @@
 #!/bin/sh
-# The one privileged step. Run it once per machine.
+# The one privileged step: install the secret broker. Run it once per machine.
+#
+# The broker is the process that holds your agents' credentials. It gets its own account
+# so that the agents — which run as you — cannot read what it holds.
 #
 # It creates a system account, a directory it owns, and a systemd unit. It does not
 # download anything, does not touch the network, and does not install the daemon binary —
@@ -44,7 +47,7 @@ command -v systemctl >/dev/null 2>&1 || {
 }
 
 if [ "$MODE" = uninstall ]; then
-  echo "Stopping and removing ${UNIT_NAME}…"
+  echo "Stopping and removing the secret broker (${UNIT_NAME})…"
   systemctl disable --now "$UNIT_NAME" 2>/dev/null || true
   rm -f "$UNIT_PATH"
   systemctl daemon-reload
@@ -119,10 +122,10 @@ UNIT_SRC="${HERE}/${UNIT_NAME}"
 [ -f "$UNIT_SRC" ] || { echo "Missing unit template: $UNIT_SRC" >&2; exit 1; }
 
 echo "This will:"
-echo "  1. create the system account '${ACCOUNT}' (no login shell, no home)"
+echo "  1. create the system account '${ACCOUNT}' for the secret broker (no login, no home)"
 echo "  2. create ${STATE_DIR}, mode 0700, owned by ${ACCOUNT}"
-echo "  3. install ${UNIT_PATH} running ${EXEC}"
-echo "  4. enable and start the service"
+echo "  3. install ${UNIT_PATH}, which runs the broker: ${EXEC}"
+echo "  4. enable and start the broker"
 echo
 
 # ── 1. the account ───────────────────────────────────────────────────────────
@@ -151,7 +154,7 @@ if id -u "$ACCOUNT" >/dev/null 2>&1; then
   # phase builds rests on nobody being able to.
   if [ -n "$INVOKER_UID" ] && [ "$EXISTING_UID" = "$INVOKER_UID" ]; then
     echo "ERROR: '${ACCOUNT}' is the account you are running as (uid ${EXISTING_UID})." >&2
-    echo "       The daemon must not run as the account its agents run as — that is the" >&2
+    echo "       The broker must not run as the account its agents run as — that is the" >&2
     echo "       entire boundary. Use a different account name for the daemon." >&2
     exit 1
   fi
@@ -163,9 +166,9 @@ if id -u "$ACCOUNT" >/dev/null 2>&1; then
 ERROR: an account named '${ACCOUNT}' already exists with uid ${EXISTING_UID} and login
 shell ${EXISTING_SHELL:-<none>}.
 
-A daemon account must not be able to log in. This one can, so a person can become it and
-read every credential the daemon holds — while the install reports that the directory is
-readable only by ${ACCOUNT}. That is worse than not installing at all.
+The broker's account must not be able to log in. This one can, so a person can become it
+and read every credential the broker holds — while the install reports that the directory
+is readable only by ${ACCOUNT}. That is worse than not installing at all.
 
 If this account is meant to be the daemon's:
   sudo usermod -s /usr/sbin/nologin ${ACCOUNT}
@@ -230,13 +233,14 @@ systemctl restart "$UNIT_NAME"
 sleep 1
 if systemctl is-active --quiet "$UNIT_NAME"; then
   echo
-  echo "Running. ${STATE_DIR} is now readable only by ${ACCOUNT}."
+  echo "The secret broker is running. ${STATE_DIR} is readable only by ${ACCOUNT},"
+  echo "which means your agents cannot read the credentials it holds."
   echo
   echo "Next, as your normal user (no sudo):"
   echo "  wundervault-agent --migrate     # hand existing agents over to the daemon"
 else
   echo
-  echo "The service did not start. What it said:" >&2
+  echo "The secret broker did not start. What it said:" >&2
   systemctl status "$UNIT_NAME" --no-pager -l 2>&1 | tail -20 >&2
   exit 1
 fi

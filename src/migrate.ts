@@ -156,12 +156,12 @@ export async function status(): Promise<MigrationStatus> {
   const oldStorePath = legacy.profiles();
   const ping = await ask({ action: 'ping' }).catch((e) => {
     throw new Error(
-      `Could not reach the daemon at ${mgmtSocketPath()}: ${(e as Error).message}\n` +
+      `Could not reach the secret broker at ${mgmtSocketPath()}: ${(e as Error).message}\n` +
       `Install it first:  sudo sh packaging/install-daemon.sh\n` +
       `Then check:        systemctl status wundervault-agent`,
     );
   });
-  if (!ping?.ok) throw new Error('The daemon answered, but not with ok. Check its logs.');
+  if (!ping?.ok) throw new Error('The broker answered, but not with ok. Check its logs.');
 
   if (!fs.existsSync(oldStorePath)) {
     return { pending: [], across: [], alreadyDone: true, oldStorePath };
@@ -220,7 +220,7 @@ export async function enrol(setupUrl: string): Promise<EnrolResult & { linkBurne
 
   const reply = await ask({ action: 'enrol', setup_url: setupUrl, socket_token: socketToken });
   if (reply?.error) throw new Error(reply.error);
-  if (!reply?.ok || !reply.agent_name) throw new Error('The daemon did not confirm the enrolment.');
+  if (!reply?.ok || !reply.agent_name) throw new Error('The broker did not confirm the enrolment.');
 
   // Written only after the daemon has confirmed, and skipped entirely when the value did
   // not change. Writing first would leave a token file for an agent that does not exist,
@@ -301,7 +301,7 @@ function shred(file: string): void {
 
 export function describeStatus(st: MigrationStatus, dashboardUrl = 'https://wundervault.com/dashboard'): string {
   if (st.alreadyDone) {
-    return 'Nothing to migrate — there is no pre-split store in your home directory.';
+    return 'Nothing to migrate — there is no old store in your home directory.';
   }
   const lines: string[] = [];
   if (st.across.length) lines.push(`Already across: ${st.across.join(', ')}`);
@@ -313,7 +313,7 @@ export function describeStatus(st: MigrationStatus, dashboardUrl = 'https://wund
   }
   lines.push(`Still to do (${st.pending.length}): ${st.pending.join(', ')}`);
   lines.push('');
-  lines.push('These agents were set up before the daemon had its own account, so their');
+  lines.push('These agents were set up before the broker had its own account, so their');
   lines.push('credentials are in a file your agents can read. Repair moves each one across');
   lines.push('and KEEPS its vault access — same agent, same permissions, new credentials.');
   lines.push('');

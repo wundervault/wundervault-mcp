@@ -476,7 +476,7 @@ export async function collectShape(
     throw new Error(
       `Cannot read the destination log.\n` +
       `  store: ${storePath}\n` +
-      `It belongs to the daemon's own account, which is what stops your agents\n` +
+      `It belongs to the broker's own account, which is what stops your agents\n` +
       `reading where every other agent has sent its secrets.\n\n` +
       `  sudo wundervault-agent --destinations\n`,
     );
@@ -491,8 +491,8 @@ export async function collectShape(
       `  store: ${storePath}\n` +
       (uid === 0
         ? `You are root and still cannot read it. Check the file's owner and mode — it\n` +
-          `should belong to the wundervault account at 0700.\n`
-        : `It belongs to the daemon's own account, which is what stops your agents\n` +
+          `should belong to the broker's wundervault account at 0700.\n`
+        : `It belongs to the broker's own account, which is what stops your agents\n` +
           `reading where every other agent has sent its secrets.\n\n` +
           `  sudo wundervault-agent --destinations\n`) +
       `Refusing to show you an empty page, which is what this used to do.`,

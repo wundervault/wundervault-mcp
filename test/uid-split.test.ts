@@ -566,7 +566,7 @@ describe('the installer will not hand the boundary to a human account', () => {
     // The uid number is a convention, not a rule — human logins at uid 500 exist. What
     // actually matters is whether a person can become that account, and whether it is the
     // account running the installer.
-    expect(script).toMatch(/A daemon account must not be able to log in/);
+    expect(script).toMatch(/must not be able to log in/);
     expect(script).toMatch(/\*\/nologin\|\*\/false/);
   });
 
