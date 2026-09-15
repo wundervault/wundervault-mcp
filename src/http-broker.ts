@@ -139,6 +139,22 @@ export function isBlockedAddress(ip: string): boolean {
   return false;
 }
 
+/**
+ * The lookup shim handed to the HTTP agent, so it cannot resolve the name a second time
+ * between our check and the connection.
+ *
+ * Extracted and exported because getting its SHAPE wrong is invisible to unit tests and
+ * fatal in production: Node calls it with options.all on some paths and expects an
+ * ARRAY there, and the (err, address, family) form elsewhere. Answering only the second
+ * produced "Invalid IP address: undefined" and no brokered request could complete at all.
+ */
+export function pinnedLookup(address: string, family: number) {
+  return (_hostname: string, opts: { all?: boolean } | undefined, cb: (...a: unknown[]) => void) => {
+    if (opts && opts.all) return cb(null, [{ address, family }]);
+    return cb(null, address, family);
+  };
+}
+
 /** Resolve once and choose an address, refusing anything internal. */
 export function resolvePinned(host: string): Promise<{ address: string; family: number }> {
   return new Promise((resolve, reject) => {
@@ -240,7 +256,12 @@ export async function performOperation(
       headers: { ...headers, host },
       // Pin the address we vetted. Without this the agent performs its own lookup at
       // connect time, and the record could differ from the one that passed the check.
-      lookup: (_h, _o, cb) => (cb as (e: NodeJS.ErrnoException | null, a: string, f: number) => void)(null, pinned.address, pinned.family),
+      //
+      // Node calls this with options.all set on some paths and expects an ARRAY back
+      // there, and the (err, address, family) form everywhere else. Answering only the
+      // second shape produced "Invalid IP address: undefined" and NO brokered request
+      // could complete — a failure no unit test saw, because nothing dialled a real host.
+      lookup: pinnedLookup(pinned.address, pinned.family) as unknown as typeof dnsLookup,
       // Certificate and SNI still use the ORIGINAL hostname, so pinning the IP does not
       // weaken TLS verification in the slightest.
       servername: host,
@@ -305,7 +326,15 @@ export async function performOperation(
         // secret is scrubbed, because an upstream can echo it in an ALLOWED field and
         // the allowlist alone would pass it through.
         const filtered = filterResponse(def, parsed);
-        finish({ ok: status >= 200 && status < 300, status, body: scrubSecret(filtered, secret) });
+        const ok = status >= 200 && status < 300;
+        finish({
+          ok, status,
+          body: scrubSecret(filtered, secret),
+          // Without this a 4xx came back as a bare ok:false with no explanation at all.
+          // The upstream's own message is not repeated: it holds the credential and
+          // could put it in the body.
+          error: ok ? undefined : `Upstream returned HTTP ${status}. Any detail it sent is not repeated here, because an upstream holding the credential can place it in the response.`,
+        });
       });
       (stream as NodeJS.ReadableStream).on('error', (e: Error) => finish({ ok: false, status, error: `Response error: ${e.message}` }));
     });

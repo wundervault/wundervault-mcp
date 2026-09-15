@@ -10,7 +10,7 @@ import {
   canonicalJson, verifyOperationDefinition, validateShape, validateArguments,
   filterResponse, _clearDerivedKeyCache, type OperationDefinition,
 } from '../src/opdef.js';
-import { isBlockedAddress, resolvePinned, expandIPv6, scrubSecret } from '../src/http-broker.js';
+import { isBlockedAddress, resolvePinned, expandIPv6, scrubSecret, pinnedLookup } from '../src/http-broker.js';
 import { modeAllowsHttpBroker, modeAllowsLegacyExec, wrongModeMessage } from '../src/ssh-agent.js';
 
 const SECRET = Buffer.from('sk-ant-api03-EXAMPLE-SECRET-VALUE');
@@ -349,5 +349,27 @@ describe('round 2 regressions', () => {
 
   it('leaves an ordinary path alone after decoding', () => {
     expect(validateShape({ ...base, route: { method: 'POST', path: '/v1/mess%61ges' } }).ok).toBe(true);
+  });
+});
+
+describe('pinned lookup shim', () => {
+  it('answers the array shape when Node asks for all', async () => {
+    // Getting this wrong is invisible to every unit test and fatal in production: the
+    // broker returned "Invalid IP address: undefined" and no request could complete.
+    const fn = pinnedLookup('93.184.216.34', 4);
+    const got = await new Promise((r) => fn('example.com', { all: true }, (_e, v) => r(v)));
+    expect(got).toEqual([{ address: '93.184.216.34', family: 4 }]);
+  });
+
+  it('answers the (address, family) shape otherwise', async () => {
+    const fn = pinnedLookup('93.184.216.34', 4);
+    const got = await new Promise((r) => fn('example.com', {}, (_e, a, f) => r([a, f])));
+    expect(got).toEqual(['93.184.216.34', 4]);
+  });
+
+  it('handles a missing options object', async () => {
+    const fn = pinnedLookup('::1', 6);
+    const got = await new Promise((r) => fn('h', undefined, (_e, a, f) => r([a, f])));
+    expect(got).toEqual(['::1', 6]);
   });
 });
