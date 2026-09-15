@@ -1,0 +1,215 @@
+{
+  "verdict": "revise",
+  "summary": "The build implements the core uid split, server-authorised enrolment, origin checking, token-gated agent access, and root-only destination viewing. It is not ready to present: the documented migration command exposes the setup link in argv, enrolment can burn a link before the caller has persisted a usable socket token, and migration cleanup is not fully re-runnable.",
+  "spec_check": [
+    {
+      "requirement": "Everything in phases 1\u20133.5 is careful handling.",
+      "status": "partial",
+      "evidence": "Those earlier phases and most of src/server.ts are not included in this excerpt, so their continued behaviour cannot be verified."
+    },
+    {
+      "requirement": "B1. The only way a profile enters the daemon is `enrol`, carrying a setup link. There is no `register_profile`.",
+      "status": "met",
+      "evidence": "The management handler accepts `enrol`; `register_profile` falls through to `unknown action`, as exercised by test/enrol.test.ts."
+    },
+    {
+      "requirement": "B2. The daemon performs the exchange: `GET /api/setup/agent/<token>`, PBKDF2-SHA256 over the fragment passphrase, AES-256-GCM, then `POST .../burn`.",
+      "status": "met",
+      "evidence": "src/enrol.ts performs the GET, 100,000-round PBKDF2-SHA256 derivation, AES-256-GCM decryption, and returns a POST burn operation to the daemon."
+    },
+    {
+      "requirement": "B2a. A link is accepted only from an origin in the daemon's own configuration (`WUNDERVAULT_SETUP_ORIGIN`, default `https://wundervault.com`).",
+      "status": "partial",
+      "evidence": "parseSetupUrl compares URL.origin against the daemon environment allowlist and the tests cover rogue loopback and lookalike hosts; the system unit that must set this environment is not included."
+    },
+    {
+      "requirement": "B2b. The link is read from stdin, never argv.",
+      "status": "unmet",
+      "evidence": "The command implementation reads stdin, but describeStatus instructs users to put the whole link after `--enrol` on the command line, where it remains visible in argv while the program waits for stdin."
+    },
+    {
+      "requirement": "B2c. Redirects are refused (`redirect: 'error'`) and a non-JSON content-type is refused rather than parsed.",
+      "status": "partial",
+      "evidence": "Redirects are refused, but the content-type check accepts any value containing the substring `json`, including non-JSON media types such as `text/notjson`."
+    },
+    {
+      "requirement": "B3. Single-use and time-boxed are enforced server-side.",
+      "status": "partial",
+      "evidence": "The stated server TTL is 15 minutes, but a failed burn is swallowed and enrolment is reported successful while the link can remain reusable until expiry."
+    },
+    {
+      "requirement": "B4. The burn happens after the profile is stored.",
+      "status": "partial",
+      "evidence": "registerProfile runs before burn, but the caller's token file is written only after burn and after a reply, so a timeout or process failure can leave a stored but inaccessible profile and a spent link."
+    },
+    {
+      "requirement": "B4a. One enrolment per connection.",
+      "status": "met",
+      "evidence": "The management handler sets `consumed` before dispatching the first newline-delimited request, and the test verifies that later writes do not repeat the fetch."
+    },
+    {
+      "requirement": "B6. Removing an agent is authorised by that agent's own token.",
+      "status": "met",
+      "evidence": "remove_profile locates the named profile and calls tokenMatches before removeProfile."
+    },
+    {
+      "requirement": "C1. The sockets are world-connectable, including the management socket.",
+      "status": "met",
+      "evidence": "Both per-agent and management sockets are chmodded to 0666, and the management directory is chmodded to 0755."
+    },
+    {
+      "requirement": "C2. Compared in constant time. A wrong token closes the connection without saying whether the agent name exists.",
+      "status": "met",
+      "evidence": "tokenMatches uses crypto.timingSafeEqual after decoding and length validation, and failed per-agent authentication returns only `unauthorized`."
+    },
+    {
+      "requirement": "C3. A wrong token costs the failing caller an exponential delay, and a valid token is always served. A per-connection absolute deadline bounds resources.",
+      "status": "partial",
+      "evidence": "Per-agent sockets check valid tokens before penalties and have a ten-second absolute deadline, but the world-connectable management socket has only a resettable inactivity timeout and can be held indefinitely by periodic bytes."
+    },
+    {
+      "requirement": "D3. The destination store is not served over the management socket. `--destinations` reads the file as root.",
+      "status": "partial",
+      "evidence": "The management action refuses and directs the user to sudo, while the binary dispatches `--destinations` before refuseRoot; the omitted network-store and log-viewer files prevent verification of the actual store path and unreadable-store behaviour."
+    },
+    {
+      "requirement": "E1. A system unit, `User=wundervault`, `Group=wundervault`.",
+      "status": "partial",
+      "evidence": "The daemon rejects uid 0 and is written for system paths, but the system unit is not included and the package states that it has never been installed."
+    },
+    {
+      "requirement": "E2. `NoNewPrivileges=yes`, `CapabilityBoundingSet=` (empty), `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `RestrictSUIDSGID=yes`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `MemoryDenyWriteExecute=yes`, `LockPersonality=yes`, `ProtectProc=invisible`, `LimitCORE=0`.",
+      "status": "partial",
+      "evidence": "The unit file is not included, so none of these directives can be checked from the excerpt."
+    },
+    {
+      "requirement": "E3. `ReadWritePaths=/var/lib/wundervault` and nothing else writable.",
+      "status": "partial",
+      "evidence": "The unit file is not included."
+    },
+    {
+      "requirement": "E4. `RuntimeDirectory=wundervault`.",
+      "status": "partial",
+      "evidence": "The daemon uses runtimeDir(), but the systemd RuntimeDirectory directive is not shown."
+    },
+    {
+      "requirement": "E5. The daemon must refuse to start as root.",
+      "status": "met",
+      "evidence": "The no-argument daemon path calls refuseRoot(), which exits with status 1 when getuid() is 0; the root-only destinations path is deliberately dispatched first."
+    },
+    {
+      "requirement": "F1. Migration carries no credentials.",
+      "status": "met",
+      "evidence": "legacyAgentNames decrypts the old store but returns only agent names, while enrolment uses a fresh server-issued setup link."
+    },
+    {
+      "requirement": "F2. The old `systemctl --user` unit is disabled and removed.",
+      "status": "partial",
+      "evidence": "cleanup attempts to disable and stop the unit and removes its file only when it considers the unit gone; after the old store is deleted, later runs return early and cannot complete a previously failed removal."
+    },
+    {
+      "requirement": "F3. The user's `~/.wundervault/agents/<name>.token` stays, and migration must preserve its value.",
+      "status": "partial",
+      "evidence": "enrol tries to restore an existing token through set_socket_token, but it first replaces the daemon token and burns the link; interruption before restoration leaves the old file mismatched with the daemon."
+    },
+    {
+      "requirement": "F4. The old `agent-profiles.enc` is deleted once every agent is across and refused while any are pending.",
+      "status": "met",
+      "evidence": "cleanup returns without deletion when status reports pending names and shreds the legacy profile and salt only after the pending list is empty."
+    },
+    {
+      "requirement": "F5. Migration is idempotent and re-runnable.",
+      "status": "unmet",
+      "evidence": "Once the old store has been deleted, cleanup immediately reports alreadyDone and no longer retries stopping or removing an old user unit left behind by the previous run."
+    },
+    {
+      "requirement": "G1\u2013G4. One limited privileged install step, no `curl | sudo sh`, verified package installation, printed in full, and re-runnable.",
+      "status": "partial",
+      "evidence": "The installer and package-verification implementation are not included, and the package explicitly says the installer has never been run."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/migrate.ts",
+      "line": null,
+      "claim": "The migration instructions tell the user to place the setup link in argv even though the enrolment command is designed to read it only from stdin.",
+      "failure_scenario": "A user follows `wundervault-agent --enrol \"<the whole link, including the #part>\"`; the binary ignores that argument and waits for stdin while the real link remains visible in `/proc/<pid>/cmdline` to every same-uid agent.",
+      "suggested_direction": "Change every displayed enrolment instruction to use an interactive stdin paste or an explicitly stdin-based invocation, and ensure no help or migration text demonstrates an argv link."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "Enrolment commits the temporary socket token and burns the setup link before the client has persisted or restored the user's token, so an interrupted response leaves an inaccessible agent.",
+      "failure_scenario": "If the setup GET or burn response takes more than the management socket's ten-second inactivity timeout, the socket is destroyed, but the asynchronous handler can later register the profile and burn the link; the caller receives no agent name and never writes its token file, while an existing agent's old token has already been replaced.",
+      "suggested_direction": "Make token persistence/restoration and daemon commitment a recoverable protocol rather than committing and burning before the client acknowledges durable possession of the final token; also tie network work to explicit timeouts and connection cancellation."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "src/migrate.ts",
+      "line": null,
+      "claim": "Migration cannot finish removing the old user unit on a rerun after a first cleanup deleted the legacy store but failed to stop the unit.",
+      "failure_scenario": "On the first `--migrate --finish`, let `stopOldUserUnit()` return `still-running`; cleanup shreds the old store and leaves the unit file, then a later `--finish` sees no old store and returns `alreadyDone` without retrying either the stop or remove operation, so the old unit file remains contrary to F2.",
+      "suggested_direction": "Track and reconcile old-unit state independently of whether the legacy credential store still exists, so every finish run retries disabling, stopping, and removing the old unit."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "src/enrol.ts",
+      "line": null,
+      "claim": "A failed burn is suppressed, causing the daemon to report successful enrolment while the supposedly single-use setup link remains valid.",
+      "failure_scenario": "If profile storage succeeds but `POST /burn` returns 500, burn catches the error and resolves; the daemon sends `{ok:true}`, yet the same link can be submitted again during its remaining 15-minute lifetime to overwrite the profile with another socket token.",
+      "suggested_direction": "Preserve enough state to retry the burn and report its unresolved status to the caller instead of converting every burn failure into an indistinguishable success."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "The world-connectable management socket lacks an absolute connection deadline and can be held indefinitely by a slow sender.",
+      "failure_scenario": "A local process opens many management connections and sends one byte on each every nine seconds; each byte resets the ten-second inactivity timeout, no newline triggers `consumed`, and the 64 KiB limit takes days to reach, allowing file-descriptor exhaustion that prevents legitimate enrolment and agent connections.",
+      "suggested_direction": "Apply a non-resettable absolute lifetime to management connections in addition to the inactivity and input-size limits."
+    },
+    {
+      "id": "F6",
+      "severity": "minor",
+      "file": "src/enrol.ts",
+      "line": null,
+      "claim": "The response media-type test does not actually distinguish JSON from non-JSON content types.",
+      "failure_scenario": "A trusted endpoint or proxy responds with `Content-Type: text/notjson` and a syntactically valid JSON body; `ctype.includes('json')` accepts and parses it even though B2c requires non-JSON content types to be refused, while a valid differently-cased `Application/JSON` value is refused.",
+      "suggested_direction": "Parse and validate the media type itself, case-insensitively, against accepted JSON media types rather than searching for a substring."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The setup link is hidden from argv but still exists in the unprivileged enrolment client's memory under the same uid as the agents.",
+      "why_it_matters": "On Linux configurations that permit same-uid ptrace or `/proc/<pid>/mem` access, a malicious agent can read the enrolment process and steal the link before it is burned; this is the same memory-reading threat used to justify moving credentials into a separate daemon uid."
+    },
+    {
+      "id": "B2",
+      "concern": "Profile-store writes use write-and-rename without fsyncing the temporary file or containing directory.",
+      "why_it_matters": "A power loss after the server burns a setup link but before filesystem metadata is durable can lose the newly stored profile after the daemon already reported success, leaving no reusable link and potentially losing an updated existing profile."
+    },
+    {
+      "id": "B3",
+      "concern": "Concurrent enrolment attempts for the same setup link and agent are not serialized.",
+      "why_it_matters": "Two commands can both complete GET before either burn is observed, install different temporary tokens, and race while restoring or writing token files; one process can then write a token that no longer matches the daemon, with the setup link already burned."
+    },
+    {
+      "id": "B4",
+      "concern": "Outbound setup fetches have neither a timeout nor a response-size limit.",
+      "why_it_matters": "A stalled configured server can leave asynchronous enrolments resident indefinitely, and an oversized JSON response can consume daemon memory; because management is world-connectable, arbitrary local callers can initiate many such requests using syntactically valid links to the configured origin."
+    }
+  ],
+  "_meta": {
+    "round": 14,
+    "at": "2026-09-15T20:31:42+00:00",
+    "package_bytes": 99392,
+    "schema_problems": []
+  }
+}

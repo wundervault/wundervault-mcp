@@ -44,10 +44,26 @@ redeems the link itself.
       the fragment passphrase (salt `wv-agent-setup-v1`, 100,000 rounds), AES-256-GCM, then
       `POST .../burn`. The credentials never enter the calling process — an improvement on
       the pre-split world, where `onboard.py` held them in plaintext as the user.
+- B2a. **The ORIGIN is the security property.** A link is accepted only from an origin in
+      the daemon's own configuration (`WUNDERVAULT_SETUP_ORIGIN`, default
+      `https://wundervault.com`), set by the unit file and not by the caller. Accepting any
+      https origin — or http on loopback, for the convenience of a test — lets an agent run
+      its own server, serve a blob it encrypted with a passphrase it chose, and mint the one
+      credential this design assumes it cannot obtain. Every cryptographic check passes in
+      that attack; only the origin refuses it.
+- B2b. The link is read from **stdin, never argv**. `/proc/<pid>/cmdline` is world-readable,
+      so a link on the command line is visible to every agent for as long as the command
+      runs, and redemption is not instantaneous.
+- B2c. Redirects are refused (`redirect: 'error'`) — the token is a bearer credential in the
+      URL path — and a non-JSON content-type is refused rather than parsed.
 - B3. Single-use and time-boxed are enforced server-side and are not re-derived here. The
       link is valid for 15 minutes.
-- B4. The burn happens **after** a successful decrypt. Burning first would consume a
-      single-use link on a typo.
+- B4. The burn happens **after the profile is stored**, not merely after a successful
+      decrypt. Anything that can fail in between — a missing socket token, a disk error —
+      would otherwise spend a single-use link and produce no agent.
+- B4a. One enrolment per connection. The handler re-parses on every `data` event, so
+      without this a caller could send one valid line and then dribble bytes, re-running a
+      100,000-round PBKDF2 and a fetch on each one, on the event loop every agent shares.
 - B5. Migration is the same path. **Repair** in the dashboard rotates an agent's
       credentials and issues a fresh setup link while keeping its identity and every vault
       grant, so moving a pre-split agent across is: repair, then `--enrol`. No credential is
@@ -128,7 +144,10 @@ package whose whole pitch is that you can read it. So identity is the per-agent 
       soon as an agent is across.
 - F2. The old `systemctl --user` unit is disabled and removed, or two daemons fight over
       one agent name and the loser's socket wins by being last to bind.
-- F3. The user's `~/.wundervault/agents/<name>.token` STAYS. It is the identity now.
+- F3. The user's `~/.wundervault/agents/<name>.token` STAYS, and migration must PRESERVE
+      its value. Repair rotates the vault credentials; the socket token is a separate local
+      identity, and replacing it would lock out any agent process that read it at startup —
+      refused by the daemon that had just enrolled it, with 'unauthorized' as the only clue.
 - F4. The old `agent-profiles.enc` is deleted once every agent is across — refused while
       any are pending, since an un-repaired agent's only credentials are in it.
 - F5. Migration is idempotent and re-runnable.
@@ -169,6 +188,18 @@ package whose whole pitch is that you can read it. So identity is the per-agent 
 14. Nothing in the codebase resolves daemon state through `os.homedir()` any more.
 15. The installer refuses an `ExecStart` under a home directory, symlinks resolved.
 16. Removing an agent requires that agent's token.
+17. A setup link from any origin but the configured one is refused, including a server the
+    caller started on loopback.
+18. The setup link never appears in `argv`.
+19. A failure after redemption does not burn the link, and one connection cannot trigger
+    more than one enrolment.
+20. `--destinations` is dispatched by the binary every message names, and does not refuse
+    to run as root.
+21. Enrolment preserves an agent's existing socket token, so a running agent is not locked
+    out by the move.
+22. No instruction anywhere tells a user to pass the setup link as an argument.
+23. A failed burn is reported to the caller rather than reported as success.
+24. A management connection cannot be held open indefinitely by a slow sender.
 
 ## Out of scope
 

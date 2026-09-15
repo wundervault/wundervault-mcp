@@ -1,0 +1,274 @@
+{
+  "verdict": "revise",
+  "summary": "The build moves daemon state behind a separate UID, removes direct profile registration, and makes the daemon redeem setup links before storing credentials. The local socket authentication and destination-store separation largely follow the new design, but enrolment still admits attacker-controlled setup servers, exposes real links to same-UID agents, and does not make burning atomic with local enrolment. Migration also replaces the token the spec requires it to preserve, so this is not ready to present.",
+  "spec_check": [
+    {
+      "requirement": "Everything in phases 1\u20133.5.",
+      "status": "partial",
+      "evidence": "The package withholds most of src/server.ts and does not include the earlier-phase specifications or all affected files, so those requirements cannot be fully checked from this excerpt."
+    },
+    {
+      "requirement": "B1. The only way a profile enters the daemon is `enrol`, carrying a setup link. There is no `register_profile`. Not guarded \u2014 absent.",
+      "status": "unmet",
+      "evidence": "`register_profile` is absent, but parseSetupUrl accepts an arbitrary HTTPS origin and explicitly accepts HTTP loopback; any local process can implement the two endpoints and manufacture a link, encrypted blob, credentials, and agent name without a server-issued link."
+    },
+    {
+      "requirement": "B2. The daemon performs the exchange: `GET /api/setup/agent/<token>`, PBKDF2-SHA256 over the fragment passphrase (salt `wv-agent-setup-v1`, 100,000 rounds), AES-256-GCM, then `POST .../burn`.",
+      "status": "partial",
+      "evidence": "src/enrol.ts implements the stated endpoints, PBKDF2 parameters, AES-256-GCM format, and post-decrypt burn, but it performs the exchange against an origin supplied entirely by the untrusted local caller."
+    },
+    {
+      "requirement": "The credentials never enter the calling process.",
+      "status": "met",
+      "evidence": "src/migrate.ts sends only the setup URL and a socket token; src/agent.ts invokes redeemSetupLink and returns only agent_name and agent_id to the caller."
+    },
+    {
+      "requirement": "B3. Single-use and time-boxed are enforced server-side and are not re-derived here.",
+      "status": "unmet",
+      "evidence": "redeemSetupLink catches every burn failure and still returns credentials, after which the daemon reports successful enrolment; if burn is the server's single-use transition, the link remains reusable."
+    },
+    {
+      "requirement": "B4. The burn happens after a successful decrypt.",
+      "status": "met",
+      "evidence": "The POST to `/burn` occurs only after GCM authentication, JSON parsing, and key extraction have succeeded."
+    },
+    {
+      "requirement": "B5. Migration is the same path.",
+      "status": "partial",
+      "evidence": "Migration uses the ordinary enrol action and does not transmit legacy credentials, but it generates and installs a new socket token rather than preserving the existing token, and cleanup does not reliably remove the old unit."
+    },
+    {
+      "requirement": "B6. Removing an agent is authorised by that agent's own token.",
+      "status": "met",
+      "evidence": "The remove_profile handler finds the target and calls tokenMatches against that profile's socket_token; missing agents and wrong tokens both receive `unauthorized`."
+    },
+    {
+      "requirement": "C1. The sockets are world-connectable, because the daemon is now a different uid ... This includes the management socket.",
+      "status": "met",
+      "evidence": "src/agent.ts sets the management directory to 0755 and both management and per-agent socket files to 0666."
+    },
+    {
+      "requirement": "C2. Compared in constant time. A wrong token closes the connection without saying whether the agent name exists.",
+      "status": "met",
+      "evidence": "tokenMatches uses timingSafeEqual after rejecting missing and length-mismatched values, and failed per-agent authentication returns only `unauthorized`."
+    },
+    {
+      "requirement": "C3. A wrong token costs the failing caller an exponential delay, and a valid token is always served.",
+      "status": "met",
+      "evidence": "The token is checked before Knocks.penaltyMs is consulted, valid tokens clear the failure state, and only the failed connection receives the delayed response; per-agent connections also have a ten-second absolute deadline and no maxConnections."
+    },
+    {
+      "requirement": "C4. Honest limit: ... it proves possession of a file, and any process that can read that file presents the same identity.",
+      "status": "met",
+      "evidence": "The source comments explicitly describe the bearer-token limitation and do not claim equivalence to SO_PEERCRED."
+    },
+    {
+      "requirement": "C5. One uid is one principal.",
+      "status": "met",
+      "evidence": "The design and source comments explicitly acknowledge that processes sharing a UID cannot be distinguished."
+    },
+    {
+      "requirement": "D1. The agent's uid cannot read `/var/lib/wundervault`. Enforced by mode 0700 on a directory owned by another user.",
+      "status": "partial",
+      "evidence": "ensureSystemRoot forces and verifies mode 0700, but ownership and access by two real UIDs were not exercised, and the installer that establishes ownership is not included."
+    },
+    {
+      "requirement": "D2. The agent cannot read the daemon's memory. Enforced by uid separation.",
+      "status": "partial",
+      "evidence": "The code is designed for a wundervault system account and refuses root in the direct daemon path, but the system unit and a real two-UID execution were not shown."
+    },
+    {
+      "requirement": "D3. The destination store ... is therefore not served over the management socket ... `--destinations` reads the file as root.",
+      "status": "partial",
+      "evidence": "The management handler refuses `destinations`, networkStorePath resolves under the system root, and collectShape reads the file directly, but the shown executable has no `--destinations` dispatch and instead falls through to daemon startup."
+    },
+    {
+      "requirement": "D4. `LimitCORE=0` ... is defence against a crash dump landing on disk.",
+      "status": "partial",
+      "evidence": "The explanatory text correctly distinguishes core-file suppression from ptrace protection, but the unit containing LimitCORE=0 is not included."
+    },
+    {
+      "requirement": "D5. The at-rest encryption of the profile store is defence in depth, not the boundary.",
+      "status": "met",
+      "evidence": "src/agent.ts and src/paths.ts explicitly identify directory ownership and mode as the boundary and describe the machine-id/UID/salt-derived encryption key as defence in depth."
+    },
+    {
+      "requirement": "E1. A system unit, `User=wundervault`, `Group=wundervault`.",
+      "status": "partial",
+      "evidence": "The intended account is referenced in code, but the system unit is not part of the review package."
+    },
+    {
+      "requirement": "E2. `NoNewPrivileges=yes`, `CapabilityBoundingSet=` (empty), `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `RestrictSUIDSGID=yes`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `MemoryDenyWriteExecute=yes`, `LockPersonality=yes`, `ProtectProc=invisible`, `LimitCORE=0`.",
+      "status": "partial",
+      "evidence": "The unit file is not included, so none of the required directives can be verified from this excerpt."
+    },
+    {
+      "requirement": "E3. `ReadWritePaths=/var/lib/wundervault` and nothing else writable.",
+      "status": "partial",
+      "evidence": "The unit file is not included."
+    },
+    {
+      "requirement": "E4. `RuntimeDirectory=wundervault`.",
+      "status": "partial",
+      "evidence": "runtimeDir supports systemd's RUNTIME_DIRECTORY, but the unit directive itself is not included."
+    },
+    {
+      "requirement": "E5. The daemon must refuse to start as root.",
+      "status": "met",
+      "evidence": "The direct no-argument daemon path calls refuseRoot, which exits with status 1 when getuid returns 0."
+    },
+    {
+      "requirement": "F1. Migration carries no credentials. The pre-split store is read only for the list of agent names.",
+      "status": "met",
+      "evidence": "legacyAgentNames extracts only names for migration decisions, and no legacy profile or credential is sent over the management socket."
+    },
+    {
+      "requirement": "F2. The old `systemctl --user` unit is disabled and removed.",
+      "status": "unmet",
+      "evidence": "stopOldUserUnit runs `disable --now` but never removes the unit file; cleanup also deletes the old store even when the function reports the old unit as still running."
+    },
+    {
+      "requirement": "F3. The user's `~/.wundervault/agents/<name>.token` STAYS.",
+      "status": "unmet",
+      "evidence": "Every call to migrate.enrol generates a new random socket token and unconditionally overwrites the existing token file after daemon enrolment."
+    },
+    {
+      "requirement": "F4. The old `agent-profiles.enc` is deleted once every agent is across \u2014 refused while any are pending.",
+      "status": "partial",
+      "evidence": "cleanup refuses while status reports pending names, but it bases identity solely on agent names and silently catches deletion failures."
+    },
+    {
+      "requirement": "F5. Migration is idempotent and re-runnable.",
+      "status": "partial",
+      "evidence": "Status and cleanup tolerate a missing old store, but once the store is absent cleanup returns without retrying shutdown or removal of an old user unit that may still be running."
+    },
+    {
+      "requirement": "G1. One privileged step, doing only: create the system user, install the unit, create `/var/lib/wundervault`, enable the service.",
+      "status": "partial",
+      "evidence": "The installer is not included and was not run."
+    },
+    {
+      "requirement": "G2. Not `curl | sudo sh`.",
+      "status": "partial",
+      "evidence": "The installer and documented installation flow are not included."
+    },
+    {
+      "requirement": "G3. Either ship a repo, or verify a detached signature explicitly before installing.",
+      "status": "partial",
+      "evidence": "No package retrieval or verification implementation is included."
+    },
+    {
+      "requirement": "G4. The privileged step is printed in full before it runs, and is re-runnable.",
+      "status": "partial",
+      "evidence": "The installer is not included."
+    },
+    {
+      "requirement": "Nothing in the codebase resolves daemon state through `os.homedir()` any more.",
+      "status": "partial",
+      "evidence": "The shown daemon paths use systemRoot, while os.homedir is confined to userRoot; the withheld files prevent a codebase-wide conclusion."
+    },
+    {
+      "requirement": "The installer refuses an `ExecStart` under a home directory, symlinks resolved.",
+      "status": "partial",
+      "evidence": "The installer implementation is not included."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/enrol.ts",
+      "line": null,
+      "claim": "A local process can enrol or overwrite a profile without any server-issued setup link because the daemon trusts arbitrary setup-link origins, including an attacker-owned loopback HTTP server.",
+      "failure_scenario": "A malicious agent starts an HTTP listener on 127.0.0.1:18080, serves a chosen AES-GCM blob and agent_name from `/api/setup/agent/x`, then sends `http://127.0.0.1:18080/setup/agent/x#chosen-passphrase` with its own socket_token; the daemon accepts the fabricated protocol, stores the fabricated profile, and can replace a real profile having the same name.",
+      "suggested_direction": "Restrict redemption to the product's authenticated setup service and keep any loopback test exception out of production behavior; do not derive the trusted API origin from caller input."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "The CLI puts the complete setup link in process argv, so a malicious agent running under the owner's UID can obtain the external authorization that the design assumes it cannot obtain.",
+      "failure_scenario": "While the owner runs `wundervault-agent --enrol \"https://wundervault.com/setup/agent/T#P\"`, a same-UID agent reads `/proc/<cli-pid>/cmdline`, copies T and P during the network exchange, and submits the same link with its own socket_token; because GET and burn are separate, it can redeem concurrently and retrieve the real credentials from the resulting agent socket.",
+      "suggested_direction": "Do not carry the setup secret in argv, and redesign the handoff around the stated malicious same-UID threat rather than assuming data visible to an owner process is invisible to an agent process."
+    },
+    {
+      "id": "F3",
+      "severity": "blocker",
+      "file": "src/enrol.ts",
+      "line": null,
+      "claim": "Burning is not atomic with successful local enrolment: burn failures are ignored, while successful burns occur before socket-token validation and profile persistence.",
+      "failure_scenario": "If GET and decrypt succeed but POST `/burn` returns 500, the daemon still stores the profile and replies `ok`, leaving the same link usable by a second caller that can overwrite the profile with another socket_token; conversely, a missing socket_token or a disk-full error after a successful burn consumes the one-use link without creating a usable profile.",
+      "suggested_direction": "Treat server consumption and durable local registration as one recoverable protocol, and never report success while the server still considers the bearer link live or consume it before all locally fallible validation and commit work is ready."
+    },
+    {
+      "id": "F4",
+      "severity": "blocker",
+      "file": "src/migrate.ts",
+      "line": null,
+      "claim": "Migration replaces the existing per-agent token even though F3 requires that token to stay unchanged.",
+      "failure_scenario": "With `~/.wundervault/agents/Byte.token` containing T-old, running repair followed by `--enrol` generates T-new, stores T-new in the daemon, and overwrites the file; the required identity value has changed, and any running Byte process that cached T-old is immediately refused.",
+      "suggested_direction": "Reuse and preserve an existing valid token during repair and migration, creating a token only for an agent that does not already have one."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "The management data handler can execute the same enrol request repeatedly because it retains the first newline and does not mark the connection as consumed before awaiting redemption.",
+      "failure_scenario": "A caller writes one valid enrol line and then sends 1,000 one-byte chunks while the first GET is pending; every data event reparses the original line and starts another GET, after which up to 1,001 synchronous 100,000-round PBKDF2 operations and registration attempts run and stall credential service for legitimate agents.",
+      "suggested_direction": "Accept exactly one management request per connection, detach or disable the data handler before starting asynchronous work, and cancel outstanding redemption when the request connection is closed or reaches an absolute deadline."
+    },
+    {
+      "id": "F6",
+      "severity": "major",
+      "file": "src/migrate.ts",
+      "line": null,
+      "claim": "Migration neither removes the old user unit nor requires it to be stopped before deleting the old store, and a rerun cannot repair that state once the store is gone.",
+      "failure_scenario": "If `systemctl --user disable --now` cannot reach the user bus, stopOldUserUnit returns `still-running`, but cleanup still shreds the old store; the legacy unit file remains installed, and the next `--migrate --finish` sees no store and returns without retrying the stop or removing the unit.",
+      "suggested_direction": "Make verified shutdown and unit removal part of cleanup, do not finalize while the old daemon may still run, and have reruns retry unit cleanup even when the old credential store is already absent."
+    },
+    {
+      "id": "F7",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "If the packaged `wundervault-agent` command uses this shown shebang entrypoint, the advertised `--destinations` command has no dispatch path.",
+      "failure_scenario": "Running the documented `sudo wundervault-agent --destinations` reaches neither log-viewer nor collectShape; it falls through to the daemon branch, calls refuseRoot, and exits with a root-refusal error instead of displaying the destination record.",
+      "suggested_direction": "Wire the destinations option to the direct file-reading viewer before daemon startup and root refusal; if another unshown entrypoint already does this, make that packaging path explicit and test the installed command."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "Outbound setup fetches have no explicit deadline, response-size limit, or cancellation tied to the management connection.",
+      "why_it_matters": "A server that accepts a connection but withholds headers or streams an oversized JSON body can retain daemon memory and sockets after the local caller's ten-second socket timeout; repeated requests can exhaust the credential daemon even after origin validation is fixed."
+    },
+    {
+      "id": "B2",
+      "concern": "The destination viewer's output ownership and location under sudo are not shown.",
+      "why_it_matters": "userRoot uses os.homedir, which normally resolves to `/root` in a root process; unless the unshown command deliberately selects the invoking user's path and ownership, `sudo --destinations` may write the page under `/root/.wundervault` where the owner cannot open it."
+    },
+    {
+      "id": "B3",
+      "concern": "Profile replacement and removal mutate in-memory sockets before saveProfiles is known to have succeeded.",
+      "why_it_matters": "On disk-full, read-only-filesystem, or rename failure, replacing a profile can close the working agent socket and removal can take an agent offline even though the durable store still contains the old profile; behavior then differs until the daemon is restarted."
+    },
+    {
+      "id": "B4",
+      "concern": "The new system daemon's outbound HTTPS behavior under enterprise proxies, private certificate authorities, and restricted egress is not covered.",
+      "why_it_matters": "An otherwise correct install may be able to serve existing agents but fail every repair or enrolment because the system account lacks the user's proxy or CA configuration, leaving migration incomplete with little distinction from an invalid setup link."
+    },
+    {
+      "id": "B5",
+      "concern": "Migration equates identity by agent name alone.",
+      "why_it_matters": "If the server permits duplicate display names or the daemon already contains a different agent with the same name, status marks the legacy agent as across and permits deletion of its only credential store even though its original identity was never repaired."
+    }
+  ],
+  "_meta": {
+    "round": 13,
+    "at": "2026-09-15T20:19:33+00:00",
+    "package_bytes": 98916,
+    "schema_problems": []
+  }
+}

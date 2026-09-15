@@ -32,9 +32,27 @@
  */
 import crypto from 'node:crypto';
 
+const DEFAULT_ORIGIN = 'https://wundervault.com';
+
+/**
+ * Where a setup link is allowed to come from.
+ *
+ * Read from the daemon's environment, which after the uid split is set by the unit file.
+ * That is the point: the caller hands over a URL, but it does not get to say which server
+ * is trusted. `WUNDERVAULT_SETUP_ORIGIN` exists for self-hosted installs and for tests,
+ * and in both cases it is set by whoever starts the daemon, never by whoever calls it.
+ */
+export function allowedOrigins(): string[] {
+  const configured = process.env.WUNDERVAULT_SETUP_ORIGIN;
+  if (!configured) return [DEFAULT_ORIGIN];
+  return configured.split(',').map(o => o.trim()).filter(Boolean);
+}
+
 const PBKDF2_SALT = 'wv-agent-setup-v1';
 const PBKDF2_ROUNDS = 100_000;
 const UA = 'WunderVault-Agent-Daemon/1.0';
+/** A credential blob is a couple of hundred bytes. This is three orders of magnitude of slack. */
+const MAX_RESPONSE_BYTES = 256 * 1024;
 
 export interface EnrolledCredentials {
   agent_name: string;
@@ -59,14 +77,26 @@ export function parseSetupUrl(raw: string): ParsedLink {
   try { u = new URL(String(raw ?? '').trim()); }
   catch { throw new Error('That does not look like a setup link. Paste the whole URL, including the # at the end.'); }
 
-  // The blob is encrypted, but the setup token is a bearer credential and plaintext HTTP
-  // would hand it to anything on the path. The one exception is loopback: a connection
-  // that never leaves the machine cannot be intercepted on the way, and without it there
-  // is no way to exercise this against a real server in a test — which would mean the
-  // protocol was only ever checked against a mock of our own making.
-  const loopback = ['127.0.0.1', '::1', 'localhost'].includes(u.hostname);
-  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && loopback)) {
-    throw new Error(`A setup link must be https. Got ${u.protocol.replace(':', '')}.`);
+  // THE ORIGIN IS THE WHOLE SECURITY PROPERTY, so it is checked against an allowlist the
+  // caller cannot influence.
+  //
+  // The first version of this accepted any https origin, plus http on loopback so a test
+  // could run a real server. That defeated the entire design in one line: a malicious
+  // agent could start its own listener on 127.0.0.1, serve a blob it had encrypted with a
+  // passphrase it chose, and hand the daemon `http://127.0.0.1:9999/setup/agent/x#p`. The
+  // daemon would decrypt it perfectly, believe it, and register whatever profile the agent
+  // named — including overwriting a real one. The "setup link an agent cannot obtain"
+  // becomes a setup link an agent can simply mint.
+  //
+  // So: exactly one origin, from the DAEMON's own environment, which systemd sets and no
+  // agent controls. The test override lives there too and is therefore unreachable by a
+  // caller — an agent cannot set the daemon's environment any more than it can set its uid.
+  const allowed = allowedOrigins();
+  if (!allowed.includes(u.origin)) {
+    throw new Error(
+      `A setup link must come from ${allowed.join(' or ')}. Got ${u.origin}.\n` +
+      `A link from anywhere else is not a Wundervault setup link, whatever it looks like.`,
+    );
   }
 
   const m = u.pathname.match(/\/setup\/agent\/([^/]+)\/?$/);
@@ -89,10 +119,14 @@ async function httpJson(url: string, method: 'GET' | 'POST'): Promise<any> {
   // response named — and this runs inside the process that holds every agent's
   // credentials. There is no legitimate reason for the setup endpoints to redirect, so
   // refusing is free, and the failure is visible rather than silent.
+  // Bounded on both axes. This runs inside the process holding every agent's credentials,
+  // so a server that never answers must not park a request there for ever, and one that
+  // answers for ever must not be read into memory without limit.
   const res = await fetch(url, {
     method,
     headers: { 'User-Agent': UA },
     redirect: 'error',
+    signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) {
     const known: Record<number, string> = {
@@ -103,13 +137,43 @@ async function httpJson(url: string, method: 'GET' | 'POST'): Promise<any> {
     };
     throw new Error(known[res.status] ?? `The server answered ${res.status} for the setup link.`);
   }
-  const ctype = String(res.headers.get('content-type') ?? '');
-  if (!ctype.includes('json')) {
+  // `includes('json')` was not a media-type test: it accepted `text/notjson` and rejected
+  // `Application/JSON`, which is the same string with different case and perfectly valid.
+  // Parse the type properly — drop parameters, lowercase, then match exactly or on the
+  // structured `+json` suffix.
+  const ctype = String(res.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
+  if (ctype !== 'application/json' && !ctype.endsWith('+json')) {
     // A captive portal or a proxy answering 200 with an HTML login page would otherwise
     // reach JSON.parse and surface as a confusing syntax error.
     throw new Error(`The setup link did not return JSON (content-type: ${ctype || 'none'}).`);
   }
-  return res.json();
+
+  // A response with no declared length, or an absurd one, is refused before it is read.
+  const declared = Number(res.headers.get('content-length') ?? '0');
+  if (declared > MAX_RESPONSE_BYTES) {
+    throw new Error(`The setup endpoint returned ${declared} bytes; refusing to read it.`);
+  }
+  const text = await res.text();
+  if (text.length > MAX_RESPONSE_BYTES) {
+    throw new Error('The setup endpoint returned more data than a credential blob can be.');
+  }
+  return JSON.parse(text);
+}
+
+/**
+ * Ask the server which agent a link belongs to, redeeming nothing.
+ *
+ * The GET endpoint deliberately does not burn the token — the server's own comment says so,
+ * because a link may be previewed. That lets enrolment learn the agent's name BEFORE it
+ * commits to anything, which is what removes the two-step dance this used to require: mint
+ * a token, enrol, discover the name from the reply, then swap the token back. That dance
+ * had a window where a dropped connection left an agent registered under a token the
+ * caller had not saved, and no way to recover it.
+ */
+export async function peekAgentName(rawUrl: string): Promise<string> {
+  const { baseUrl, token } = parseSetupUrl(rawUrl);
+  const server = await httpJson(`${baseUrl}/api/setup/agent/${encodeURIComponent(token)}`, 'GET');
+  return String(server?.agent_name ?? '');
 }
 
 /**
@@ -120,7 +184,9 @@ async function httpJson(url: string, method: 'GET' | 'POST'): Promise<any> {
  * and left the agent with nothing, forcing another trip to the dashboard. Burning last
  * means the only way to lose the link is to have already succeeded with it.
  */
-export async function redeemSetupLink(rawUrl: string): Promise<EnrolledCredentials> {
+export async function redeemSetupLink(
+  rawUrl: string,
+): Promise<{ creds: EnrolledCredentials; burn: () => Promise<boolean> }> {
   const { baseUrl, token, passphrase } = parseSetupUrl(rawUrl);
 
   const server = await httpJson(`${baseUrl}/api/setup/agent/${encodeURIComponent(token)}`, 'GET');
@@ -160,14 +226,27 @@ export async function redeemSetupLink(rawUrl: string): Promise<EnrolledCredentia
     throw new Error('The decrypted credentials are missing a key. Repair the agent and try again.');
   }
 
-  // Best effort, and deliberately non-fatal: the credentials are already in hand, and
-  // failing the whole enrolment because the "mark as used" call timed out would be a
-  // worse outcome than a link that stays live for its remaining fifteen minutes.
-  try {
-    await httpJson(`${baseUrl}/api/setup/agent/${encodeURIComponent(token)}/burn`, 'POST');
-  } catch {
-    console.error('[wundervault-agent] Enrolled, but could not mark the setup link as used.');
-  }
+  // The burn is HANDED BACK rather than done here, so the caller can do it only after the
+  // profile is actually stored. Burning at this point consumed the link on any later
+  // failure — a missing socket token, a disk error — leaving the owner with a spent link
+  // and no agent.
+  //
+  // It stays non-fatal once called: the credentials are already in hand and filed, and
+  // failing an enrolment that has already succeeded because the "mark as used" call timed
+  // out would be the worse outcome. A link that stays live for the rest of its fifteen
+  // minutes is the smaller problem, and it is logged.
+  const burn = async (): Promise<boolean> => {
+    try {
+      await httpJson(`${baseUrl}/api/setup/agent/${encodeURIComponent(token)}/burn`, 'POST');
+      return true;
+    } catch {
+      console.error(
+        '[wundervault-agent] Enrolled, but could not mark the setup link as used. ' +
+        'It stays valid until it expires — repair the agent again if that worries you.',
+      );
+      return false;
+    }
+  };
 
-  return creds;
+  return { creds, burn };
 }

@@ -33,7 +33,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { VERSION } from './version.js';
-import { redeemSetupLink } from './enrol.js';
+import { redeemSetupLink, peekAgentName } from './enrol.js';
 import {
   systemRoot, profilesPath, saltPath, mgmtSocketPath, agentSocketPath,
   runtimeDir, ensureSystemRoot, safeName, SYSTEM_ACCOUNT, mgmtDir, networkStorePath,
@@ -405,6 +405,35 @@ class AgentDaemon {
 
     const mgmt = net.createServer((socket) => {
       let buf = '';
+      // An ABSOLUTE deadline as well as the inactivity one. setTimeout() below is reset by
+      // any traffic, so a byte every nine seconds held a management connection for days —
+      // no newline, so never consumed, and the 64KiB ceiling never reached. Enough of
+      // those and the daemon runs out of file descriptors and no agent can connect.
+      //
+      // It is generous because enrolment legitimately waits on two network round trips,
+      // and the previous 10s inactivity timeout could destroy the socket mid-enrolment:
+      // the profile still got registered and the link still got burned, but the caller
+      // never learned the name, so it never wrote the token file. An agent existed that
+      // nothing could authenticate as.
+      const hardDeadline = setTimeout(() => socket.destroy(), 60_000);
+      (hardDeadline as unknown as { unref?: () => void }).unref?.();
+      socket.on('close', () => clearTimeout(hardDeadline));
+
+      // Writing to a destroyed socket throws; every reply goes through here so a client
+      // that hung up cannot turn into an unhandled error inside an async handler.
+      const reply = (obj: unknown) => {
+        try {
+          if (socket.destroyed) return;
+          socket.write(JSON.stringify(obj) + '\n');
+          socket.end();
+        } catch { /* the caller is gone */ }
+      };
+      // One request per connection. The handler fires on every 'data' event and reparses
+      // whatever is in the buffer, so before this flag a caller could write one valid
+      // enrol line and then dribble single bytes: each one re-ran the same request, and
+      // each enrol is a 100,000-round PBKDF2 plus a network fetch. A thousand of those
+      // stall the event loop that every agent's credential socket shares.
+      let consumed = false;
       socket.setTimeout(10_000, () => socket.destroy());
       socket.on('data', (d) => {
         buf += d.toString();
@@ -413,6 +442,8 @@ class AgentDaemon {
         if (buf.length > 64 * 1024) { socket.destroy(); return; }
         const nl = buf.indexOf('\n');
         if (nl < 0) return;
+        if (consumed) return;
+        consumed = true;
 
         try {
           const msg = JSON.parse(buf.slice(0, nl));
@@ -431,10 +462,15 @@ class AgentDaemon {
             // process at all.
             void (async () => {
               try {
-                const creds = await redeemSetupLink(String(msg.setup_url));
+                // Checked BEFORE anything is redeemed. Redeeming first meant a missing
+                // socket_token burned a single-use link and produced no usable agent —
+                // the link spent, the agent absent, and another trip to the dashboard.
                 if (!msg.socket_token || String(msg.socket_token).length < 32) {
                   throw new Error('An enrolment must carry a socket_token of at least 32 characters.');
                 }
+                // The burn is deferred: the link is marked used only once the profile is
+                // actually stored, so a disk error cannot consume it either.
+                const { creds, burn } = await redeemSetupLink(String(msg.setup_url));
                 this.registerProfile({
                   agent_name: creds.agent_name,
                   api_key: creds.api_key,
@@ -442,15 +478,34 @@ class AgentDaemon {
                   vault_url: creds.vault_url,
                   socket_token: String(msg.socket_token),
                 } as AgentProfile);
-                socket.write(JSON.stringify({
+                const burned = await burn();
+                // Reported, not swallowed. An unburned link stays usable for the rest of
+                // its fifteen minutes and could be replayed to overwrite this profile with
+                // a different token, so the caller is told rather than reassured.
+                reply({
                   ok: true, agent_name: creds.agent_name, agent_id: creds.agent_id,
-                }) + '\n');
+                  link_burned: burned,
+                });
               } catch (e) {
-                socket.write(JSON.stringify({ error: (e as Error).message }) + '\n');
+                reply({ error: (e as Error).message });
               }
-              socket.end();
             })();
             return;   // the async path owns this socket from here
+          } else if (msg.action === 'whose_link' && msg.setup_url) {
+            // The agent's NAME, redeeming nothing — the GET endpoint does not burn. This
+            // exists so enrolment can find out whether that agent already has a socket
+            // token BEFORE committing, which replaced a two-step register-then-swap that
+            // left an agent registered under a token the caller had not saved if the
+            // connection dropped in between.
+            void (async () => {
+              try {
+                const name = await peekAgentName(String(msg.setup_url));
+                reply({ ok: true, agent_name: name });
+              } catch (e) {
+                reply({ error: (e as Error).message });
+              }
+            })();
+            return;
           } else if (msg.action === 'remove_profile' && msg.agent_name) {
             // Gated on the agent's own token. The socket is world-connectable now, so
             // without this any local user could delete another user's agents. It does NOT
@@ -562,6 +617,33 @@ class AgentDaemon {
 export { AgentDaemon, deriveMachineKey, encryptProfiles, decryptProfiles, refuseRoot };
 export type { AgentProfile, ProfileStore };
 
+/**
+ * Read the setup link from stdin.
+ *
+ * Deliberately not an argument. `/proc/<pid>/cmdline` is world-readable on Linux, so a
+ * link passed on the command line is visible to every process running as the owner — which
+ * is every agent — for as long as the command runs. That link is the one credential this
+ * whole design assumes an agent cannot obtain, and fetching and burning are separate steps,
+ * so an agent that copied it would have had time to redeem it first. Piping still works, so
+ * this stays scriptable; nothing that reaches here lands in argv.
+ */
+function readLinkFromStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) {
+      process.stderr.write('Paste the setup link from the dashboard (it ends in #…): ');
+    }
+    let buf = '';
+    process.stdin.setEncoding('utf8');
+    const finish = (v: string) => { process.stdin.pause(); resolve(v.trim()); };
+    process.stdin.on('data', (d) => {
+      buf += d;
+      // A terminal sends no EOF until ctrl-D, so the first newline ends the read.
+      if (process.stdin.isTTY && buf.includes('\n')) finish(buf.split('\n')[0]);
+    });
+    process.stdin.on('end', () => finish(buf));
+  });
+}
+
 // Only run when invoked as the binary, so the class can be imported by tests and by the
 // migration command without starting a daemon as a side effect.
 const invokedDirectly = process.argv[1] && /wundervault-agent|agent\.(js|ts)$/.test(process.argv[1]);
@@ -572,14 +654,15 @@ if (invokedDirectly && !process.env.WUNDERVAULT_AGENT_NO_AUTOSTART) {
     console.log(`
 Wundervault agent daemon ${VERSION}
 
-Usage: wundervault-agent [--enrol <setup-link>] [--migrate [--finish]] [--destinations]
+Usage: wundervault-agent [--enrol] [--migrate [--finish]] [--destinations]
 
 With no arguments it runs as the daemon. It is normally started by systemd as the
 '${SYSTEM_ACCOUNT}' account, not by hand.
 
-  --enrol URL   Add an agent using a setup link from the dashboard. The daemon redeems
-                the link itself, so the credentials never pass through this process.
-                Quote the URL — it ends in a #fragment your shell would otherwise eat.
+  --enrol       Add an agent using a setup link from the dashboard. Prompts for the link
+                rather than taking it as an argument: a command line is readable by every
+                process on this machine. The daemon redeems the link itself, so the
+                credentials never pass through this process.
   --migrate     Show which pre-split agents still need moving across, and how.
   --finish      With --migrate: delete the pre-split store, once every agent is across.
   --destinations  Write the page showing where your agents have sent secrets.
@@ -590,13 +673,43 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
     process.exit(0);
   }
 
-  const enrolAt = argv.indexOf('--enrol');
-  if (enrolAt >= 0) {
+  if (argv.includes('--destinations')) {
+    // Dispatched here as well as in the MCP binary, because every message that mentions
+    // this names THIS command — `sudo wundervault-agent --destinations`. It was only wired
+    // into wundervault-mcp, so the advice printed by the daemon and the log viewer led
+    // straight into refuseRoot and a message about not running as root.
+    //
+    // refuseRoot is deliberately NOT called on this path: reading the store is the one
+    // thing that requires being root, because the file belongs to the daemon's account and
+    // that is what stops the agents reading it.
+    const { writeViewer, collectShape } = await import('./log-viewer.js');
+    const { defaultStorePath } = await import('./network-store.js');
+    const store = defaultStorePath();
+    collectShape(store)
+      .then(({ shape }) => {
+        const out = writeViewer(store, undefined, shape);
+        const calls = shape.seen.reduce((n: number, x: { count: number }) => n + x.count, 0);
+        console.log(
+          `\nDestination log — ${shape.seen.length} destination(s), ${calls} call(s)\n` +
+          `  store:  ${store}\n  viewer: ${out}\n\n` +
+          `Open that file in your browser. It contains the data already, loads nothing, and\n` +
+          `is blocked by its own content-security policy from making any network request.\n`);
+        process.exit(0);
+      })
+      .catch((e: Error) => { console.error(e.message); process.exit(1); });
+  } else if (argv.includes('--enrol')) {
     // Runs as the USER. It hands over a URL and gets back a name — the credentials are
     // fetched, decrypted and filed by the daemon, and never enter this process.
-    const url = argv[enrolAt + 1];
-    if (!url || url.startsWith('-')) {
-      console.error('--enrol needs the setup link from the dashboard, in quotes.');
+    //
+    // The link is READ FROM STDIN, never taken from argv. A command line is world-readable
+    // through /proc/<pid>/cmdline, so `--enrol "https://...#passphrase"` published the one
+    // credential this design assumes an agent cannot get, to every agent on the machine,
+    // for as long as the command ran. And because fetching and burning are separate steps,
+    // an agent that copied it had time to redeem it first. Prompting costs one paste and
+    // keeps the link out of argv and out of shell history.
+    const url = await readLinkFromStdin();
+    if (!url) {
+      console.error('No setup link given.');
       process.exit(2);
     }
     const { enrol } = await import('./migrate.js');
@@ -604,6 +717,12 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
       .then((r) => {
         console.log(`Enrolled ${r.agent_name}. Its credentials are in ${systemRoot()}, ` +
                     `which your agents cannot read.`);
+        if (!r.linkBurned) {
+          console.log('');
+          console.log('WARNING: the server did not confirm the setup link as used, so it stays');
+          console.log('valid until it expires and could be replayed to re-point this agent.');
+          console.log('Repair the agent again in the dashboard if that matters to you.');
+        }
         process.exit(0);
       })
       .catch((e: Error) => { console.error(e.message); process.exit(1); });

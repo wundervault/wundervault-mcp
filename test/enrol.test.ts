@@ -41,14 +41,22 @@ function makeBlob(creds: object, passphrase = PASSPHRASE): string {
 }
 
 /** Stands in for the website. Answers the two endpoints onboard.py uses, and no others. */
-function startServer(tokens: Record<string, { name: string; blob: string; used?: boolean; gone?: boolean }>) {
+function startServer(
+  tokens: Record<string, { name: string; blob: string; used?: boolean; gone?: boolean }>,
+  opts: { burnFails?: boolean } = {},
+) {
   return new Promise<void>((resolve) => {
     server = http.createServer((req, res) => {
       const m = String(req.url).match(/^\/api\/setup\/agent\/([^/]+)(\/burn)?$/);
       if (!m) { res.writeHead(404).end('{}'); return; }
       const entry = tokens[m[1]];
       if (!entry) { res.writeHead(404).end(JSON.stringify({ detail: 'Invalid setup token' })); return; }
-      if (m[2]) { entry.used = true; burned.push(m[1]); res.writeHead(200).end(JSON.stringify({ status: 'burned' })); return; }
+      if (m[2]) {
+        if (opts.burnFails) { res.writeHead(500).end(JSON.stringify({ detail: 'nope' })); return; }
+        entry.used = true; burned.push(m[1]);
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'burned' }));
+        return;
+      }
       if (entry.used || entry.gone) { res.writeHead(410).end(JSON.stringify({ detail: 'used' })); return; }
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
         agent_id: 'ag_' + entry.name, agent_name: entry.name, encrypted_blob: entry.blob,
@@ -62,6 +70,9 @@ function startServer(tokens: Record<string, { name: string; blob: string; used?:
 }
 
 async function freshDaemon() {
+  // Set on the DAEMON's environment, which is exactly the point: systemd sets this, and a
+  // caller cannot. An agent can hand over any URL it likes and still not widen this.
+  process.env.WUNDERVAULT_SETUP_ORIGIN = baseUrl;
   process.env.WUNDERVAULT_SYSTEM_ROOT = path.join(dir, 'state');
   process.env.WUNDERVAULT_USER_ROOT = path.join(dir, 'home', '.wundervault');
   process.env.WUNDERVAULT_RUNTIME_DIR = path.join(dir, 'run');
@@ -94,7 +105,8 @@ afterEach(async () => {
   daemon = undefined;
   await new Promise<void>((r) => server ? server.close(() => r()) : r());
   fs.rmSync(dir, { recursive: true, force: true });
-  for (const k of ['WUNDERVAULT_SYSTEM_ROOT', 'WUNDERVAULT_USER_ROOT', 'WUNDERVAULT_RUNTIME_DIR']) {
+  for (const k of ['WUNDERVAULT_SYSTEM_ROOT', 'WUNDERVAULT_USER_ROOT', 'WUNDERVAULT_RUNTIME_DIR',
+                   'WUNDERVAULT_SETUP_ORIGIN']) {
     delete process.env[k];
   }
 });
@@ -187,25 +199,185 @@ describe('the setup link is the authorisation', () => {
   });
 });
 
+describe('one enrolment per connection', () => {
+  it('does not re-run the request when the caller keeps writing', async () => {
+    // Each enrol is a 100,000-round PBKDF2 plus a fetch, on the event loop every agent's
+    // credential socket shares. Before the guard, a caller could send one valid line and
+    // then dribble bytes, re-running the whole thing on every chunk.
+    const blob = makeBlob({ api_key: 'k', encryption_key: 'e' });
+    let gets = 0;
+    await startServer({ tok1: { name: 'Byte', blob } });
+    server.on('request', (req) => { if (!/burn/.test(String(req.url))) gets++; });
+    daemon = await freshDaemon();
+
+    const c = net.createConnection(mgmt());
+    await new Promise((r) => c.on('connect', r));
+    c.write(JSON.stringify({
+      action: 'enrol', setup_url: `${baseUrl}/setup/agent/tok1#${PASSPHRASE}`,
+      socket_token: crypto.randomBytes(32).toString('hex'),
+    }) + '\n');
+    for (let i = 0; i < 50; i++) c.write('x');
+    await new Promise((r) => setTimeout(r, 600));
+    c.destroy();
+
+    expect(gets).toBe(1);
+  }, 20_000);
+
+  it('does not burn the link when there is no socket token', async () => {
+    // Validation moved ahead of redemption: burning first spent a single-use link and
+    // produced no agent, so the owner was sent back to the dashboard for a new one.
+    const blob = makeBlob({ api_key: 'k', encryption_key: 'e' });
+    await startServer({ tok1: { name: 'Byte', blob } });
+    daemon = await freshDaemon();
+    const res = await speak(mgmt(), {
+      action: 'enrol', setup_url: `${baseUrl}/setup/agent/tok1#${PASSPHRASE}`,
+    });
+    expect(res.error).toMatch(/socket_token/);
+    expect(burned).toEqual([]);
+  });
+});
+
+describe('the token an agent already has survives the move', () => {
+  it('reuses the existing token instead of locking a running agent out', async () => {
+    // An agent process reads its token once, at startup. Handing it a new one during
+    // migration gets it refused by the daemon that just enrolled it, and 'unauthorized'
+    // is the only clue it ever gets.
+    const blob = makeBlob({ api_key: 'k2', encryption_key: 'e2' });
+    await startServer({ tok1: { name: 'Byte', blob } });
+    daemon = await freshDaemon();
+
+    const existing = 'cc'.repeat(32);
+    const tokenFile = path.join(dir, 'home', '.wundervault', 'agents', 'Byte.token');
+    fs.mkdirSync(path.dirname(tokenFile), { recursive: true });
+    fs.writeFileSync(tokenFile, existing);
+
+    const { enrol } = await import('../src/migrate.js');
+    const r = await enrol(`${baseUrl}/setup/agent/tok1#${PASSPHRASE}`);
+    expect(r.agent_name).toBe('Byte');
+
+    // Unchanged on disk, and the daemon answers to it.
+    expect(fs.readFileSync(tokenFile, 'utf8').trim()).toBe(existing);
+    const got = await speak(path.join(dir, 'run', 'Byte.sock'), { token: existing });
+    expect(got.api_key).toBe('k2');
+  }, 20_000);
+
+  it('mints one when the agent has none, and writes it 0600', async () => {
+    const blob = makeBlob({ api_key: 'k3', encryption_key: 'e3' });
+    await startServer({ tok1: { name: 'Codex', blob } });
+    daemon = await freshDaemon();
+
+    const { enrol } = await import('../src/migrate.js');
+    await enrol(`${baseUrl}/setup/agent/tok1#${PASSPHRASE}`);
+
+    const tokenFile = path.join(dir, 'home', '.wundervault', 'agents', 'Codex.token');
+    expect(fs.statSync(tokenFile).mode & 0o777).toBe(0o600);
+    const got = await speak(path.join(dir, 'run', 'Codex.sock'),
+      { token: fs.readFileSync(tokenFile, 'utf8').trim() });
+    expect(got.api_key).toBe('k3');
+  }, 20_000);
+
+  it('tells the caller when the link was not burned', async () => {
+    // An unburned link stays replayable for the rest of its life and could re-point the
+    // agent at a different token. Reporting ok and staying quiet about it is the one
+    // outcome that leaves somebody confidently wrong.
+    const blob = makeBlob({ api_key: 'k', encryption_key: 'e' });
+    await startServer({ tok1: { name: 'Byte', blob } }, { burnFails: true });
+    daemon = await freshDaemon();
+    const res = await speak(mgmt(), {
+      action: 'enrol', setup_url: `${baseUrl}/setup/agent/tok1#${PASSPHRASE}`,
+      socket_token: crypto.randomBytes(32).toString('hex'),
+    });
+    // The enrolment DID succeed — the credentials are filed — so this is not an error.
+    // It is a caveat, and it has to travel with the success.
+    expect(res.ok).toBe(true);
+    expect(res.link_burned).toBe(false);
+    expect(burned).toEqual([]);
+  }, 20_000);
+});
+
+describe('the migration instructions match the command', () => {
+  it('never tells anyone to put the link on the command line', async () => {
+    // The whole point of reading from stdin is that a command line is world-readable.
+    // Instructions that say otherwise hand the credential over just as effectively.
+    const { describeStatus } = await import('../src/migrate.js');
+    const text = describeStatus({
+      pending: ['Byte'], across: [], alreadyDone: false, oldStorePath: '/tmp/x',
+    });
+    expect(text).toContain('--enrol');
+    expect(text).not.toMatch(/--enrol\s+["'<]/);
+    expect(text).toMatch(/paste/i);
+  });
+});
+
+describe('the origin is the whole security property', () => {
+  it('refuses a link from a server the agent stood up itself', async () => {
+    // THE attack the loopback exception opened, and the reason it is gone. A malicious
+    // agent runs its own listener, serves a blob it encrypted with a passphrase it chose,
+    // and hands the daemon the link. Every cryptographic check passes — the agent made the
+    // ciphertext — so the only thing that can refuse it is not trusting the origin.
+    const rogueBlob = makeBlob({ api_key: 'stolen', encryption_key: 'stolen' }, 'agent-chosen');
+    const rogue = http.createServer((req, res) => {
+      const m = String(req.url).match(/^\/api\/setup\/agent\/([^/]+)(\/burn)?$/);
+      if (!m) { res.writeHead(404).end('{}'); return; }
+      if (m[2]) { res.writeHead(200).end('{"status":"burned"}'); return; }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+        agent_id: 'rogue', agent_name: 'Byte', encrypted_blob: rogueBlob,
+      }));
+    });
+    await new Promise<void>((r) => rogue.listen(0, '127.0.0.1', () => r()));
+    const rogueUrl = `http://127.0.0.1:${(rogue.address() as net.AddressInfo).port}`;
+
+    // The daemon trusts a DIFFERENT origin — the real one.
+    await startServer({});
+    daemon = await freshDaemon();
+
+    const res = await speak(mgmt(), {
+      action: 'enrol',
+      setup_url: `${rogueUrl}/setup/agent/anything#agent-chosen`,
+      socket_token: crypto.randomBytes(32).toString('hex'),
+    });
+    await new Promise<void>((r) => rogue.close(() => r()));
+
+    expect(res.ok).toBeUndefined();
+    expect(res.error).toMatch(/must come from/);
+    expect(fs.existsSync(path.join(dir, 'run', 'Byte.sock'))).toBe(false);
+  });
+
+  it('refuses a link from a lookalike host', async () => {
+    await startServer({});
+    daemon = await freshDaemon();
+    const res = await speak(mgmt(), {
+      action: 'enrol',
+      setup_url: 'https://wundervault.com.evil.example/setup/agent/t#p',
+      socket_token: crypto.randomBytes(32).toString('hex'),
+    });
+    expect(res.error).toMatch(/must come from/);
+  });
+});
+
 describe('parsing a setup link', () => {
   it('takes the token from the path and the passphrase from the fragment', () => {
+    process.env.WUNDERVAULT_SETUP_ORIGIN = 'https://wundervault.com';
     const p = parseSetupUrl('https://wundervault.com/setup/agent/abc123#hunter2');
     expect(p).toEqual({ baseUrl: 'https://wundervault.com', token: 'abc123', passphrase: 'hunter2' });
   });
 
   it('refuses a link with no fragment, and explains why it matters', () => {
+    process.env.WUNDERVAULT_SETUP_ORIGIN = 'https://wundervault.com';
     // A link without the fragment looks complete and cannot possibly work: the passphrase
     // is the only thing that decrypts the blob and the server never had it.
     expect(() => parseSetupUrl('https://wundervault.com/setup/agent/abc123'))
       .toThrow(/after the #/);
   });
 
-  it('refuses plaintext http', () => {
-    // The blob is encrypted, but the token is a bearer credential.
-    expect(() => parseSetupUrl('http://wundervault.com/setup/agent/abc#p')).toThrow(/https/);
+  it('refuses plaintext http even on the right hostname', () => {
+    // The blob is encrypted, but the token is a bearer credential in the path.
+    process.env.WUNDERVAULT_SETUP_ORIGIN = 'https://wundervault.com';
+    expect(() => parseSetupUrl('http://wundervault.com/setup/agent/abc#p')).toThrow(/must come from/);
   });
 
   it('refuses something that is not a setup link at all', () => {
+    process.env.WUNDERVAULT_SETUP_ORIGIN = 'https://wundervault.com';
     expect(() => parseSetupUrl('https://wundervault.com/dashboard#p')).toThrow(/no setup token/);
     expect(() => parseSetupUrl('not a url')).toThrow(/does not look like/);
   });

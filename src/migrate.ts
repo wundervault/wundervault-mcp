@@ -109,6 +109,21 @@ export function stopOldUserUnit(): Promise<OldUnit> {
   });
 }
 
+/**
+ * Delete the pre-split unit file.
+ *
+ * Disabling stops it now; the file is what starts it again. Leaving it means a reboot
+ * brings up a second daemon that binds a socket the client still falls back to, and by
+ * then the store it wants is gone — so it comes up serving nothing, loudly, for reasons
+ * nobody will connect to a migration run weeks earlier.
+ */
+function removeOldUnitFile(): void {
+  const home = process.env.HOME || '';
+  if (!home) return;
+  const unit = `${home}/.config/systemd/user/${OLD_UNIT()}`;
+  try { if (fs.existsSync(unit)) fs.unlinkSync(unit); } catch { /* best effort */ }
+}
+
 export interface MigrationStatus {
   pending: string[];
   across: string[];
@@ -153,27 +168,58 @@ export interface EnrolResult { agent_name: string; agent_id: string; }
  * this phase removes — and the token is the agent's identity rather than a vault
  * credential, so there is nothing to protect by having the daemon generate it.
  */
-export async function enrol(setupUrl: string): Promise<EnrolResult> {
-  const socketToken = crypto.randomBytes(32).toString('hex');
+export async function enrol(setupUrl: string): Promise<EnrolResult & { linkBurned: boolean }> {
+  const { agentTokenPath } = await import('./paths.js');
+  const path = await import('node:path');
+
+  // Ask WHOSE link this is before committing to anything. The GET endpoint does not burn
+  // the token — the server says so explicitly — so this costs one round trip and removes a
+  // race that the previous shape could not avoid: it had to mint a token, enrol, learn the
+  // name from the reply, then swap the token back. If the connection dropped in the middle
+  // of that, the agent was registered under a token nobody had saved, the link was spent,
+  // and there was no way back except another repair.
+  const who = await ask({ action: 'whose_link', setup_url: setupUrl });
+  if (who?.error) throw new Error(who.error);
+  const agentName = String(who?.agent_name ?? '');
+  if (!agentName) throw new Error('The server did not say which agent that link is for.');
+
+  // Reuse the agent's existing token when it has one. Repair rotates the VAULT
+  // credentials; the socket token is a separate local identity, read once at startup by
+  // any already-running agent process. Replacing it would have that agent refused by the
+  // daemon that just enrolled it, with 'unauthorized' as the only clue.
+  const tp = agentTokenPath(agentName);
+  let socketToken = '';
+  if (fs.existsSync(tp)) {
+    try {
+      const existing = fs.readFileSync(tp, 'utf8').trim();
+      if (existing.length >= 32) socketToken = existing;
+    } catch { /* unreadable: mint a new one below */ }
+  }
+  const reusedToken = Boolean(socketToken);
+  if (!socketToken) socketToken = crypto.randomBytes(32).toString('hex');
+
   const reply = await ask({ action: 'enrol', setup_url: setupUrl, socket_token: socketToken });
   if (reply?.error) throw new Error(reply.error);
   if (!reply?.ok || !reply.agent_name) throw new Error('The daemon did not confirm the enrolment.');
 
-  // Written only after the daemon has confirmed. Writing first would leave a token file
-  // for an agent that does not exist, which reads as a working setup and is not.
-  const { agentTokenPath } = await import('./paths.js');
-  const tp = agentTokenPath(reply.agent_name);
-  const path = await import('node:path');
-  const dir = path.dirname(tp);
-  // chmod unconditionally: mkdir's mode is masked by umask and ignored on an existing
-  // directory, and writeFileSync's mode applies only when it creates the file. This token
-  // is the agent's identity in front of a world-connectable socket.
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(dir, 0o700);
-  fs.writeFileSync(tp, socketToken, { mode: 0o600 });
+  // Written only after the daemon has confirmed, and skipped entirely when the value did
+  // not change. Writing first would leave a token file for an agent that does not exist,
+  // which reads as a working setup and is not.
+  if (!reusedToken) {
+    const dir = path.dirname(tp);
+    // chmod unconditionally: mkdir's mode is masked by umask and ignored on a directory
+    // that already exists, and writeFileSync's mode applies only when it creates the file.
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dir, 0o700);
+    fs.writeFileSync(tp, socketToken, { mode: 0o600 });
+  }
   fs.chmodSync(tp, 0o600);
 
-  return { agent_name: reply.agent_name, agent_id: reply.agent_id };
+  return {
+    agent_name: reply.agent_name,
+    agent_id: reply.agent_id,
+    linkBurned: reply.link_burned !== false,
+  };
 }
 
 export interface CleanupResult { deleted: boolean; oldUnitStopped: boolean; pending: string[]; }
@@ -187,15 +233,32 @@ export interface CleanupResult { deleted: boolean; oldUnitStopped: boolean; pend
  */
 export async function cleanup(): Promise<CleanupResult> {
   const st = await status();
-  if (st.alreadyDone) return { deleted: false, oldUnitStopped: false, pending: [] };
+  if (st.alreadyDone) {
+    // The store is already gone, but the old unit may not be — an earlier --finish could
+    // have shredded the store and failed to reach the user bus. Returning early here meant
+    // that state could never be repaired by rerunning: no store, so nothing to do, while a
+    // disabled-but-present unit file waited to start a second daemon at the next boot.
+    const unit = await stopOldUserUnit();
+    if (unit === 'gone') removeOldUnitFile();
+    return { deleted: false, oldUnitStopped: unit === 'gone', pending: [] };
+  }
   if (st.pending.length) return { deleted: false, oldUnitStopped: false, pending: st.pending };
 
   console.error(`[migrate] deleting the pre-split store: ${st.oldStorePath}`);
 
+  // The store is shredded even if the old unit is still up, and that is safe HERE and only
+  // here: reaching this point means every agent is across, which means every one of them
+  // was repaired, which means the server has already rotated the credentials in that file
+  // to dead ones. It is stale ciphertext, not a live secret.
+  //
+  // The unit is a different matter. It is reported, and its unit FILE is removed so a
+  // reboot does not quietly start a second daemon — the thing a rerun could not fix once
+  // the store was gone.
   const oldUnit = await stopOldUserUnit();
   for (const f of [legacy.profiles(), legacy.salt()]) {
     try { shred(f); } catch { /* best effort */ }
   }
+  if (oldUnit === 'gone') removeOldUnitFile();
   return { deleted: !fs.existsSync(legacy.profiles()), oldUnitStopped: oldUnit === 'gone', pending: [] };
 }
 
@@ -235,7 +298,10 @@ export function describeStatus(st: MigrationStatus, dashboardUrl = 'https://wund
   lines.push('');
   lines.push(`  1. Open ${dashboardUrl}`);
   lines.push('  2. Press REPAIR on the agent, and copy the setup link it gives you');
-  lines.push('  3. Run:  wundervault-agent --enrol "<the whole link, including the #part>"');
+  lines.push('  3. Run:  wundervault-agent --enrol');
+  lines.push('     …and paste the link when it asks. Do NOT put it on the command line:');
+  lines.push('     every process you run can read another\'s command line, so the link');
+  lines.push('     would be visible to the very agents it is meant to keep out.');
   lines.push('');
   lines.push('The link is good for 15 minutes and works once. Repeat for each agent, then');
   lines.push('run  wundervault-agent --migrate --finish  to delete the old file.');
