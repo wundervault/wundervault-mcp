@@ -658,13 +658,36 @@ export function createServer(args: { url?: string } = {}) {
           const bodyHash = agentReq?.body !== undefined
             ? createHash('sha256').update(JSON.stringify(agentReq.body)).digest('hex')
             : undefined;
+          // Record the destination LOCALLY first, and find out whether it is new here
+          // rather than asking the server to work it out. The server used to answer that
+          // by searching its access log, which meant it had to hold every destination
+          // this entry had ever used, for ever, so that one email could be sent. One bit
+          // travels instead of a profile.
+          //
+          // Before the verdict, because the tier-2 branch below can wait ninety seconds
+          // and return without ever reaching the code that used to record it — a first
+          // sighting that got refused would then have alerted again on every retry.
+          const originStr = originString(def.origin);
+          // Purpose is recorded here too — it is no longer sent to the server, and
+          // dropping it entirely would leave the owner unable to reconstruct what
+          // their own agent did.
+          const { isNew } = recordDestination(entry_id, originStr, undefined, purpose);
+
+          // The client knows the tier from the entry, so it can decide what to send. The
+          // server re-checks and refuses a tier-2 request that arrives without its
+          // destination, so this is a privacy choice the client makes about its OWN data,
+          // never a way to weaken the gate.
+          const isTier2 = String(secretData.access_tier ?? '1') === '2';
+          const destination = isTier2
+            ? { origin: originStr, method: def.route.method, path: def.route.path,
+                body_sha256: bodyHash }
+            : {};
+
           const verdict = await api.checkOperation({
             entry_id,
-            origin: originString(def.origin),
-            method: def.route.method,
-            path: def.route.path,
             purpose: purpose.slice(0, 200),
-            body_sha256: bodyHash,
+            first_sighting: isNew,
+            ...destination,
           });
           if (!verdict.allowed) {
             // Park and poll rather than refusing outright, exactly as the plaintext path
@@ -692,10 +715,10 @@ export function createServer(args: { url?: string } = {}) {
             // decision and is the only thing that should conclude the call may proceed.
             const second = await api.checkOperation({
               entry_id,
-              origin: originString(def.origin),
+              purpose: purpose.slice(0, 200),
+              origin: originStr,
               method: def.route.method,
               path: def.route.path,
-              purpose: purpose.slice(0, 200),
               body_sha256: bodyHash,
             });
             if (!second.allowed) {
@@ -719,9 +742,8 @@ export function createServer(args: { url?: string } = {}) {
             if (Array.isArray(parsed)) approvedOrigins = parsed.filter((x): x is string => typeof x === 'string');
           } catch { approvedOrigins = []; }
 
-          // Recorded here, on this machine. The server is never told where this went.
-          const originStr = originString(def.origin);
-          const { isNew } = recordDestination(entry_id, originStr);
+          // Already recorded above, before the verdict — a first sighting that then got
+          // refused at tier 2 must not read as new again on the retry.
           let noticeForAgent = '';
           if (isNew) {
             const notice = newDestinationNotice(
@@ -731,7 +753,12 @@ export function createServer(args: { url?: string } = {}) {
               // destination; a signed operation means it does not, and the tool result
               // reaches the model provider.
               !operation_id,
-              (secretData.alert_email ?? 'off') === 'on');
+              // The server's EFFECTIVE answer, not this entry's setting. Two switches
+              // have to agree before mail goes out, and the entry only carries one of
+              // them — so an entry set to 'on' under an account that opted out would have
+              // had this notice claim an email was sent when none was. Believing you are
+              // covered at 3am and not being is worse than knowing you are not.
+              verdict.emailed === true);
             emitToStderr(notice);
             noticeForAgent = `\n\n${notice.toolNote}`;
           }

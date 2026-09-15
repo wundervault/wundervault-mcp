@@ -108,15 +108,27 @@ describe('the notice, and where it goes', () => {
     expect(notice.toolNote).toContain('api.cloudflare.com');
   });
 
-  it('says which channels actually carried it, and does not claim the destination stayed local', () => {
-    // This test used to assert "not sent to Wundervault". That claim was false:
-    // checkOperation sends origin, method and path on EVERY call, tier 1 included. A
-    // test asserting a false security claim is worse than no test — it defends the
-    // claim against being corrected. What the notice can honestly say is which channels
-    // the NOTICE went to, which is what decides whether anyone hears it at 3am.
-    expect(n().toolNote).not.toMatch(/not sent to Wundervault/i);
+  it('says the destination stayed local, which is now true, and which channels carried it', () => {
+    // This assertion has been through both states, and the history is the point.
+    //
+    // It originally claimed "not sent to Wundervault" while checkOperation was sending
+    // origin, method and path on every call — a test defending a false security claim,
+    // which is worse than no test because it defends the claim against correction. It was
+    // then rewritten to assert the truth: terminal-only, no claim about locality.
+    //
+    // The code has since been changed to match what the notice always wanted to say. The
+    // destination genuinely does not leave the machine at tier 1 now; one boolean does.
+    // So the claim comes back — earned this time rather than asserted.
+    expect(n().toolNote).toMatch(/not sent to Wundervault/i);
     expect(n().toolNote).toMatch(/Terminal only/i);
     expect(n().toolNote).toMatch(/nobody is emailed/i);
+  });
+
+  it('does not put the destination in the sentence about email', () => {
+    // The mail is a doorbell. If the notice implied otherwise, an owner would reasonably
+    // conclude their inbox holds a record of where their keys go, and act on that.
+    const on = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/x', '1', true, true);
+    expect(on.toolNote).toMatch(/does not say where/i);
   });
 
   it('describes itself as a notice, not a block', () => {
@@ -265,5 +277,60 @@ describe('round 2 fixes', () => {
     const started = Date.now();
     expect(recordDestination('e1', 'https://h.example:443', fresh).isNew).toBe(true);
     expect(Date.now() - started).toBeLessThan(2000);
+  });
+});
+
+describe('the purpose lives here, not on the server', () => {
+  const CF = 'https://api.cloudflare.com:443';
+
+  it('keeps the agent-written purpose beside the destination', () => {
+    // It used to go into the hosted audit log, where it was a WORSE disclosure than the
+    // origin: an origin is mostly externally discoverable and only dangerous in
+    // aggregate, whereas a purpose is intent — one row naming an incident or a customer
+    // is enough to hurt.
+    recordDestination('e1', CF, store, 'rotate the prod key after the incident');
+    const [rec] = destinationsFor('e1', store);
+    expect(rec.purposes?.[0]).toMatch(/rotate the prod key after the incident/);
+  });
+
+  it('keeps enough history to reconstruct what an agent did', () => {
+    // The point of keeping it at all. Dropping both the destination and the intention
+    // leaves the owner's own forensic answer at "this key was used four hundred times",
+    // which protects them from us at the cost of protecting them from their agent.
+    for (let i = 0; i < 5; i++) recordDestination('e1', CF, store, `call ${i}`);
+    const [rec] = destinationsFor('e1', store);
+    expect(rec.count).toBe(5);
+    expect(rec.purposes).toHaveLength(5);
+    expect(rec.purposes?.at(-1)).toMatch(/call 4/);
+  });
+
+  it('is bounded, and evicts the oldest', () => {
+    // A long-lived install must not grow this file without limit. An owner reconstructing
+    // an incident reads backwards from the most recent call, so the newest end is the one
+    // worth keeping.
+    for (let i = 0; i < 60; i++) recordDestination('e1', CF, store, `call ${i}`);
+    const [rec] = destinationsFor('e1', store);
+    expect(rec.purposes!.length).toBeLessThanOrEqual(20);
+    expect(rec.purposes?.at(-1)).toMatch(/call 59/);
+    expect(rec.purposes?.some(p => p.includes('call 0 '))).toBe(false);
+  });
+
+  it('truncates a very long purpose rather than storing it whole', () => {
+    recordDestination('e1', CF, store, 'x'.repeat(5000));
+    const [rec] = destinationsFor('e1', store);
+    expect(rec.purposes![0].length).toBeLessThan(400);
+  });
+
+  it('records the destination even when no purpose was given', () => {
+    expect(recordDestination('e1', CF, store).isNew).toBe(true);
+    const [rec] = destinationsFor('e1', store);
+    expect(rec.origin).toBe(CF);
+    expect(rec.purposes).toBeUndefined();
+  });
+
+  it('survives a reload, because it is the owners only copy', () => {
+    recordDestination('e1', CF, store, 'deploy the site');
+    const reloaded = load(store).seen.find(s => s.entryId === 'e1');
+    expect(reloaded?.purposes?.[0]).toMatch(/deploy the site/);
   });
 });

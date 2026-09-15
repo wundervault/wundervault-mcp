@@ -56,9 +56,36 @@ export class AgentVaultAPI {
    * server, so the decision does too.
    */
   async checkOperation(body: {
-    entry_id: string; origin: string; method: string; path: string;
-    purpose: string; body_sha256?: string;
-  }): Promise<{ allowed: boolean; tier: string; request_id?: string; message?: string }> {
+    entry_id: string;
+    purpose: string;
+    /**
+     * The destination — sent for TIER 2 ONLY.
+     *
+     * Where an owner's agents send their keys is a behavioural profile: which services,
+     * how often, at what hour, and for a self-hosted destination the shape of an internal
+     * network. None of it helps anyone read a secret and all of it is what a breach or a
+     * subpoena reaches, so it stays in the local store rather than being accumulated
+     * server-side one routine call at a time.
+     *
+     * Tier 2 is the exception because tier 2 IS a human reviewing one specific request,
+     * and nobody can approve what they cannot see. That is consented disclosure for a
+     * single call. The server enforces this: it refuses a tier-2 check that omits them,
+     * so a client that lied about the tier to withhold the destination gets a 422 rather
+     * than a quiet downgrade.
+     */
+    origin?: string; method?: string; path?: string;
+    body_sha256?: string;
+    /**
+     * One bit, computed locally: has this entry been used against this origin before?
+     *
+     * This is what replaced the server answering the same question from its access log —
+     * which required it to hold every destination for ever in order to send one email.
+     * The server learns that a first sighting happened, never which destination caused
+     * it.
+     */
+    first_sighting?: boolean;
+  }): Promise<{ allowed: boolean; tier: string; request_id?: string; message?: string;
+                emailed?: boolean }> {
     const resp = await fetch(`${this.baseUrl}/agent/vault/operation-check`, {
       method: 'POST',
       headers: { ...this.headers(), 'content-type': 'application/json' },
@@ -71,7 +98,8 @@ export class AgentVaultAPI {
       err.status = resp.status;
       throw err;
     }
-    return resp.json() as Promise<{ allowed: boolean; tier: string; request_id?: string; message?: string }>;
+    return resp.json() as Promise<{ allowed: boolean; tier: string; request_id?: string;
+                                    message?: string; emailed?: boolean }>;
   }
 
   async getProfile(): Promise<ProfileResponse> {

@@ -9,20 +9,27 @@
  *
  * The split that makes this coherent:
  *
- *   Tier 1 — the destination is INTENDED to stay on this machine. The server should
- *            learn that a call happened, not where it went.
+ *   Tier 1 — the destination NEVER leaves this machine. The server learns that a call
+ *            happened, and one bit saying it was the first time; not where it went.
  *   Tier 2 — the destination IS sent, because the whole point of tier 2 is that a human
  *            reviews the request, and they cannot review what they cannot see. That is
  *            consented disclosure for one specific call, not a standing profile.
  *
- * NOT TRUE YET, and saying so here rather than letting the comment flatter the code:
- * `checkOperation` sends origin, method and path on EVERY call, tier 1 included, because
- * the tier gate and the audit log both live on the server and both read those fields. So
- * today the server does learn tier 1 destinations. Closing that means the client deciding
- * the tier locally before it asks, and the account's audit log losing the destination
- * column for tier 1 entries — a product change, not a refactor, and it is owed a decision
- * rather than a quiet commit. Until it is made, the per-entry email switch controls
- * whether a destination is MAILED, not whether it is transmitted.
+ * This was NOT true until 2026-09-15, and the correction is worth keeping visible:
+ * `checkOperation` used to send origin, method and path on EVERY call, tier 1 included,
+ * and the server wrote them into its access log — because that log was also how it
+ * answered "is this origin new?" in order to send one email. One feature's convenience
+ * had quietly made the server the holder of a complete profile of where an owner's keys
+ * go, accumulated one routine call at a time and outliving the retention they chose.
+ *
+ * It now sends ONE BIT. This file answers the first-sighting question locally, the server
+ * is told only THAT a first sighting happened, and the tier-1 log row records that a
+ * brokered call occurred without recording where it went.
+ *
+ * The cost is real and worth naming rather than glossing: the hosted audit log can no
+ * longer tell an owner where a tier-1 key was sent. THIS FILE is that record now — which
+ * is why the uid split matters more than it did, since until then the party being audited
+ * still owns the evidence.
  *
  * HONEST LIMIT: this file lives in the agent's own home directory and is writable by the
  * agent's uid. A compromised agent can edit its own record of where it sent things — the
@@ -50,7 +57,29 @@ export interface SeenDestination {
   firstSeen: string;
   lastSeen: string;
   count: number;
+  /**
+   * The most recent purposes the agent gave for calling this destination.
+   *
+   * This lives here for the same reason the origin does, and it arrived here the same
+   * way: it used to be written into the hosted audit log, where it was a worse disclosure
+   * than the origin ever was. An origin is mostly externally discoverable and only
+   * becomes dangerous in aggregate; a purpose is INTENT — "rotate creds after suspected
+   * breach" is an incident disclosure, "pull the Acme contract data" names a customer —
+   * and one row is enough to hurt.
+   *
+   * But it must not simply vanish, which is what the first attempt at this did. Strip
+   * both the destination and the intention and the owner's own forensic answer becomes
+   * "this key was used four hundred times", with no way to reconstruct what their agent
+   * did if it goes wrong. That protects them from us at the cost of protecting them from
+   * their agent. Keeping it here gives them the whole record on their own machine while
+   * the server holds only that a call happened.
+   */
+  purposes?: string[];
 }
+
+/** Enough to reconstruct a session; not so many that the file grows without bound. */
+const MAX_PURPOSES = 20;
+const MAX_PURPOSE_LEN = 300;
 
 export interface NetworkShape {
   version: 1;
@@ -120,6 +149,7 @@ export function save(shape: NetworkShape, storePath = defaultStorePath()): void 
  */
 export function recordDestination(
   entryId: string, origin: string, storePath = defaultStorePath(),
+  purpose?: string,
 ): { isNew: boolean; recorded: boolean } {
   // Opted out: touch nothing, say nothing. Returning isNew:false here is deliberate —
   // a notice without a record would fire on every single call.
@@ -130,15 +160,25 @@ export function recordDestination(
   const now = new Date().toISOString();
   const key = origin.trim().toLowerCase();
 
+  const note = (purpose ?? '').trim().slice(0, MAX_PURPOSE_LEN);
+
   const existing = shape.seen.find((s) => s.entryId === entryId && s.origin === key);
   if (existing) {
     existing.count += 1;
     existing.lastSeen = now;
+    if (note) {
+      // Newest last, oldest evicted. An owner reconstructing an incident reads backwards
+      // from the most recent call, so that is the end worth keeping.
+      existing.purposes = [...(existing.purposes ?? []), `${now} ${note}`].slice(-MAX_PURPOSES);
+    }
     save(shape, storePath);
     return { isNew: false, recorded: true };
   }
 
-  shape.seen.push({ entryId, origin: key, firstSeen: now, lastSeen: now, count: 1 });
+  shape.seen.push({
+    entryId, origin: key, firstSeen: now, lastSeen: now, count: 1,
+    ...(note ? { purposes: [`${now} ${note}`] } : {}),
+  });
   // Oldest-first eviction. Evicting a record makes that destination read as new again,
   // which raises one extra notice — the safe direction for a detective signal.
   if (shape.seen.length > MAX_SEEN) {
@@ -223,8 +263,8 @@ export interface DestinationNotice {
  *  - **the tool result** is how the agent explains it to you in the conversation, which
  *    is where you are actually looking.
  *
- * Neither of those two channels reaches the server. (The operation-check that precedes
- * this notice does — see the header. These channels add nothing to what it already sent.)
+ * Neither reaches the server, and at tier 1 neither does the destination itself — the
+ * operation-check that precedes this notice sends one boolean, not an address.
  *
  * The case NEITHER covers is an unattended run: a scheduled agent at 3am with nobody
  * watching the terminal. Both channels are written blind — sent, with no way to know a
@@ -271,7 +311,8 @@ export function newDestinationNotice(
   // so an owner who has not turned email on should be told that in the notice itself
   // rather than discovering it after a 3am first sighting nobody saw.
   const channels = emailOn
-    ? `   Emailed to you as well, so an unattended run still reaches you.`
+    ? `   Emailed to you as well, so an unattended run still reaches you. That mail says `
+      + `a secret went somewhere new; it does not say where, and neither does Wundervault.`
     : `   Terminal only — nobody is emailed. If this entry runs unattended, turn email `
       + `alerts on for it in the dashboard, or a first sighting at 3am is seen by no one.`;
 
@@ -281,6 +322,7 @@ export function newDestinationNotice(
     : `   Tier 1 does not gate destinations, so this is a notice rather than a block. `
       + `If you did not expect it, revoke this agent and rotate the secret at the provider. `
       + `Moving the secret to Tier 2 makes each new request wait for approval.\n`
+      + `   Recorded on this machine; the destination was not sent to Wundervault.\n`
       + `${channels}\n`
       + `   (This note travels in the tool result, so it reaches whoever runs your model.)`;
 
