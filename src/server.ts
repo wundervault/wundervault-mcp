@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { loadOpenSshEd25519, runSshBrokered, modeAllowsLegacyExec, modeAllowsSshBroker,
   modeAllowsHttpBroker, wrongModeMessage, type BrokeredOp } from './ssh-agent.js';
 import { verifyOperationDefinition, validateArguments } from './opdef.js';
-import { definitionFromAgentRequest, originString, type AgentRequest } from './http-broker.js';
+import { definitionFromAgentRequest, originString, isApprovedPrivateOrigin, type AgentRequest } from './http-broker.js';
 import { performOperation } from './http-broker.js';
 import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey, commandInvokesSudo } from './exec.js';
 import { getRecipe, recipeIds } from './recipes.js';
@@ -673,7 +673,30 @@ export function createServer(args: { url?: string } = {}) {
             );
           }
 
-          const result = await performOperation(def, operation_id ? callArgs : ((agentReq?.body ?? {}) as Record<string, unknown>), secret);
+          let approvedOrigins: string[] = [];
+          try {
+            const raw = secretData.allowed_private_origins as unknown;
+            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (Array.isArray(parsed)) approvedOrigins = parsed.filter((x): x is string => typeof x === 'string');
+          } catch { approvedOrigins = []; }
+
+          const result = await performOperation(
+            def,
+            operation_id ? callArgs : ((agentReq?.body ?? {}) as Record<string, unknown>),
+            secret,
+            approvedOrigins,
+          );
+          if (!result.ok && /internal or reserved address/.test(result.error ?? '')
+              && !isApprovedPrivateOrigin(def.origin, approvedOrigins)) {
+            // Name the remedy rather than just refusing: this is the one refusal an owner
+            // can legitimately clear, and without saying so it looks like a dead end.
+            return fail(
+              `${result.error}\n\nIf you host that service yourself, the owner can approve `
+              + `exactly ${originString(def.origin)} for this entry in the dashboard. `
+              + `Approval is per entry and per exact host and port — it does not open a range, `
+              + `and cloud metadata endpoints cannot be approved at all.`,
+            );
+          }
           if (!result.ok) {
             return fail(`${label} failed${result.status ? ` (HTTP ${result.status})` : ''}: ${result.error ?? 'unknown error'}`);
           }

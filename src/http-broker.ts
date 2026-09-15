@@ -155,12 +155,45 @@ export function pinnedLookup(address: string, family: number) {
   };
 }
 
+/**
+ * Addresses no approval can unlock. Cloud metadata endpoints hand out instance
+ * credentials; there is no brokered call with a legitimate reason to reach one, so this
+ * is not a decision an owner gets to make on an agent's behalf.
+ */
+const NEVER_APPROVABLE = new Set([
+  '169.254.169.254', 'fd00:ec2::254', '100.100.100.200',
+]);
+
+/**
+ * Is this exact origin one the owner approved for this entry?
+ *
+ * Exact string match on scheme://host:port, deliberately. A prefix or subnet match would
+ * let an approval for 10.0.0.5:9000 cover 10.0.0.50:9000 or port 22 — and a range is a
+ * decision an owner cannot realistically evaluate.
+ */
+export function isApprovedPrivateOrigin(
+  origin: { scheme: string; host: string; port: number },
+  approved: string[] | undefined,
+): boolean {
+  if (!approved || approved.length === 0) return false;
+  const host = origin.host.toLowerCase();
+  if (NEVER_APPROVABLE.has(host)) return false;
+  const want = `${origin.scheme}://${host}:${origin.port}`.toLowerCase();
+  return approved.some((a) => typeof a === 'string' && a.trim().toLowerCase() === want);
+}
+
 /** Resolve once and choose an address, refusing anything internal. */
-export function resolvePinned(host: string): Promise<{ address: string; family: number }> {
+export function resolvePinned(host: string, allowInternal = false): Promise<{ address: string; family: number }> {
   return new Promise((resolve, reject) => {
     if (isIP(host)) {
-      // A literal address in a definition still goes through the same filter.
-      if (isBlockedAddress(host)) return reject(new Error(`refuses to connect to ${host}: internal or reserved address`));
+      // A literal address still goes through the filter — unless the owner approved this
+      // exact origin for this entry, which is the only thing that lifts it.
+      if (!allowInternal && isBlockedAddress(host)) {
+        return reject(new Error(`refuses to connect to ${host}: internal or reserved address`));
+      }
+      if (allowInternal && NEVER_APPROVABLE.has(host.toLowerCase())) {
+        return reject(new Error(`${host} is a cloud metadata endpoint and cannot be approved`));
+      }
       return resolve({ address: host, family: isIP(host) });
     }
     // A stalled resolver would otherwise hang forever: resolution happens BEFORE the
@@ -177,7 +210,9 @@ export function resolvePinned(host: string): Promise<{ address: string; family: 
       settled = true;
       clearTimeout(timer);
       if (err) return reject(new Error(`could not resolve ${host}: ${err.message}`));
-      const usable = addrs.filter((a) => !isBlockedAddress(a.address));
+      const usable = addrs.filter((a) =>
+        (allowInternal || !isBlockedAddress(a.address))
+        && !NEVER_APPROVABLE.has(a.address.toLowerCase()));
       if (usable.length === 0) {
         return reject(new Error(
           `${host} resolves only to internal or reserved addresses (${addrs.map((a) => a.address).join(', ')}); refusing to send the credential there`,
@@ -207,13 +242,16 @@ export async function performOperation(
   def: OperationDefinition,
   args: Record<string, unknown>,
   secret: string,
+  /** Exact origins the owner approved for this entry; nothing else lifts the filter. */
+  approvedPrivateOrigins?: string[],
 ): Promise<CallResult> {
   const { scheme, host, port } = def.origin;
   if (scheme !== 'https') return { ok: false, error: 'Only https origins are permitted.' };
 
+  const ownerApproved = isApprovedPrivateOrigin(def.origin, approvedPrivateOrigins);
   let pinned: { address: string; family: number };
   try {
-    pinned = await resolvePinned(host);
+    pinned = await resolvePinned(host, ownerApproved);
   } catch (e) {
     return { ok: false, error: `Refused: ${e instanceof Error ? e.message : String(e)}` };
   }

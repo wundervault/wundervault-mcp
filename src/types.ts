@@ -50,6 +50,8 @@ export interface SecretResponse {
   entry_mode?: string;
   /** Signed operation catalogue, JSON. */
   operations?: string;
+  /** Exact private origins the owner approved for this entry. */
+  allowed_private_origins?: string;
   name?: string;
   encrypted_content: string;
   content_nonce: string;

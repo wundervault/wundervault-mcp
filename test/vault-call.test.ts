@@ -11,7 +11,7 @@ import {
   filterResponse, _clearDerivedKeyCache, type OperationDefinition,
 } from '../src/opdef.js';
 import { isBlockedAddress, resolvePinned, expandIPv6, scrubSecret, pinnedLookup,
-  definitionFromAgentRequest, originString } from '../src/http-broker.js';
+  definitionFromAgentRequest, originString, isApprovedPrivateOrigin } from '../src/http-broker.js';
 import { modeAllowsHttpBroker, modeAllowsLegacyExec, wrongModeMessage } from '../src/ssh-agent.js';
 
 const SECRET = Buffer.from('sk-ant-api03-EXAMPLE-SECRET-VALUE');
@@ -435,5 +435,43 @@ describe('tiered brokering — agent-described requests', () => {
     const d = definitionFromAgentRequest(
       { origin: { scheme: 'https', host: '169.254.169.254', port: 443 }, method: 'GET', path: '/' }, BINDING);
     expect(isBlockedAddress(d.origin.host)).toBe(true);
+  });
+});
+
+describe('owner-approved private origins', () => {
+  const o = (host: string, port: number) => ({ scheme: 'https', host, port });
+
+  it('matches only the exact scheme, host and port', () => {
+    // A prefix or subnet match would let 10.0.0.5:9000 cover 10.0.0.50:9000 or port 22,
+    // and a range is a decision an owner cannot realistically evaluate.
+    const approved = ['https://10.0.0.5:9000'];
+    expect(isApprovedPrivateOrigin(o('10.0.0.5', 9000), approved)).toBe(true);
+    expect(isApprovedPrivateOrigin(o('10.0.0.5', 22), approved)).toBe(false);
+    expect(isApprovedPrivateOrigin(o('10.0.0.50', 9000), approved)).toBe(false);
+    expect(isApprovedPrivateOrigin({ ...o('10.0.0.5', 9000), scheme: 'http' }, approved)).toBe(false);
+  });
+
+  it('is case-insensitive on the host but still exact', () => {
+    expect(isApprovedPrivateOrigin(o('NAS.local', 9000), ['https://nas.local:9000'])).toBe(true);
+  });
+
+  it('approves nothing when the entry has no approvals', () => {
+    expect(isApprovedPrivateOrigin(o('10.0.0.5', 9000), [])).toBe(false);
+    expect(isApprovedPrivateOrigin(o('10.0.0.5', 9000), undefined)).toBe(false);
+  });
+
+  it('refuses cloud metadata even when it appears in the approval list', () => {
+    // These hand out instance credentials; it is not a decision an owner gets to make.
+    expect(isApprovedPrivateOrigin(o('169.254.169.254', 80), ['https://169.254.169.254:80'])).toBe(false);
+    expect(isApprovedPrivateOrigin(o('100.100.100.200', 80), ['https://100.100.100.200:80'])).toBe(false);
+  });
+
+  it('lets an approved internal address resolve, and still blocks an unapproved one', async () => {
+    await expect(resolvePinned('10.0.0.5', true)).resolves.toMatchObject({ address: '10.0.0.5' });
+    await expect(resolvePinned('10.0.0.5', false)).rejects.toThrow(/internal or reserved/);
+  });
+
+  it('blocks metadata even when internal access was granted', async () => {
+    await expect(resolvePinned('169.254.169.254', true)).rejects.toThrow(/metadata/);
   });
 });
