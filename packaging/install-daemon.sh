@@ -65,6 +65,49 @@ fi
 case "$EXEC" in /*) ;; *) EXEC=$(CDPATH= cd -- "$(dirname -- "$EXEC")" && pwd)/$(basename -- "$EXEC") ;; esac
 [ -x "$EXEC" ] || { echo "Not executable: $EXEC" >&2; exit 1; }
 
+# Resolve symlinks BEFORE the ProtectHome check. `npm install -g` into a user prefix
+# leaves ~/.local/bin/wundervault-agent pointing at ~/.local/lib/node_modules/..., so a
+# path that looks fine can still land the real file under /home.
+REAL_EXEC=$(readlink -f "$EXEC" 2>/dev/null || echo "$EXEC")
+
+# ProtectHome=yes makes /home, /root and /run/user empty FOR THIS SERVICE. An ExecStart
+# under any of them does not fail at install time — it fails at start with 203/EXEC, after
+# the account and the state directory already exist, and the message points at the binary
+# rather than at the sandbox that hid it. Node resolves its package directory at runtime
+# too, so a launcher outside /home whose library sits inside it fails the same way, one
+# step later and even less legibly. Refuse both here, where the fix is still cheap.
+for CANDIDATE in "$EXEC" "$REAL_EXEC"; do
+  case "$CANDIDATE" in
+    /home/*|/root/*|/run/user/*)
+      echo "ERROR: $CANDIDATE is inside a home directory." >&2
+      # A plain `a && b` list here would return non-zero whenever the symlink note does
+      # not apply, and `set -e` would take that as a failure and exit before the
+      # explanation below ever printed — leaving only "ERROR:" and no way forward.
+      if [ "$CANDIDATE" = "$REAL_EXEC" ] && [ "$EXEC" != "$REAL_EXEC" ]; then
+        echo "       (reached via the symlink $EXEC)" >&2
+      fi
+      cat >&2 <<EOM
+The unit sets ProtectHome=yes, which makes /home invisible to the service, so this
+would install cleanly and then fail to start with status=203/EXEC.
+
+Install the package somewhere the service can see it:
+
+  sudo npm install -g --prefix /usr/local @wundervault/mcp-server
+  sudo sh $0 --exec /usr/local/bin/wundervault-agent
+
+ProtectHome is not negotiable here: it is what stops the daemon reading the home
+directories of the agents it holds credentials for.
+
+And no, this cannot be solved by bind-mounting the path back in. A directory under your
+home is WRITABLE by everything that runs as you, agents included — so the daemon would be
+executing code its own agents can replace. That is a worse hole than the one this whole
+step exists to close: it would hand over not just the credentials but the process that
+guards them. The package has to live somewhere the agent cannot write.
+EOM
+      exit 1 ;;
+  esac
+done
+
 UNIT_SRC="${HERE}/${UNIT_NAME}"
 [ -f "$UNIT_SRC" ] || { echo "Missing unit template: $UNIT_SRC" >&2; exit 1; }
 

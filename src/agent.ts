@@ -33,6 +33,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { VERSION } from './version.js';
+import { redeemSetupLink } from './enrol.js';
 import {
   systemRoot, profilesPath, saltPath, mgmtSocketPath, agentSocketPath,
   runtimeDir, ensureSystemRoot, safeName, SYSTEM_ACCOUNT, mgmtDir, networkStorePath,
@@ -130,14 +131,44 @@ export function tokenMatches(provided: string | undefined, expected: string | un
  * produce is its own denial of service. A short lockout costs a legitimate agent one
  * retry after a genuine misconfiguration.
  */
+/**
+ * Make guessing expensive without letting a guesser deny the real agent.
+ *
+ * The first shape of this was a lockout: ten bad tokens for an agent name and that name
+ * was refused for sixty seconds. Behind a 0600 socket that was defensible. It is not
+ * defensible now — this phase made the per-agent sockets world-connectable, because the
+ * daemon is a different uid and a 0600 socket it owns is one no agent could reach. So any
+ * local process could send ten wrong tokens and take the LEGITIMATE agent off the air,
+ * repeatedly, for as long as it liked. The mechanism meant to slow an attacker down had
+ * become the cheapest attack available, and this phase is what introduced it.
+ *
+ * The rule now: a correct token is ALWAYS served. Nothing an attacker sends can change
+ * what the holder of the real token gets back. The cost falls on the failing caller
+ * instead, as a delay that doubles per consecutive failure — which is what actually
+ * throttles guessing, since it is the attacker's own connection that has to wait.
+ *
+ * The delay is per agent name, and that is a deliberate, stated limit: a unix socket
+ * carries no address to attribute failures to, and Node exposes no SO_PEERCRED to
+ * identify the caller. So a persistent guesser does slow down a legitimate client that
+ * is ALSO failing — but a legitimate client that is failing has the wrong token, and
+ * telling it so a second later costs nothing.
+ */
 class Knocks {
   private fails = new Map<string, { n: number; until: number }>();
-  private readonly MAX = 10;
   private readonly WINDOW_MS = 60_000;
+  // Overridable so the tests can exercise the growth curve without sitting through it.
+  // Production values are the defaults; nothing in the shipped path sets these.
+  private readonly BASE_DELAY_MS = Number(process.env.WUNDERVAULT_KNOCK_BASE_MS) || 50;
+  private readonly MAX_DELAY_MS = Number(process.env.WUNDERVAULT_KNOCK_MAX_MS) || 2_000;
 
-  lockedOut(name: string): boolean {
+  /**
+   * How long to make a FAILING caller wait. Never consulted before a token is checked:
+   * a valid token must not be delayed or refused because somebody else guessed wrong.
+   */
+  penaltyMs(name: string): number {
     const f = this.fails.get(name);
-    return !!f && f.n >= this.MAX && Date.now() < f.until;
+    if (!f || Date.now() >= f.until) return 0;
+    return Math.min(this.BASE_DELAY_MS * 2 ** Math.min(f.n, 16), this.MAX_DELAY_MS);
   }
 
   record(name: string): void {
@@ -145,6 +176,9 @@ class Knocks {
     const f = this.fails.get(name);
     if (!f || now >= f.until) { this.fails.set(name, { n: 1, until: now + this.WINDOW_MS }); return; }
     f.n += 1;
+    // Sliding, not fixed: a guesser that keeps knocking keeps paying, rather than
+    // getting a clean slate sixty seconds after its first attempt.
+    f.until = now + this.WINDOW_MS;
   }
 
   clear(name: string): void { this.fails.delete(name); }
@@ -163,17 +197,52 @@ class AgentDaemon {
     this.loadProfiles();
   }
 
+  /**
+   * A store we could not read is NOT an empty store.
+   *
+   * This used to log the failure and carry on with `this.profiles` still `[]`. The daemon
+   * would come up serving nobody, which looks like a bad day — and then the first
+   * enrolment called saveProfiles(), which wrote a store containing ONLY that profile,
+   * over the ciphertext holding every other agent's credentials. A recoverable problem
+   * (a changed /etc/machine-id, a recreated wundervault account, a damaged file — all of
+   * which leave the plaintext retrievable) became permanent loss, silently.
+   *
+   * So a decrypt failure is now a refusal: the daemon will not serve and will not save
+   * until a person has looked at it. Refusing to start is a visible, reversible failure.
+   * Overwriting is neither.
+   */
+  private unreadableStore: string | null = null;
+
   loadProfiles(): void {
     const pp = profilesPath();
-    if (!fs.existsSync(pp)) return;
+    if (!fs.existsSync(pp)) { this.unreadableStore = null; return; }
     try {
       this.profiles = decryptProfiles(fs.readFileSync(pp), this.key).profiles;
+      this.unreadableStore = null;
     } catch (err) {
-      console.error('[wundervault-agent] Failed to decrypt profiles:', (err as Error).message);
+      this.unreadableStore = (err as Error).message;
+      this.profiles = [];
+      console.error(
+        `[wundervault-agent] Could not read the profile store at ${pp}: ${this.unreadableStore}\n` +
+        `[wundervault-agent] It is encrypted against this machine's id and the daemon's uid.\n` +
+        `[wundervault-agent] REFUSING to serve or to overwrite it. The credentials are still\n` +
+        `[wundervault-agent] in that file; starting fresh would destroy them. Restore the file,\n` +
+        `[wundervault-agent] or move it aside deliberately if you mean to start over.`,
+      );
     }
   }
 
+  /** True when the store exists but could not be read. Nothing may be written in this state. */
+  get storeUnreadable(): boolean { return this.unreadableStore !== null; }
+
   saveProfiles(): void {
+    if (this.unreadableStore) {
+      throw new Error(
+        `Refusing to write the profile store: it exists but could not be decrypted ` +
+        `(${this.unreadableStore}). Writing now would replace every credential in it ` +
+        `with only what is in memory.`,
+      );
+    }
     const pp = profilesPath();
     // Write-then-rename. A half-written store read after a crash decrypts to nothing and
     // every agent on the machine loses its credentials at once.
@@ -188,6 +257,17 @@ class AgentDaemon {
     // connect to, so "../../etc/cron.d/x" would otherwise have this daemon place a file
     // wherever it liked — which for the process holding the boundary is the whole game.
     profile.agent_name = safeName(profile.agent_name);
+
+    // Refuse before touching anything. Saving first was not enough on its own: by the time
+    // saveProfiles() threw, the in-memory list had already been rewritten and the previous
+    // agent's socket closed, so a rejected enrolment still took a working agent off the
+    // air. The state a failure leaves behind has to be the state it started from.
+    if (this.storeUnreadable) {
+      throw new Error(
+        `Refusing to enrol while the profile store cannot be read. Writing now would ` +
+        `replace every credential in it with only what is in memory.`,
+      );
+    }
 
     if (!profile.socket_token) {
       throw new Error(
@@ -211,8 +291,12 @@ class AgentDaemon {
       this.profiles.push(profile);
     }
     this.knocks.clear(profile.agent_name);
-    this.startAgentSocket(profile);
+    // Saved BEFORE the socket is published. The other order started serving credentials
+    // and then threw on save, so a daemon that had just declared it would not write to an
+    // unreadable store was nonetheless handing out a profile it had not committed —
+    // refusing the caller while serving the agent. Commit first; publish only if it stuck.
     this.saveProfiles();
+    this.startAgentSocket(profile);
   }
 
   removeProfile(name: string): boolean {
@@ -236,28 +320,42 @@ class AgentDaemon {
       let buf = '';
       // A caller that never sends a newline would otherwise hold a connection open for
       // ever, and a caller that streams without one would grow this buffer without bound.
+      // Inactivity timeout AND an absolute one. The inactivity timer alone is resettable
+      // by any traffic, which is what let a connection be held open indefinitely.
       socket.setTimeout(5_000, () => socket.destroy());
+      const deadline = setTimeout(() => socket.destroy(), 10_000);
+      (deadline as unknown as { unref?: () => void }).unref?.();
+      socket.on('close', () => clearTimeout(deadline));
       socket.on('data', (d) => {
         buf += d.toString();
         if (buf.length > 4096) { socket.destroy(); return; }
         if (!buf.includes('\n')) return;
 
-        if (this.knocks.lockedOut(profile.agent_name)) {
-          socket.write(JSON.stringify({ error: 'unauthorized' }) + '\n');
-          socket.end();
-          return;
-        }
-
         let msg: { token?: string } = {};
         try { msg = JSON.parse(buf.trim()); } catch { /* treated as no token */ }
 
+        // The token is checked FIRST, before any penalty is consulted. The previous order
+        // let a stranger's wrong guesses decide what the real agent got back.
         if (!tokenMatches(msg.token, profile.socket_token)) {
+          const wait = this.knocks.penaltyMs(profile.agent_name);
           this.knocks.record(profile.agent_name);
-          // The same answer for a bad token, a missing token and a lockout. Anything more
-          // specific tells a local prober which agent names exist on this machine.
-          socket.write(JSON.stringify({ error: 'unauthorized' }) + '\n');
-          socket.end();
           console.error(`[wundervault-agent] Auth failure on ${profile.agent_name} socket`);
+          // The same answer for a bad token and a missing one. Anything more specific
+          // tells a local prober which agent names exist on this machine.
+          const refuse = () => {
+            try {
+              socket.write(JSON.stringify({ error: 'unauthorized' }) + '\n');
+              socket.end();
+            } catch { /* the prober hung up while waiting, which is fine */ }
+          };
+          if (wait > 0) {
+            const t = setTimeout(refuse, wait);
+            // Do not hold the event loop open on behalf of someone guessing tokens.
+            (t as unknown as { unref?: () => void }).unref?.();
+            socket.on('close', () => clearTimeout(t));
+          } else {
+            refuse();
+          }
           return;
         }
 
@@ -272,6 +370,17 @@ class AgentDaemon {
       socket.on('error', () => { /* a client that hangs up is not an event */ });
     });
 
+    // NO maxConnections here, deliberately — the second version of this code had one, and
+    // it recreated the denial of service it was meant to prevent one layer down. A ceiling
+    // of 64 means 64 held connections exclude everyone else, and the legitimate agent's
+    // connection is dropped by the kernel BEFORE its token is ever read. Holding them was
+    // easy: setTimeout() is an INACTIVITY timeout, so a byte every few seconds reset it
+    // indefinitely, and the 4096-byte ceiling took hours to reach at that rate.
+    //
+    // What bounds the resource is the absolute deadline below instead: a connection dies a
+    // fixed time after it was accepted, whatever it sends. Slots cannot be held, so they
+    // do not need to be rationed, and nothing an attacker does can make the daemon refuse
+    // a connection it has not yet authenticated.
     srv.listen(sockPath, () => {
       // World-connectable BY DESIGN — see the header. The daemon is a different uid from
       // every agent, so a mode that excluded others would exclude the agent too. The
@@ -290,8 +399,8 @@ class AgentDaemon {
     // listen leaves a window in which the socket is bound at the default mode and a
     // process watching for it can connect; a 0770 directory has no such window.
     const md = mgmtDir();
-    fs.mkdirSync(md, { recursive: true, mode: 0o770 });
-    fs.chmodSync(md, 0o770);
+    fs.mkdirSync(md, { recursive: true, mode: 0o755 });
+    fs.chmodSync(md, 0o755);
     try { fs.unlinkSync(mp); } catch { /* nothing to clear */ }
 
     const mgmt = net.createServer((socket) => {
@@ -307,49 +416,82 @@ class AgentDaemon {
 
         try {
           const msg = JSON.parse(buf.slice(0, nl));
-          if (msg.action === 'register_profile' && msg.profile) {
-            this.registerProfile(msg.profile as AgentProfile);
-            socket.write(JSON.stringify({ ok: true }) + '\n');
+          if (msg.action === 'enrol' && msg.setup_url) {
+            // The ONLY way a profile gets in. `register_profile` used to live here and
+            // took whatever it was handed: any local process — every agent on this
+            // machine included, since they run as the owner — could register a name with
+            // a token of its choosing and then read that agent's credentials off its own
+            // socket. No local permission could fix that, because the kernel cannot tell
+            // the owner's shell from an agent running as the owner.
+            //
+            // A setup link can. It is issued by the server to someone logged in to the
+            // website, it is single-use, and it expires in fifteen minutes. An agent
+            // cannot obtain one. So the daemon redeems it ITSELF: the caller hands over a
+            // URL and learns a name, and the credentials never exist in the asking
+            // process at all.
+            void (async () => {
+              try {
+                const creds = await redeemSetupLink(String(msg.setup_url));
+                if (!msg.socket_token || String(msg.socket_token).length < 32) {
+                  throw new Error('An enrolment must carry a socket_token of at least 32 characters.');
+                }
+                this.registerProfile({
+                  agent_name: creds.agent_name,
+                  api_key: creds.api_key,
+                  enc_key: creds.enc_key,
+                  vault_url: creds.vault_url,
+                  socket_token: String(msg.socket_token),
+                } as AgentProfile);
+                socket.write(JSON.stringify({
+                  ok: true, agent_name: creds.agent_name, agent_id: creds.agent_id,
+                }) + '\n');
+              } catch (e) {
+                socket.write(JSON.stringify({ error: (e as Error).message }) + '\n');
+              }
+              socket.end();
+            })();
+            return;   // the async path owns this socket from here
           } else if (msg.action === 'remove_profile' && msg.agent_name) {
-            const gone = this.removeProfile(String(msg.agent_name));
+            // Gated on the agent's own token. The socket is world-connectable now, so
+            // without this any local user could delete another user's agents. It does NOT
+            // distinguish one agent from another under the same uid — nothing can, and
+            // the spec says so in C5 — but it does stop everyone else.
+            const name = String(msg.agent_name);
+            const target = this.profiles.find(p => p.agent_name === name);
+            if (!target || !tokenMatches(msg.token, target.socket_token)) {
+              socket.write(JSON.stringify({ error: 'unauthorized' }) + '\n');
+              socket.end();
+              return;
+            }
+            const gone = this.removeProfile(name);
             socket.write(JSON.stringify({ ok: true, removed: gone }) + '\n');
           } else if (msg.action === 'reload') {
             this.loadProfiles();
             socket.write(JSON.stringify({ ok: true, count: this.profiles.length }) + '\n');
           } else if (msg.action === 'destinations') {
-            // The store is daemon-owned now, so the user who wants to READ it cannot.
-            // Serving it here is what keeps `--destinations` working after the split —
-            // and the alternative, letting the client read the file directly, is the
-            // access this phase exists to remove.
-            //
-            // Not gated on a token: this is the owner's own record of their own agents,
-            // reachable only through the 0770 management directory, and refusing to show
-            // someone where their keys went would make the boundary a cage rather than a
-            // wall.
-            //
-            // `load()` swallows a read error and returns an empty shape, which is right
-            // for a vault call — one unreadable store must not break every request — and
-            // wrong here. Someone asking where their keys went would be shown "nowhere".
-            // The client was just fixed for exactly this; the same lie one level down is
-            // no better, so the readability check happens before the load.
-            const sp = networkStorePath();
-            let readable = true;
-            if (fs.existsSync(sp)) {
-              try { fs.accessSync(sp, fs.constants.R_OK); } catch { readable = false; }
-            }
-            if (!readable) {
-              socket.write(JSON.stringify({
-                error: `the daemon cannot read its own store at ${sp}. Check its owner and mode.`,
-              }) + '\n');
-            } else {
-              socket.write(JSON.stringify({
-                ok: true, shape: loadNetworkShape(), store: sp,
-              }) + '\n');
-            }
-          } else if (msg.action === 'ping') {
+            // Deliberately gone. It was served here while the socket sat behind a locked
+            // directory; that lock is off, because the owner and their agents are the same
+            // uid and any door the owner can open an agent can open too. Serving this now
+            // would hand every agent the record of where all the others sent secrets.
             socket.write(JSON.stringify({
-              ok: true, version: VERSION, system_root: systemRoot(),
-              agents: this.profiles.map(p => p.agent_name),
+              error: 'destinations are not served over this socket. Run: ' +
+                     'sudo wundervault-agent --destinations',
+            }) + '\n');
+          } else if (msg.action === 'ping') {
+            // Liveness only. This used to return every agent name on the machine, which
+            // is a roster of what holds credentials here, handed to anyone who could
+            // reach the socket. Migration is the only caller that needs the names, and it
+            // asks for them explicitly below.
+            socket.write(JSON.stringify({
+              ok: true, version: VERSION, store_unreadable: this.storeUnreadable,
+            }) + '\n');
+          } else if (msg.action === 'known_agents') {
+            // Names only, never credentials. This is what lets migration tell you which of
+            // your agents still need a repair link, and it is the reason the destination
+            // store is NOT served here any more: a roster of names is a much smaller thing
+            // to give away than the record of where every agent sent its secrets.
+            socket.write(JSON.stringify({
+              ok: true, agents: this.profiles.map(p => p.agent_name),
             }) + '\n');
           } else {
             socket.write(JSON.stringify({ error: 'unknown action' }) + '\n');
@@ -365,14 +507,11 @@ class AgentDaemon {
     });
 
     mgmt.listen(mp, () => {
-      // Belt as well as braces. The 0770 directory above is what actually gates this; the
-      // socket mode is set too so a misconfigured directory does not silently open it.
-      //
-      // The honest limit: group membership is coarse, and on Linux it is what 1Password
-      // settles for too. A finer check needs SO_PEERCRED, which Node does not expose, and
-      // a native addon would put a compiled binary inside a package whose selling point is
-      // that you can read it.
-      try { fs.chmodSync(mp, 0o660); } catch { /* best effort */ }
+      // Connectable by anyone, like the per-agent sockets, and for the same reason: the
+      // daemon is a different uid, so a socket it owns at 0660 is one no agent could
+      // reach. What guards the actions behind it is a server-issued setup link to enrol
+      // and the agent's own token to remove — neither of which a file mode can supply.
+      try { fs.chmodSync(mp, 0o666); } catch { /* best effort */ }
       console.log(`[wundervault-agent] Listening. Management: ${mp}`);
     });
     mgmt.on('error', (err) => {
@@ -433,28 +572,70 @@ if (invokedDirectly && !process.env.WUNDERVAULT_AGENT_NO_AUTOSTART) {
     console.log(`
 Wundervault agent daemon ${VERSION}
 
-Usage: wundervault-agent [--migrate [--dry-run]]
+Usage: wundervault-agent [--enrol <setup-link>] [--migrate [--finish]] [--destinations]
 
 With no arguments it runs as the daemon. It is normally started by systemd as the
 '${SYSTEM_ACCOUNT}' account, not by hand.
 
-  --migrate     Hand agents enrolled before the uid split over to the system daemon,
-                then delete the copy in your home directory. Run as YOUR user, no sudo.
-  --dry-run     With --migrate: say what would move, change nothing.
+  --enrol URL   Add an agent using a setup link from the dashboard. The daemon redeems
+                the link itself, so the credentials never pass through this process.
+                Quote the URL — it ends in a #fragment your shell would otherwise eat.
+  --migrate     Show which pre-split agents still need moving across, and how.
+  --finish      With --migrate: delete the pre-split store, once every agent is across.
+  --destinations  Write the page showing where your agents have sent secrets.
+                Needs sudo: the record belongs to the daemon so your agents cannot read it.
 
 State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
 `);
     process.exit(0);
   }
 
-  if (argv.includes('--migrate')) {
+  const enrolAt = argv.indexOf('--enrol');
+  if (enrolAt >= 0) {
+    // Runs as the USER. It hands over a URL and gets back a name — the credentials are
+    // fetched, decrypted and filed by the daemon, and never enter this process.
+    const url = argv[enrolAt + 1];
+    if (!url || url.startsWith('-')) {
+      console.error('--enrol needs the setup link from the dashboard, in quotes.');
+      process.exit(2);
+    }
+    const { enrol } = await import('./migrate.js');
+    enrol(url)
+      .then((r) => {
+        console.log(`Enrolled ${r.agent_name}. Its credentials are in ${systemRoot()}, ` +
+                    `which your agents cannot read.`);
+        process.exit(0);
+      })
+      .catch((e: Error) => { console.error(e.message); process.exit(1); });
+  } else if (argv.includes('--migrate')) {
     // Runs as the USER, not the daemon: it reads the old store from a home directory the
     // daemon deliberately cannot reach.
-    const { migrate, describe } = await import('./migrate.js');
-    const dryRun = argv.includes('--dry-run');
-    migrate({ dryRun })
-      .then((r) => { console.log(describe(r, dryRun)); process.exit(0); })
-      .catch((e: Error) => { console.error(e.message); process.exit(1); });
+    const { status, describeStatus, cleanup } = await import('./migrate.js');
+    if (argv.includes('--finish')) {
+      cleanup()
+        .then((r) => {
+          if (r.pending.length) {
+            console.error(`Not yet — these are still on the old credentials: ${r.pending.join(', ')}`);
+            console.error('Deleting the store now would take them off the air for good.');
+            process.exit(1);
+          }
+          console.log(r.deleted
+            ? 'Deleted the pre-split store. Credentials now live where your agents cannot read them.'
+            : 'There was no pre-split store to delete.');
+          if (!r.oldUnitStopped) {
+            console.log('');
+            console.log('The pre-split daemon may still be running. It is serving credentials the');
+            console.log('server no longer accepts, but it should not be left behind:');
+            console.log('  systemctl --user disable --now wundervault-agent.service');
+          }
+          process.exit(0);
+        })
+        .catch((e: Error) => { console.error(e.message); process.exit(1); });
+    } else {
+      status()
+        .then((st) => { console.log(describeStatus(st)); process.exit(0); })
+        .catch((e: Error) => { console.error(e.message); process.exit(1); });
+    }
   } else {
     refuseRoot();
     const daemon = new AgentDaemon();

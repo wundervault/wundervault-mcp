@@ -1,0 +1,218 @@
+{
+  "verdict": "revise",
+  "summary": "The build moves daemon state and sockets toward the required system-account boundary, adds IPC migration, and includes the requested systemd hardening. It does not hold up on a real split install: the normal user cannot reach the management socket, setup-token authorization is absent, migration can delete a valid source based only on an agent-name collision, and the old same-UID daemon is not visibly retired.",
+  "spec_check": [
+    {
+      "requirement": "Everything in phases 1\u20133.5 is careful handling.",
+      "status": "partial",
+      "evidence": "The supplied diffs preserve the existing broker paths, but most of server.ts, index.ts, log-viewer.ts, and network-store.ts is withheld, so regressions outside the shown changes cannot be assessed."
+    },
+    {
+      "requirement": "The daemon refuses to start as root.",
+      "status": "met",
+      "evidence": "src/agent.ts calls refuseRoot() on the direct daemon path, and refuseRoot exits with status 1 when getuid() is 0."
+    },
+    {
+      "requirement": "Running as wundervault, the agent's uid cannot read /var/lib/wundervault.",
+      "status": "partial",
+      "evidence": "The installer chowns the directory to wundervault and sets mode 0700, while the unit runs as User=wundervault; however, this has only been tested under one UID and the old same-UID daemon is not removed by the shown migration or installer."
+    },
+    {
+      "requirement": "An agent with a valid token connects and retrieves its credentials.",
+      "status": "met",
+      "evidence": "The per-agent server uses tokenMatches() before returning credentials, and the real-socket test retrieves a profile using its token."
+    },
+    {
+      "requirement": "An agent with a wrong token is refused, and the refusal does not reveal whether the name exists.",
+      "status": "unmet",
+      "evidence": "A known name has a visible /run/wundervault/<name>.sock and returns an unauthorized JSON response, while an unknown name has no socket and produces ENOENT; the test claiming equivalence never attempts an unknown name."
+    },
+    {
+      "requirement": "Repeated bad tokens are rate-limited rather than served indefinitely.",
+      "status": "unmet",
+      "evidence": "Knocks locks authentication after ten failures, but the lockedOut branch continues accepting and immediately answering every subsequent connection without delay or request-rate control."
+    },
+    {
+      "requirement": "Enrolment through the management socket creates a usable profile.",
+      "status": "unmet",
+      "evidence": "It works in same-UID tests, but on the packaged install the management directory and socket are 0770/0660 and owned by wundervault:wundervault, while the installer never adds the invoking user to that group."
+    },
+    {
+      "requirement": "Enrolment without a valid setup token is refused.",
+      "status": "unmet",
+      "evidence": "register_profile contains no setup-token field, validation, server exchange, expiration check, or single-use handling; any caller able to reach the management socket can submit a profile directly."
+    },
+    {
+      "requirement": "The installer fails loudly when the daemon is absent, and writes no fallback file.",
+      "status": "met",
+      "evidence": "migrate() pings the management socket before reading, writing, or deleting migration state and throws an installation/status error if the ping fails."
+    },
+    {
+      "requirement": "Migration moves profiles, deletes the old store, and keeps the agent tokens.",
+      "status": "partial",
+      "evidence": "The happy-path migration registers profiles, writes missing token files, and shreds the legacy profile and salt files, but it treats a matching agent name as proof that the correct profile is already present and can therefore delete the only correct source."
+    },
+    {
+      "requirement": "Migration run twice leaves the same state as once.",
+      "status": "partial",
+      "evidence": "The tested successful second run returns alreadyDone, but existing same-name profiles and mismatched token files are not reconciled before the legacy source is deleted."
+    },
+    {
+      "requirement": "The destination store lives under /var/lib/wundervault and the agent's uid cannot write it.",
+      "status": "partial",
+      "evidence": "networkStorePath resolves under systemRoot and the installer configures /var/lib/wundervault as 0700 owned by the system account, but no test actually runs the writer and attempted agent access under different UIDs."
+    },
+    {
+      "requirement": "--destinations still works for a user who cannot read the store directly.",
+      "status": "unmet",
+      "evidence": "collectShape correctly asks the daemon, but the installed normal user cannot traverse the wundervault-owned 0770 management directory and therefore cannot make the destinations request."
+    },
+    {
+      "requirement": "The unit file contains every hardening directive in E2.",
+      "status": "met",
+      "evidence": "packaging/wundervault-agent.service includes NoNewPrivileges, an empty CapabilityBoundingSet, ProtectSystem=strict, ProtectHome, PrivateTmp, RestrictSUIDSGID, the required address families, MemoryDenyWriteExecute, LockPersonality, ProtectProc=invisible, and LimitCORE=0."
+    },
+    {
+      "requirement": "ReadWritePaths=/var/lib/wundervault and nothing else writable.",
+      "status": "met",
+      "evidence": "The unit contains the specified ReadWritePaths entry; systemd-managed runtime and private temporary directories remain the expected transient exceptions."
+    },
+    {
+      "requirement": "RuntimeDirectory=wundervault so the socket directory is created and cleaned up by systemd.",
+      "status": "met",
+      "evidence": "The system unit declares RuntimeDirectory=wundervault and RuntimeDirectoryMode=0755."
+    },
+    {
+      "requirement": "The old systemctl --user unit is disabled and removed.",
+      "status": "unmet",
+      "evidence": "Neither packaging/install-daemon.sh nor src/migrate.ts disables or removes the user unit; onboard.py is withheld, so it is possible but not demonstrated that the missing action exists there."
+    },
+    {
+      "requirement": "Nothing in the codebase resolves daemon state through os.homedir() any more.",
+      "status": "partial",
+      "evidence": "All shown daemon-state paths use systemRoot(), while os.homedir() remains only in userRoot() for agent-side state; full versions of several files and onboard.py were withheld, so the entire codebase cannot be verified."
+    },
+    {
+      "requirement": "Not curl | sudo sh.",
+      "status": "met",
+      "evidence": "The privileged script performs no download and installs a local unit template."
+    },
+    {
+      "requirement": "Either ship a repo, or verify a detached signature explicitly before installing.",
+      "status": "partial",
+      "evidence": "The privileged script installs no downloaded package, but the unprivileged package acquisition and verification path is in the withheld onboard.py repository."
+    },
+    {
+      "requirement": "The privileged step is printed in full before it runs, and is re-runnable.",
+      "status": "partial",
+      "evidence": "The script is designed to be re-runnable and prints a four-item summary, but the shown code does not print the full privileged command or script before privileged execution; an outer installer that might do so is withheld."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "packaging/wundervault-agent.service",
+      "line": null,
+      "claim": "A normal enrolled user cannot reach the management socket on a real split install because its containing directory is 0770 wundervault:wundervault and the installer grants the user no group access.",
+      "failure_scenario": "Install as user alice with the generated wundervault system account, then run wundervault-agent --migrate or --destinations as alice; traversal of /run/wundervault/mgmt is denied, so migration and destination viewing fail even though both pass the same-UID tests.",
+      "suggested_direction": "Make the management transport reachable by the intended unprivileged caller and authorize each sensitive operation in the protocol rather than relying on membership in an ungranted daemon group."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "The daemon accepts register_profile without receiving or validating a server-issued setup token, so B2, B3, and acceptance check 7 are not implemented.",
+      "failure_scenario": "If alice is placed in the wundervault group to overcome the current socket-permission failure, alice can send {\"action\":\"register_profile\",\"profile\":...} with no setup token and the daemon immediately stores and serves it; an expired or already-used setup token is indistinguishable because no token is examined.",
+      "suggested_direction": "Carry the server-issued setup token in the enrolment request, have the daemon validate the one-time server authorization, and ensure neither successful validation nor any local credential becomes reusable enrolment authority."
+    },
+    {
+      "id": "F3",
+      "severity": "blocker",
+      "file": "src/migrate.ts",
+      "line": null,
+      "claim": "Migration treats a matching agent name from ping as proof that the correct profile is already present and may delete the only correct legacy profile without checking credentials or token identity.",
+      "failure_scenario": "The new daemon contains agent A with token X and stale credentials, while the legacy store and A.token contain token Y and the current credentials; migrate() sees A in ping.agents, skips registration as already known, marks all profiles across, shreds the legacy store, and leaves A permanently unauthorized with the old correct credential source gone.",
+      "suggested_direction": "Make migration idempotently submit or reconcile every source profile, or compare a non-secret profile identity/fingerprint returned by the daemon, and delete the source only after the daemon confirms the exact profile and token being migrated are usable."
+    },
+    {
+      "id": "F4",
+      "severity": "blocker",
+      "file": "packaging/install-daemon.sh",
+      "line": null,
+      "claim": "Unless the withheld onboard.py performs it, no shown installation or migration path disables and removes the old user service required by F2.",
+      "failure_scenario": "On the owner's machine the old systemctl --user daemon remains running after the system service is installed and profiles are migrated; the agent UID can still read that old daemon's credential-bearing memory through same-UID process access, so the advertised boundary is not established even if clients prefer the new socket.",
+      "suggested_direction": "Add an explicit, idempotent migration step that stops, disables, and removes the old user unit and verifies that no old daemon remains before claiming migration complete."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "Per-agent socket existence reveals whether an agent name exists, contradicting the required indistinguishable refusal.",
+      "failure_scenario": "A local user checks /run/wundervault/A.sock and /run/wundervault/Unknown.sock or connects to both; A is visible and answers unauthorized, while Unknown is absent and returns ENOENT, directly disclosing which name is registered.",
+      "suggested_direction": "Use a connection shape in which both known and unknown names reach the same responder and produce the same externally observable failure, and avoid exposing registered names as directory entries."
+    },
+    {
+      "id": "F6",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "Knocks implements a credential lockout rather than a connection rate limit, so bad-token connections continue to be accepted and answered indefinitely.",
+      "failure_scenario": "A local process opens thousands of sequential connections to A.sock with a wrong token; after the tenth attempt, every later connection still gets an immediate unauthorized response, consuming accept-loop and socket resources without delay, quota, or backpressure.",
+      "suggested_direction": "Apply an actual bounded request or connection rate policy, including during lockout and for clients that do not complete a request, while avoiding a policy that merely shifts the cost into an unlimited fast rejection loop."
+    },
+    {
+      "id": "F7",
+      "severity": "major",
+      "file": "src/migrate.ts",
+      "line": null,
+      "claim": "Migration does not verify or repair the mode and ownership of an existing token file even though that file is now the load-bearing identity.",
+      "failure_scenario": "~/.wundervault/agents/A.token already exists with mode 0644 and matches the legacy profile; migrate() leaves it unchanged, publishes A.sock as 0666, and another local user reads the token and retrieves A's credentials.",
+      "suggested_direction": "Before registering or retaining a token, require a regular file owned by the migrating user with mode 0600, repairing safe ownership/mode errors or refusing migration loudly when the path is unsafe."
+    },
+    {
+      "id": "F8",
+      "severity": "major",
+      "file": "packaging/install-daemon.sh",
+      "line": null,
+      "claim": "The installer accepts an executable under a user's home even though ProtectHome=yes makes that executable or its Node package dependencies inaccessible to the service.",
+      "failure_scenario": "A user installs the npm package into ~/.local or an nvm prefix and runs sudo sh packaging/install-daemon.sh --exec /home/alice/.local/bin/wundervault-agent; the root-side executable check passes, but systemd hides /home under ProtectHome and the service fails to execute or load its package.",
+      "suggested_direction": "Validate that the resolved executable and all required package files are in a system-service-readable location compatible with the sandbox, or install a verified immutable copy into such a location during the accepted privileged step."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The final daemon-absent migration test resolves legacy.profiles() to the reviewer's real home because WUNDERVAULT_USER_ROOT is unset.",
+      "why_it_matters": "The current ping-first ordering prevents deletion, but a future test fixture that unexpectedly creates that socket or a harmless-looking reordering could shred the live credential store; destructive tests should fail before execution unless the resolved source is explicitly inside the scratch root."
+    },
+    {
+      "id": "B2",
+      "concern": "No test launches the installed unit with two real UIDs and the actual systemd sandbox.",
+      "why_it_matters": "Same-UID tests cannot detect management-directory denial, unreadable home-based executables, wrong ownership, supplementary-group behavior, /proc isolation, or whether the agent really lacks read and write access to /var/lib/wundervault."
+    },
+    {
+      "id": "B3",
+      "concern": "The bad-token lockout lets any local user deny credentials to a known agent for repeated 60-second windows.",
+      "why_it_matters": "An attacker can send ten bad tokens per minute and keep the legitimate agent locked out indefinitely; the test currently treats refusal of the correct token as proof of success rather than checking availability under hostile traffic."
+    },
+    {
+      "id": "B4",
+      "concern": "A profile-store decryption failure is logged but the daemon starts with an empty in-memory store and remains willing to save.",
+      "why_it_matters": "If /etc/machine-id changes, the wundervault UID is recreated, or the ciphertext is damaged, the next successful enrolment overwrites agent-profiles.enc with only the new in-memory profiles, converting a recoverable key mismatch or corruption incident into loss of all previous profiles."
+    },
+    {
+      "id": "B5",
+      "concern": "Agent names and sockets are machine-global even though real Linux machines may have multiple human users.",
+      "why_it_matters": "Two users enrolling the same agent name target the same daemon profile and /run socket; one enrolment replaces the other's credentials and token, causing cross-user lockout or unintended credential reassignment unless machine-global uniqueness is explicitly enforced."
+    }
+  ],
+  "_meta": {
+    "round": 11,
+    "at": "2026-09-15T19:18:01+00:00",
+    "package_bytes": 101341,
+    "schema_problems": []
+  }
+}

@@ -273,63 +273,48 @@ export function writeViewer(storePath = defaultStorePath(), outPath?: string,
 
 
 /**
- * Get the destinations, from wherever they can honestly be got.
+ * Get the destinations — by reading the file, as root.
  *
- * After the uid split the store belongs to the daemon and the person running this cannot
- * read it. That is the boundary working. But `load()` swallows a read error and returns
- * an empty shape — which would render a page saying this machine's agents have never sent
- * a secret anywhere, to someone who is looking precisely because they want to know. A
- * wrong answer delivered confidently is worse than an error.
+ * This used to ask the daemon over the management socket. That worked while the socket sat
+ * behind a locked directory, and stopped being safe the moment the lock came off: the
+ * socket is world-connectable now, because the authorisation for enrolment moved to the
+ * server-issued setup link and a directory mode that keeps agents out keeps the OWNER out
+ * too — they are the same uid. Anything served on that socket is served to every agent on
+ * the machine.
  *
- * So: ask the daemon first, fall back to reading the file, and if neither works say which
- * one failed rather than showing an empty table.
+ * A roster of agent names is a small thing to hand over. The destination store is not: it
+ * is the record of where all of this machine's agents have sent secrets, and one agent
+ * reading the others' history is exactly the cross-agent leak the store exists to make
+ * visible. It is also, per the spec's D3, an integrity control — the party being audited
+ * must not be able to read, and thereby learn to work around, the audit.
+ *
+ * So there is no network path to it. The file belongs to the daemon's account at 0700, and
+ * reading it means being root. That costs the owner one `sudo` to see their own record,
+ * and it costs an agent everything, which is the right way round.
+ *
+ * `load()` is not called on the failure path: it swallows a read error and returns an
+ * empty shape, which would render a page telling someone their agents have never sent a
+ * secret anywhere — to the person looking precisely because they want to know.
  */
 export async function collectShape(
   storePath = defaultStorePath(),
 ): Promise<{ shape: NetworkShape; source: 'daemon' | 'file' }> {
-  let daemonSaid: string | null = null;
-  const viaDaemon = await askDaemon().catch((e: Error) => {
-    // Distinguish "no daemon there" from "the daemon says something is wrong". The first
-    // is a fallback; the second is the answer.
-    if (!/ENOENT|ECONNREFUSED|timed out/.test(e.message)) daemonSaid = e.message;
-    return null;
-  });
-  if (viaDaemon) return { shape: viaDaemon, source: 'daemon' };
-  if (daemonSaid) throw new Error(daemonSaid);
-
   try {
     accessSync(storePath, constants.R_OK);
   } catch {
+    const uid = (process as unknown as { getuid?: () => number }).getuid?.();
     throw new Error(
-      `Cannot read the destination log, and the daemon did not answer.\n` +
-      `  store:  ${storePath} (not readable by you — this is the uid split working)\n` +
-      `  daemon: ${mgmtSocketPath()}\n` +
-      `Start it:  sudo systemctl start wundervault-agent\n` +
+      `Cannot read the destination log.\n` +
+      `  store: ${storePath}\n` +
+      (uid === 0
+        ? `You are root and still cannot read it. Check the file's owner and mode — it\n` +
+          `should belong to the wundervault account at 0700.\n`
+        : `It belongs to the daemon's own account, which is what stops your agents\n` +
+          `reading where every other agent has sent its secrets.\n\n` +
+          `  sudo wundervault-agent --destinations\n`) +
       `Refusing to show you an empty page, which is what this used to do.`,
     );
   }
   return { shape: load(storePath), source: 'file' };
 }
 
-function askDaemon(timeoutMs = 3_000): Promise<NetworkShape | null> {
-  return new Promise((resolve, reject) => {
-    const sock = net.createConnection(mgmtSocketPath());
-    let buf = '';
-    const fin = (fn: () => void) => { clearTimeout(timer); sock.destroy(); fn(); };
-    const timer = setTimeout(() => fin(() => reject(new Error('daemon timed out'))), timeoutMs);
-    sock.on('connect', () => sock.write(JSON.stringify({ action: 'destinations' }) + '\n'));
-    sock.on('data', (d) => {
-      buf += d.toString();
-      if (!buf.includes('\n')) return;
-      try {
-        const reply = JSON.parse(buf.trim());
-        // A daemon that answered with an error has told us something worth repeating.
-        // Treating it as "no answer" would fall through to the file and, if that happened
-        // to be readable, quietly disagree with the daemon about what the truth is.
-        if (reply?.error) { fin(() => reject(new Error(String(reply.error)))); return; }
-        fin(() => resolve(reply?.ok && reply.shape ? reply.shape as NetworkShape : null));
-      } catch { fin(() => reject(new Error('unparseable reply'))); }
-    });
-    sock.on('error', (e) => fin(() => reject(e)));
-  });
-}

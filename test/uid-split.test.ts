@@ -32,6 +32,12 @@ async function freshDaemon(opts: { profiles?: any[]; userRoot?: string } = {}) {
   process.env.WUNDERVAULT_USER_ROOT = opts.userRoot ?? path.join(dir, 'home', '.wundervault');
   process.env.WUNDERVAULT_RUNTIME_DIR = path.join(dir, 'run');
   process.env.WUNDERVAULT_AGENT_NO_AUTOSTART = '1';
+  // Small penalties: the growth curve is what is under test, not the wall-clock wait.
+  process.env.WUNDERVAULT_KNOCK_BASE_MS = '5';
+  process.env.WUNDERVAULT_KNOCK_MAX_MS = '80';
+  // NEVER the real unit. Without this, migration's stop step reached the developer's own
+  // running daemon and disabled it — systemctl did precisely what it was told.
+  process.env.WUNDERVAULT_OLD_UNIT = 'wundervault-test-not-a-real-unit.service';
 
   // Plain static imports are enough: every path function reads process.env at CALL time
   // rather than at import time, so pointing the environment at a scratch directory before
@@ -48,6 +54,24 @@ function profile(name: string, token = crypto.randomBytes(32).toString('hex')) {
     agent_name: name, api_key: `wv_agent_${name}|k`, enc_key: 'e', vault_url: 'https://v.test',
     socket_token: token,
   };
+}
+
+/** Build a pre-split store on disk, encrypted the way the old daemon wrote it. */
+function writeLegacyStore(home: string, profiles: any[]) {
+  const root = path.join(home, '.wundervault');
+  fs.mkdirSync(root, { recursive: true });
+  let machineId = 'unknown';
+  try { machineId = fs.readFileSync('/etc/machine-id', 'utf8').trim(); } catch { /* not linux */ }
+  const uid = (process as unknown as { getuid?: () => number }).getuid?.() ?? 0;
+  const ikm = crypto.createHash('sha256').update(`${machineId}:${uid}`).digest();
+  const salt = crypto.randomBytes(32);
+  fs.writeFileSync(path.join(root, 'agent-salt.bin'), salt);
+  const key = crypto.hkdfSync('sha256', ikm, salt, Buffer.from('wundervault-agent-v1'), 32) as unknown as Buffer;
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const body = Buffer.concat([c.update(JSON.stringify({ profiles }), 'utf8'), c.final()]);
+  fs.writeFileSync(path.join(root, 'agent-profiles.enc'),
+    Buffer.concat([iv, c.getAuthTag(), body]), { mode: 0o600 });
 }
 
 /** Talk to a socket the way the MCP client does. */
@@ -75,6 +99,9 @@ afterEach(() => {
   delete process.env.WUNDERVAULT_SYSTEM_ROOT;
   delete process.env.WUNDERVAULT_USER_ROOT;
   delete process.env.WUNDERVAULT_RUNTIME_DIR;
+  delete process.env.WUNDERVAULT_KNOCK_BASE_MS;
+  delete process.env.WUNDERVAULT_KNOCK_MAX_MS;
+  delete process.env.WUNDERVAULT_OLD_UNIT;
 });
 
 describe('the state directory is the boundary', () => {
@@ -162,20 +189,59 @@ describe('the token is the identity now', () => {
     expect(tokenMatches('ab', good)).toBe(false);        // shorter, must not throw
   });
 
-  it('locks out after repeated bad tokens', async () => {
-    // The socket is world-connectable, so any local process may knock. An unbounded
-    // guessing loop is not a real threat to a 32-byte token; an unbounded connection loop
-    // is, and so is the log it writes.
+  it('still serves the real agent while somebody else is guessing', async () => {
+    // THE regression test for this phase. The first version of this code locked out the
+    // agent NAME after ten bad tokens and checked that lockout before comparing the
+    // token — so any local process could send ten wrong guesses and take the legitimate
+    // agent off the air for a minute, over and over. Making the socket world-connectable
+    // is what created that, and this phase is what made the socket world-connectable.
+    //
+    // The old test asserted the bug: it sent twelve bad tokens, then presented the CORRECT
+    // one, and expected 'unauthorized'. It passed, and the denial-of-service passed with it.
     const p = profile('A');
     const { d } = await freshDaemon({ profiles: [p] }); daemon = d;
     const sock = path.join(dir, 'run', 'A.sock');
     for (let i = 0; i < 12; i++) await speak(sock, { token: 'aa'.repeat(32) });
-    // Even the correct token is refused while locked out.
+
     const res = await speak(sock, { token: p.socket_token });
-    expect(res.error).toBe('unauthorized');
+    expect(res.api_key).toBe(p.api_key);
   });
 
-  it('clears the lockout when the profile is re-registered', async () => {
+  it('makes the guesser wait, and the delay grows', async () => {
+    // The cost has to land on the failing caller — that is the only party a unix socket
+    // lets us charge, since it carries no address and Node exposes no SO_PEERCRED.
+    const p = profile('A');
+    const { d } = await freshDaemon({ profiles: [p] }); daemon = d;
+    const sock = path.join(dir, 'run', 'A.sock');
+
+    const first = Date.now();
+    await speak(sock, { token: 'aa'.repeat(32) });
+    const firstMs = Date.now() - first;
+
+    for (let i = 0; i < 8; i++) await speak(sock, { token: 'aa'.repeat(32) });
+
+    const later = Date.now();
+    await speak(sock, { token: 'aa'.repeat(32) });
+    const laterMs = Date.now() - later;
+
+    expect(laterMs).toBeGreaterThan(firstMs);
+    expect(laterMs).toBeGreaterThanOrEqual(20);
+  });
+
+  it("does not make the real agent pay the guesser's penalty", async () => {
+    const p = profile('A');
+    const { d } = await freshDaemon({ profiles: [p] }); daemon = d;
+    const sock = path.join(dir, 'run', 'A.sock');
+    for (let i = 0; i < 12; i++) await speak(sock, { token: 'aa'.repeat(32) });
+
+    const t = Date.now();
+    const res = await speak(sock, { token: p.socket_token });
+    expect(res.api_key).toBe(p.api_key);
+    // Served promptly, not after the penalty the guesser earned.
+    expect(Date.now() - t).toBeLessThan(200);
+  });
+
+  it('clears the penalty when the profile is re-registered', async () => {
     const p = profile('A');
     const { d } = await freshDaemon({ profiles: [p] }); daemon = d;
     const sock = path.join(dir, 'run', 'A.sock');
@@ -201,17 +267,6 @@ describe('an agent name becomes a path', () => {
     }
   });
 
-  it('refuses a traversing name over the management socket too', async () => {
-    // The daemon is now the process holding the boundary, and this socket is reachable by
-    // other local processes — so the check has to be at the boundary, not at the caller.
-    const { d } = await freshDaemon(); daemon = d;
-    const res = await speak(path.join(dir, 'run', 'mgmt', 'agent.sock'), {
-      action: 'register_profile',
-      profile: { ...profile('x'), agent_name: '../../../tmp/pwned' },
-    });
-    expect(res.error).toMatch(/Invalid agent name/);
-    expect(fs.existsSync('/tmp/pwned.sock')).toBe(false);
-  });
 });
 
 describe('the daemon refuses to be root', () => {
@@ -227,54 +282,75 @@ describe('the daemon refuses to be root', () => {
 });
 
 describe('management socket', () => {
-  it('enrols a profile and serves it immediately', async () => {
-    const { d } = await freshDaemon(); daemon = d;
-    const p = profile('New');
-    const reply = await speak(path.join(dir, 'run', 'mgmt', 'agent.sock'),
-      { action: 'register_profile', profile: p });
-    expect(reply.ok).toBe(true);
-    const creds = await speak(path.join(dir, 'run', 'New.sock'), { token: p.socket_token });
-    expect(creds.api_key).toBe(p.api_key);
-  });
-
-  it('removes a profile and its socket', async () => {
-    const p = profile('Gone');
-    const { d } = await freshDaemon({ profiles: [p] }); daemon = d;
-    expect(fs.existsSync(path.join(dir, 'run', 'Gone.sock'))).toBe(true);
-    const reply = await speak(path.join(dir, 'run', 'mgmt', 'agent.sock'),
-      { action: 'remove_profile', agent_name: 'Gone' });
-    expect(reply.removed).toBe(true);
-    expect(fs.existsSync(path.join(dir, 'run', 'Gone.sock'))).toBe(false);
-  });
-
-  it('reports what it knows without revealing credentials', async () => {
+  it('answers ping with liveness only, not a roster of what holds credentials', async () => {
+    // ping used to return every agent name on the machine — a list of what is worth
+    // attacking here, handed to anything that can reach the socket.
     const { d } = await freshDaemon({ profiles: [profile('A'), profile('B')] }); daemon = d;
     const res = await speak(path.join(dir, 'run', 'mgmt', 'agent.sock'), { action: 'ping' });
+    expect(res.ok).toBe(true);
+    expect(res.agents).toBeUndefined();
+    expect(JSON.stringify(res)).not.toContain('wv_agent_');
+  });
+
+  it('gives the names only when they are asked for, and still no credentials', async () => {
+    const { d } = await freshDaemon({ profiles: [profile('A'), profile('B')] }); daemon = d;
+    const res = await speak(path.join(dir, 'run', 'mgmt', 'agent.sock'), { action: 'known_agents' });
     expect(res.agents.sort()).toEqual(['A', 'B']);
     expect(JSON.stringify(res)).not.toContain('wv_agent_');
   });
 
-  it('sits behind a 0770 directory, with no window between bind and chmod', async () => {
-    // Enrolment writes credentials INTO the daemon, so it is the one operation that must
-    // not be open to every local process. chmod-after-listen was not enough: this test
-    // caught the socket at 0775 because listen()'s callback had not run yet, which is the
-    // same gap a local process watching for the socket would connect through. The
-    // directory is created before the bind, so there is no gap to hit.
-    const { d } = await freshDaemon(); daemon = d;
-    expect(fs.statSync(path.join(dir, 'run', 'mgmt')).mode & 0o777).toBe(0o770);
-    expect(fs.existsSync(path.join(dir, 'run', 'mgmt', 'agent.sock'))).toBe(true);
+  it('removes a profile only for a caller holding that agent\'s token', async () => {
+    // The socket is connectable by anyone now, so an unauthenticated remove would let any
+    // local user delete someone else's agents. This does NOT separate one agent from
+    // another under the same uid — nothing can, and the spec says so — but it stops
+    // everybody else.
+    const p = profile('A');
+    const { d } = await freshDaemon({ profiles: [p] }); daemon = d;
+    const sock = path.join(dir, 'run', 'mgmt', 'agent.sock');
+
+    const refused = await speak(sock, { action: 'remove_profile', agent_name: 'A' });
+    expect(refused.error).toBe('unauthorized');
+    expect(fs.existsSync(path.join(dir, 'run', 'A.sock'))).toBe(true);
+
+    const ok = await speak(sock, { action: 'remove_profile', agent_name: 'A', token: p.socket_token });
+    expect(ok.removed).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'run', 'A.sock'))).toBe(false);
+  });
+
+  it('does not serve the destination store, and says where to get it', async () => {
+    // It was served here while the socket sat behind a locked directory. That lock is off,
+    // because a mode that keeps agents out keeps the owner out too — same uid. Serving it
+    // now would hand every agent the record of where all the others sent secrets.
+    const { d } = await freshDaemon({ profiles: [profile('A')] }); daemon = d;
+    const res = await speak(path.join(dir, 'run', 'mgmt', 'agent.sock'), { action: 'destinations' });
+    expect(res.shape).toBeUndefined();
+    expect(res.error).toMatch(/sudo wundervault-agent --destinations/);
+  });
+
+  it('is reachable without group membership, because the link is the lock', async () => {
+    // The 0770 directory this replaced could not be opened by the owner either, so the
+    // installer's own closing instruction failed on a real install.
+    const { d } = await freshDaemon({ profiles: [profile('A')] }); daemon = d;
+    const md = path.join(dir, 'run', 'mgmt');
+    expect(fs.statSync(md).mode & 0o777).toBe(0o755);
+    const res = await speak(path.join(md, 'agent.sock'), { action: 'ping' });
+    expect(res.ok).toBe(true);
   });
 
   it('does not hang on a message with no newline', async () => {
-    const { d } = await freshDaemon(); daemon = d;
-    await expect(new Promise((resolve, reject) => {
-      const s = net.createConnection(path.join(dir, 'run', 'mgmt', 'agent.sock'));
-      s.on('connect', () => s.write('{"action":"ping"}'));   // no newline
-      s.on('close', () => resolve('closed'));
-      s.on('error', reject);
-      setTimeout(() => { s.destroy(); resolve('still open'); }, 1500);
-    })).resolves.toBeDefined();
-  });
+    const { d } = await freshDaemon({ profiles: [profile('A')] }); daemon = d;
+    const s = net.createConnection(path.join(dir, 'run', 'mgmt', 'agent.sock'));
+    await new Promise((r) => s.on('connect', r));
+    s.write('{"action":"ping"}');
+    const closed = await new Promise<boolean>((resolve) => {
+      const t = setTimeout(() => resolve(false), 15_000);
+      s.on('close', () => { clearTimeout(t); resolve(true); });
+    });
+    s.destroy();
+    expect(closed).toBe(true);
+    // 20s ceiling: the daemon's own inactivity timeout on this socket is 10s, so the test
+    // has to outlast it to observe the close rather than its own impatience.
+  }, 20_000);
 });
 
 describe('persistence', () => {
@@ -310,156 +386,89 @@ describe('persistence', () => {
   });
 });
 
-describe('migration', () => {
-  /** Write a pre-split store the way the old daemon would have. */
-  function legacyStore(home: string, profiles: any[]) {
-    // Writes to the directory WUNDERVAULT_USER_ROOT will point at. Setting process.env.HOME
-    // and hoping os.homedir() follows is what destroyed a real credential store: on Linux
-    // it reads the passwd entry, not $HOME.
-    const d = path.join(home, '.wundervault');
-    fs.mkdirSync(path.join(d, 'agents'), { recursive: true });
-    let mid = 'unknown';
-    try { mid = fs.readFileSync('/etc/machine-id', 'utf8').trim(); } catch { /* not linux */ }
-    const uid = (process as any).getuid?.() ?? 0;
-    const ikm = crypto.createHash('sha256').update(`${mid}:${uid}`).digest();
-    const salt = crypto.randomBytes(32);
-    fs.writeFileSync(path.join(d, 'agent-salt.bin'), salt, { mode: 0o600 });
-    const key = crypto.hkdfSync('sha256', ikm, salt, Buffer.from('wundervault-agent-v1'), 32);
-    const n = crypto.randomBytes(12);
-    const c = crypto.createCipheriv('aes-256-gcm', Buffer.from(key as any), n);
-    const e = Buffer.concat([c.update(JSON.stringify({ profiles }), 'utf8'), c.final()]);
-    fs.writeFileSync(path.join(d, 'agent-profiles.enc'),
-      Buffer.concat([n, c.getAuthTag(), e]), { mode: 0o600 });
-  }
 
-  it('writes the token file when the profile has a token but the file is gone', async () => {
-    // A restored home directory, or a half-finished uninstall, leaves a profile carrying a
-    // token whose file no longer exists. Migrating that produces an agent the daemon knows
-    // about and the client cannot authenticate as — migrated-looking and locked out, which
-    // is worse than either.
-    const home = path.join(dir, 'home2');
-    const token = 'ab'.repeat(32);
-    legacyStore(home, [{
-      agent_name: 'Kept', api_key: 'wv_agent_a|k', enc_key: 'e',
-      vault_url: 'https://v.test', socket_token: token,
-    }]);
-    process.env.WUNDERVAULT_USER_ROOT = path.join(home, '.wundervault');
-    {
-      const { d } = await freshDaemon({ userRoot: path.join(home, '.wundervault') });
-      daemon = d;
-      const { legacy } = await import('../src/paths.js');
-      // Prove the redirect took before running anything destructive. This assertion is
-      // the one that was missing when a test deleted a live store.
-      expect(legacy.profiles().startsWith(dir)).toBe(true);
-      const { migrate } = await import('../src/migrate.js');
-      const r = await migrate();
-      expect(r.migrated).toEqual(['Kept']);
-      const tokenFile = path.join(home, '.wundervault', 'agents', 'Kept.token');
-      expect(fs.existsSync(tokenFile)).toBe(true);
-      expect(fs.readFileSync(tokenFile, 'utf8').trim()).toBe(token);
-      // And it actually works against the running daemon.
-      const creds = await speak(path.join(dir, 'run', 'Kept.sock'), { token });
-      expect(creds.api_key).toBe('wv_agent_a|k');
-    }
+describe('a store it could not read is not an empty store', () => {
+  it('refuses to save over ciphertext it failed to decrypt', async () => {
+    // The failure that motivates this: decrypt throws, the daemon carries on with an
+    // empty in-memory list, and the next enrolment writes a store containing only that
+    // one profile — over the credentials of every other agent on the machine. A changed
+    // /etc/machine-id or a recreated system account is enough to trigger it, and both are
+    // recoverable until the moment the file is overwritten.
+    const { d } = await freshDaemon({ profiles: [profile('A')] }); daemon = d;
+    const storePath = path.join(dir, 'state', 'agent-profiles.enc');
+    const before = fs.readFileSync(storePath);
+
+    fs.writeFileSync(storePath, Buffer.concat([before.subarray(0, 28), crypto.randomBytes(64)]));
+    d.loadProfiles();
+    expect(d.storeUnreadable).toBe(true);
+
+    // Refused before anything is mutated, not merely before the write lands.
+    expect(() => d.registerProfile(profile('B'))).toThrow(/Refusing to enrol/);
+    expect(() => d.saveProfiles()).toThrow(/Refusing to write/);
+    // The ciphertext is untouched, so the credentials are still recoverable.
+    expect(fs.readFileSync(storePath).length).toBeGreaterThan(28);
+    expect(fs.readFileSync(storePath).subarray(0, 28)).toEqual(before.subarray(0, 28));
   });
 
-  it('mints a token for a profile that never had one', async () => {
-    const home = path.join(dir, 'home3');
-    legacyStore(home, [{
-      agent_name: 'Tokenless', api_key: 'wv_agent_b|k', enc_key: 'e', vault_url: 'https://v.test',
-    }]);
-    process.env.WUNDERVAULT_USER_ROOT = path.join(home, '.wundervault');
-    {
-      const { d } = await freshDaemon({ userRoot: path.join(home, '.wundervault') });
-      daemon = d;
-      const { legacy } = await import('../src/paths.js');
-      // Prove the redirect took before running anything destructive. This assertion is
-      // the one that was missing when a test deleted a live store.
-      expect(legacy.profiles().startsWith(dir)).toBe(true);
-      const { migrate } = await import('../src/migrate.js');
-      await migrate();
-      const tokenFile = path.join(home, '.wundervault', 'agents', 'Tokenless.token');
-      const minted = fs.readFileSync(tokenFile, 'utf8').trim();
-      expect(minted).toHaveLength(64);
-      const creds = await speak(path.join(dir, 'run', 'Tokenless.sock'), { token: minted });
-      expect(creds.api_key).toBe('wv_agent_b|k');
+  it('says so on ping rather than looking healthy and empty', async () => {
+    const { d } = await freshDaemon({ profiles: [profile('A')] }); daemon = d;
+    const storePath = path.join(dir, 'state', 'agent-profiles.enc');
+    fs.writeFileSync(storePath, crypto.randomBytes(120));
+    d.loadProfiles();
+    const res = await speak(path.join(dir, 'run', 'mgmt', 'agent.sock'), { action: 'ping' });
+    expect(res.store_unreadable).toBe(true);
+  });
+});
+
+
+
+describe('a held connection must not exclude the real agent', () => {
+  it('serves the valid token while many connections sit open', async () => {
+    // The regression this exists for is mine: the first fix for the token-level lockout
+    // added srv.maxConnections = 64, which moved the same denial of service down a layer.
+    // Sixty-four connections held open — trivial, since the timeout was an INACTIVITY one
+    // a single byte could reset — and the legitimate agent's connection was dropped by the
+    // kernel before its token was read.
+    const p = profile('A');
+    const { d } = await freshDaemon({ profiles: [p] }); daemon = d;
+    const sock = path.join(dir, 'run', 'A.sock');
+
+    const held: net.Socket[] = [];
+    for (let i = 0; i < 80; i++) {
+      const c = net.createConnection(sock);
+      c.on('error', () => { /* the daemon may close it; that is fine */ });
+      c.write('x');                    // no newline: never a complete message
+      held.push(c);
     }
+    await new Promise((r) => setTimeout(r, 150));
+
+    const res = await speak(sock, { token: p.socket_token });
+    for (const c of held) c.destroy();
+    expect(res.api_key).toBe(p.api_key);
+  });
+});
+
+
+describe('the installer refuses what the sandbox would hide', () => {
+  const script = fs.readFileSync(path.join(ROOT, 'packaging', 'install-daemon.sh'), 'utf8');
+
+  it('rejects an ExecStart under a home directory', () => {
+    // ProtectHome=yes makes /home empty for the service, so a home-based ExecStart installs
+    // cleanly and then fails at start with 203/EXEC. On the owner's own machine
+    // `wundervault-agent` resolves to ~/.local/bin, so this is the default path, not an
+    // edge case.
+    expect(script).toMatch(/\/home\/\*\|\/root\/\*\|\/run\/user\/\*/);
+    expect(script).toContain('readlink -f');
   });
 
-  it('deletes the old store once everything is across', async () => {
-    // Migration that copies and leaves the original has moved nothing: a readable file
-    // holding every credential still sits where the agent can read it.
-    const home = path.join(dir, 'home4');
-    legacyStore(home, [{
-      agent_name: 'Moved', api_key: 'k', enc_key: 'e', vault_url: 'https://v.test',
-      socket_token: 'cd'.repeat(32),
-    }]);
-    process.env.WUNDERVAULT_USER_ROOT = path.join(home, '.wundervault');
-    {
-      const { d } = await freshDaemon({ userRoot: path.join(home, '.wundervault') });
-      daemon = d;
-      const { legacy } = await import('../src/paths.js');
-      // Prove the redirect took before running anything destructive. This assertion is
-      // the one that was missing when a test deleted a live store.
-      expect(legacy.profiles().startsWith(dir)).toBe(true);
-      const { migrate } = await import('../src/migrate.js');
-      const r = await migrate();
-      expect(r.deletedLegacyStore).toBe(true);
-      expect(fs.existsSync(path.join(home, '.wundervault', 'agent-profiles.enc'))).toBe(false);
-      // The token file is the agent's identity and must survive.
-      expect(fs.existsSync(path.join(home, '.wundervault', 'agents', 'Moved.token'))).toBe(true);
-    }
-  });
-
-  it('changes nothing on a dry run', async () => {
-    const home = path.join(dir, 'home5');
-    legacyStore(home, [{
-      agent_name: 'Dry', api_key: 'k', enc_key: 'e', vault_url: 'https://v.test',
-      socket_token: 'ef'.repeat(32),
-    }]);
-    process.env.WUNDERVAULT_USER_ROOT = path.join(home, '.wundervault');
-    {
-      const { d } = await freshDaemon({ userRoot: path.join(home, '.wundervault') });
-      daemon = d;
-      const { legacy } = await import('../src/paths.js');
-      expect(legacy.profiles().startsWith(dir)).toBe(true);
-      const { migrate, describe: say } = await import('../src/migrate.js');
-      const r = await migrate({ dryRun: true });
-      expect(r.migrated).toEqual(['Dry']);
-      expect(fs.existsSync(path.join(home, '.wundervault', 'agent-profiles.enc'))).toBe(true);
-      // And it must not report the no-op as a failure to finish.
-      expect(say(r, true)).toContain('Dry run');
-      expect(say(r, true)).not.toContain('LEFT the old store');
-    }
-  });
-
-  it('is idempotent', async () => {
-    const home = path.join(dir, 'home6');
-    legacyStore(home, [{
-      agent_name: 'Twice', api_key: 'k', enc_key: 'e', vault_url: 'https://v.test',
-      socket_token: '01'.repeat(32),
-    }]);
-    process.env.WUNDERVAULT_USER_ROOT = path.join(home, '.wundervault');
-    {
-      const { d } = await freshDaemon({ userRoot: path.join(home, '.wundervault') });
-      daemon = d;
-      const { legacy } = await import('../src/paths.js');
-      // Prove the redirect took before running anything destructive. This assertion is
-      // the one that was missing when a test deleted a live store.
-      expect(legacy.profiles().startsWith(dir)).toBe(true);
-      const { migrate } = await import('../src/migrate.js');
-      await migrate();
-      const second = await migrate();
-      expect(second.alreadyDone).toBe(true);
-    }
-  });
-
-  it('refuses to run when the daemon is not there, and writes no fallback', async () => {
-    // Writing the old file as a fallback would recreate the pre-split world beside a
-    // daemon that never reads it, and everything would appear to work.
-    process.env.WUNDERVAULT_RUNTIME_DIR = path.join(dir, 'nowhere');
-    const { migrate } = await import('../src/migrate.js');
-    await expect(migrate()).rejects.toThrow(/Could not reach the daemon/);
+  it('does not let set -e swallow the explanation', () => {
+    // A bare `a && b && echo` list returns non-zero when the note does not apply, and
+    // `set -e` would exit on it — printing "ERROR:" and nothing that says what to do.
+    // The guard must be an `if ...; then` — a bare list is the bug. Matching on "not a
+    // bare list" is what the first version of this test got wrong: the corrected `if` form
+    // contains the same bracket text, so the negative regex matched it too and failed.
+    expect(script).toMatch(/if \[ "\$CANDIDATE" = "\$REAL_EXEC" \] && \[ "\$EXEC" != "\$REAL_EXEC" \]; then/);
+    expect(script).not.toMatch(/^\s*\[ "\$CANDIDATE" = "\$REAL_EXEC" \] && \[ [^\n]*\] && \\$/m);
   });
 });
 

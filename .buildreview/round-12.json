@@ -1,0 +1,216 @@
+{
+  "verdict": "revise",
+  "summary": "The build establishes the intended system-account paths, token-gated agent sockets, management IPC, and a substantially safer migration flow. It still does not satisfy phase 4: setup-token enrolment and management access are knowingly unresolved, while the shown code can delete the legacy store without stopping the old daemon, migrate an unusable token, and expose uncommitted profiles after persistence failures. The documented install path also requires an additional privileged npm installation on a normal user-prefix setup.",
+  "spec_check": [
+    {
+      "requirement": "daemon uid: `wundervault` system account; key material and destination store under `/var/lib/wundervault/`; unit: system unit",
+      "status": "partial",
+      "evidence": "`paths.ts` defaults daemon state to `/var/lib/wundervault`, and `install-daemon.sh` creates and owns that directory for `wundervault`; the actual unit file is withheld and the package says no real two-uid installation has been run."
+    },
+    {
+      "requirement": "B1. The installer sends the profile over the management socket. It never touches `/var/lib/wundervault`.",
+      "status": "partial",
+      "evidence": "`migrate.ts` sends `register_profile` over `mgmtSocketPath()` and does not write the system root, but `onboard.py` is withheld and the acknowledged management-directory permissions currently prevent the normal user from reaching that socket."
+    },
+    {
+      "requirement": "B2. Enrolment is authorised by the server-issued setup token the owner pastes, not by local privilege.",
+      "status": "unmet",
+      "evidence": "The shown `register_profile` action accepts a supplied profile without any setup token; this is the acknowledged round-11 deferred enrolment redesign."
+    },
+    {
+      "requirement": "B3. A setup token is single-use and time-boxed ... The daemon must not treat \"the server accepted it\" as reusable local authority.",
+      "status": "unmet",
+      "evidence": "No setup-token exchange or local disposal behavior exists in the shown daemon, and `onboard.py` is not included."
+    },
+    {
+      "requirement": "B4. The installer must FAIL LOUDLY if the daemon is not running. Writing the old file as a fallback would silently recreate the pre-split world.",
+      "status": "partial",
+      "evidence": "`migrate()` throws when `ping` cannot reach the daemon and has no fallback write, with a regression test for that behavior; the separate onboarding installer is withheld."
+    },
+    {
+      "requirement": "B5. Removing an agent is the same shape: a request, not an `rm`.",
+      "status": "met",
+      "evidence": "`startMgmtSocket()` implements `remove_profile`, which calls `removeProfile()` and persists the resulting profile store."
+    },
+    {
+      "requirement": "C1. The socket is world-connectable ... The token is the identity, not the file mode.",
+      "status": "met",
+      "evidence": "`startAgentSocket()` chmods each per-agent socket to 0666 and requires `profile.socket_token` before credentials are served."
+    },
+    {
+      "requirement": "C2. Compared in constant time. A wrong token closes the connection without saying whether the agent name exists.",
+      "status": "met",
+      "evidence": "`tokenMatches()` uses `crypto.timingSafeEqual` for equal-length decoded tokens, and failures receive the same `unauthorized` response."
+    },
+    {
+      "requirement": "C3. Repeated bad tokens on one socket are rate-limited.",
+      "status": "partial",
+      "evidence": "`Knocks` applies an exponential per-name delay and each server has `maxConnections = 64`, but F5 shows the connection ceiling lets an attacker deny new valid connections."
+    },
+    {
+      "requirement": "D1. The agent's uid cannot read `/var/lib/wundervault`. Enforced by mode 0700 on a directory owned by another user.",
+      "status": "partial",
+      "evidence": "`install-daemon.sh` applies ownership and mode 0700, and `ensureSystemRoot()` reapplies and verifies the mode; the package explicitly says this has not been exercised with real separate uids."
+    },
+    {
+      "requirement": "D2. The agent cannot read the daemon's memory. Enforced by uid separation.",
+      "status": "partial",
+      "evidence": "The installer and daemon are structured for a separate `wundervault` uid, but no real installation or cross-uid `/proc` check has been run."
+    },
+    {
+      "requirement": "D3. The destination store becomes an integrity control, not merely privacy.",
+      "status": "met",
+      "evidence": "`networkStorePath()` resolves to the daemon-owned system root, and the management `destinations` action reads it on behalf of an otherwise unprivileged client."
+    },
+    {
+      "requirement": "D4. `LimitCORE=0` ... is defence against a crash dump landing on disk ... D2 is what prevents memory reading.",
+      "status": "partial",
+      "evidence": "The source comments correctly attribute the memory boundary to uid separation, but the unit containing `LimitCORE=0` is withheld."
+    },
+    {
+      "requirement": "D5. The at-rest encryption of the profile store is defence in depth, not the boundary.",
+      "status": "met",
+      "evidence": "`paths.ts` and `agent.ts` explicitly identify directory ownership and mode as the boundary and describe machine-id/uid/salt encryption as defence in depth."
+    },
+    {
+      "requirement": "E1-E4. A system unit for `wundervault`, with every listed hardening directive, only `/var/lib/wundervault` writable, and `RuntimeDirectory=wundervault`.",
+      "status": "partial",
+      "evidence": "`install-daemon.sh` installs a system unit and verifies its `User`, while `runtimeDir()` consumes systemd's `RUNTIME_DIRECTORY`; the unit itself is withheld, so its Group, complete E2 directive set, and `ReadWritePaths` cannot be independently checked here."
+    },
+    {
+      "requirement": "E5. The daemon must refuse to start as root.",
+      "status": "met",
+      "evidence": "Direct daemon startup calls `refuseRoot()`, which exits with status 1 when `getuid()` is zero."
+    },
+    {
+      "requirement": "F1. On first start ... the installer \u2014 not the daemon \u2014 hands the profiles over via B1. The daemon must not read another user's home directory.",
+      "status": "partial",
+      "evidence": "`migrate.ts` runs as the user, decrypts the legacy store, and sends profiles to the daemon; the acknowledged 0770 management-directory issue currently prevents that transfer on a real install."
+    },
+    {
+      "requirement": "F2. The old `systemctl --user` unit is disabled and removed.",
+      "status": "unmet",
+      "evidence": "`stopOldUserUnit()` attempts disable-and-stop but never removes the unit, and `migrate()` ignores a false stop result before deleting the source as described in F2."
+    },
+    {
+      "requirement": "F3. The user's `~/.wundervault/agents/<name>.token` STAYS.",
+      "status": "partial",
+      "evidence": "Migration preserves or creates the token file and forces 0600/0700 modes, but it does not verify that an existing token file contains the token installed in the daemon, producing F3."
+    },
+    {
+      "requirement": "F4. After migration the old `agent-profiles.enc` is deleted, not left behind.",
+      "status": "partial",
+      "evidence": "The file is shredded after profiles are accounted for, but deletion proceeds even when the old daemon remains active, and partial per-file failures are treated as best effort."
+    },
+    {
+      "requirement": "F5. Migration is idempotent and re-runnable.",
+      "status": "unmet",
+      "evidence": "If the first run fails to stop the old unit but deletes the source, the next run returns `alreadyDone` before retrying old-unit cleanup."
+    },
+    {
+      "requirement": "G1. One privileged step, doing only: create the system user, install the unit, create `/var/lib/wundervault`, enable the service.",
+      "status": "unmet",
+      "evidence": "The script itself performs those actions, but after rejecting the normal home-prefix npm executable it directs the user to run a separate `sudo npm install -g --prefix /usr/local` before running the privileged installer."
+    },
+    {
+      "requirement": "G2. Not `curl | sudo sh`.",
+      "status": "met",
+      "evidence": "`install-daemon.sh` performs no download and contains no network-to-shell pipeline."
+    },
+    {
+      "requirement": "G3. Either ship a repo, or verify a detached signature explicitly before installing.",
+      "status": "partial",
+      "evidence": "No `.deb` path is shown, but the recommended root npm installation has no detached-signature or repository-signing verification flow in this package."
+    },
+    {
+      "requirement": "G4. The privileged step is printed in full before it runs, and is re-runnable.",
+      "status": "partial",
+      "evidence": "The script is written to be re-runnable and prints a four-item summary, but the onboarding code that should present the full privileged command before invocation is withheld."
+    },
+    {
+      "requirement": "12. `--destinations` still works for a user who cannot read the store directly.",
+      "status": "unmet",
+      "evidence": "The daemon provides a `destinations` IPC action, but the package acknowledges that the owner cannot traverse the current 0770 `wundervault` management directory on a real install."
+    },
+    {
+      "requirement": "14. Nothing in the codebase resolves daemon state through `os.homedir()` any more.",
+      "status": "partial",
+      "evidence": "All shown daemon-state paths use `systemRoot()`; `os.homedir()` is confined to the user-side token and legacy migration root. The whole `server.ts` and onboarding repository are withheld, so this cannot be established codebase-wide."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "packaging/install-daemon.sh",
+      "line": 93,
+      "claim": "The normal recovery path for a home-installed npm binary requires a second privileged package installation, contradicting the one narrowly scoped privileged step required by G1.",
+      "failure_scenario": "On a standard npm user-prefix setup, `wundervault-agent` resolves under `/home/alice/.local`; the installer rejects it and instructs Alice to run `sudo npm install -g --prefix /usr/local ...` followed by `sudo sh install-daemon.sh`, so package content is installed as root in a separate privileged step rather than through the specified single audited operation.",
+      "suggested_direction": "Provide a verified, service-visible executable through an installation flow that remains unprivileged until the one audited system-account/unit/state step; do not make root-level npm installation the supported remedy."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/migrate.ts",
+      "line": 278,
+      "claim": "Migration deletes the legacy credential store even when verification says the old user daemon was not stopped, and a rerun cannot repair that state.",
+      "failure_scenario": "`systemctl --user disable --now` fails because the user bus is unavailable while the old daemon remains alive; `oldUnitStopped` becomes false, but migration still shreds `agent-profiles.enc` and reports that agents cannot read the credentials, then the next run sees no legacy store and returns `alreadyDone` without retrying the stop, leaving the same-uid daemon serving credentials from memory.",
+      "suggested_direction": "Make verified shutdown and removal of the old user unit a prerequisite for destructive cleanup, report failure loudly, and retain enough migration state for a rerun to finish unit cleanup."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "src/migrate.ts",
+      "line": 238,
+      "claim": "Migration preserves an existing token file without checking that its contents match the token copied into the daemon.",
+      "failure_scenario": "The legacy profile for agent `A` contains token `T1`, while a stale `~/.wundervault/agents/A.token` already contains `T2`; migration chmods the existing file but does not rewrite it, registers `T1`, marks `A` migrated, and deletes the legacy store, after which the agent presents `T2` and is permanently refused.",
+      "suggested_direction": "Before counting a profile as migrated, reconcile and verify the token file against the exact token persisted by the daemon; preserve the source and report a conflict if this cannot be done safely."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": 272,
+      "claim": "`registerProfile()` publishes the new in-memory profile and starts its credential socket before confirming that the profile store was saved.",
+      "failure_scenario": "With an undecryptable existing store, a `register_profile` request pushes profile `B`; `registerProfile()` adds `B` and starts `B.sock`, then `saveProfiles()` throws, so management returns an error while `B.sock` remains live and serves credentials that were never durably committed despite the daemon's stated refusal to serve in this state.",
+      "suggested_direction": "Treat registration as a transaction: validate and durably persist the proposed state before publishing or replacing its socket, and leave the prior in-memory/socket state unchanged on any save failure."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": 375,
+      "claim": "The per-agent `maxConnections = 64` ceiling lets an unauthenticated local process exclude the valid agent from its socket.",
+      "failure_scenario": "A local process opens 64 connections to `A.sock` and sends one non-newline byte often enough to reset each five-second inactivity timeout; while those slots remain occupied, Node drops new connections at the threshold, so the legitimate agent's connection carrying the correct token is refused before its token can be checked.",
+      "suggested_direction": "Redesign the pre-auth resource bound so concurrent unauthenticated clients cannot consume every admission slot, and add a saturation test in which a valid token must still obtain service while bad callers hold concurrent connections."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The proposed unauthenticated migration exception for a previously unknown name has no trustworthy way to prove that a legacy store exists or that the caller possesses it.",
+      "why_it_matters": "The daemon is intentionally unable to inspect the user's legacy store, and the owner and agents share one uid, so any process able to reach migration IPC can win the first-write race, preclaim real names to block migration, or fill the daemon with attacker-selected names. This needs an explicit trust assumption such as quiescing same-uid agents during migration, or a separate one-time migration capability; checking only that the name is new does not authenticate the handoff."
+    },
+    {
+      "id": "B2",
+      "concern": "A daemon-side setup-token exchange needs the server identity and enrollment target bound independently of caller-supplied IPC fields.",
+      "why_it_matters": "If a future request supplies both a setup token and an arbitrary `vault_url`, a typo or manipulated local configuration can make the daemon send the single-use token to the wrong endpoint. The exchange should use a trusted or cryptographically bound issuer and verify that the returned agent identity matches the intended enrollment before persisting anything."
+    },
+    {
+      "id": "B3",
+      "concern": "There is no recovery procedure for state encrypted against a service-account uid and machine id.",
+      "why_it_matters": "Deleting and recreating the `wundervault` account with a different uid, restoring `/var/lib/wundervault` onto another machine, or regenerating `/etc/machine-id` makes the profile store undecryptable. The new refusal prevents overwrite, but without a documented backup and recovery path every agent remains unavailable indefinitely."
+    },
+    {
+      "id": "B4",
+      "concern": "Migration has no stated policy for the old `~/.wundervault/network.json` destination history.",
+      "why_it_matters": "`migrate.ts` moves profiles but never reads `legacy.networkStore()`, so after upgrade `--destinations` can show an empty new store while historical records remain in the user-owned location. Blindly importing them would also promote previously mutable evidence into the integrity-controlled store, so the product needs an explicit discard, label-as-untrusted, or import policy."
+    }
+  ],
+  "_meta": {
+    "round": 12,
+    "at": "2026-09-15T19:32:33+00:00",
+    "package_bytes": 113508,
+    "schema_problems": []
+  }
+}

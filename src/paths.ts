@@ -83,13 +83,21 @@ export const networkStorePath = () => path.join(systemRoot(), 'network.json');
 /**
  * The management socket, inside its own directory.
  *
- * Enrolment writes credentials INTO the daemon, so unlike the per-agent sockets this one
- * must not be reachable by every local process. Restricting it with chmod after listen()
- * leaves a window: the socket exists at the default mode from the moment it is bound
- * until the chmod lands, and a process watching for it can connect in that gap. A
- * DIRECTORY at 0770 has no such window — it is created before the socket is bound, and
- * traversal is checked on every connect regardless of what mode the socket itself ended
- * up with.
+ * This directory was 0770, on the reasoning that enrolment writes credentials INTO the
+ * daemon and so must not be reachable by every local process. The reasoning was right and
+ * the mechanism could not deliver it. Agents run as the machine's owner, so a mode that
+ * excludes agents excludes the owner, and the installer's own closing instruction —
+ * `wundervault-agent --migrate`, no sudo — could not open the door it had just locked.
+ * Adding the owner to the group would have added all seven of their agents with them.
+ *
+ * There is no local permission that separates the owner from a process running as the
+ * owner. So the lock moved off the directory entirely and onto the thing an agent cannot
+ * obtain: a setup link, issued by the server to someone logged in to the website,
+ * single-use and valid for fifteen minutes. The daemon redeems it itself.
+ *
+ * The directory is therefore traversable and the socket connectable, exactly like the
+ * per-agent ones, and every action behind it carries its own proof — a setup link to
+ * enrol, the agent's own token to remove. Nothing is protected by being hard to reach.
  */
 export const mgmtDir = () => path.join(runtimeDir(), 'mgmt');
 export const mgmtSocketPath = () => path.join(mgmtDir(), 'agent.sock');
