@@ -1,0 +1,10 @@
+{"round": 10, "decisions": [
+ {"id":"F1","action":"fixed","claim":"the tool note sends the destination to the model provider while claiming it stayed local",
+  "reason":"confirmed and the sharpest finding of the round — I had not considered that the tool result is read BY the model, so for a hosted model the destination reaches the model provider. For a signed operation the agent never knew the origin or path, so my notice was the disclosure. The note now omits them there and stderr carries the detail; it also says Wundervault rather than the ambiguous 'the server', and warns that the note itself travels to whoever runs the model."},
+ {"id":"F2","action":"fixed","claim":"the lock loop spins for the full timeout on a fresh install",
+  "reason":"confirmed: openSync returns ENOENT when the directory does not exist, which the loop could not distinguish from contention. The directory is created before locking; a test asserts the first call on a fresh path completes promptly."},
+ {"id":"F3","action":"fixed","claim":"approvals remain server-side while the plan says they move local",
+  "reason":"a plan/code mismatch rather than a code bug — the code was right and the document was stale. The plan now states why approvals did NOT move and what that costs."},
+ {"id":"F4","action":"fixed","claim":"a structurally valid store with a null element throws on the next read",
+  "reason":"confirmed. Elements are validated, not just the array shape; malformed rows are dropped and the good ones kept."}
+]}

@@ -692,7 +692,11 @@ export function createServer(args: { url?: string } = {}) {
           if (isNew) {
             const notice = newDestinationNotice(
               secretData.name ?? entry_id, originStr, def.route.method, def.route.path,
-              verdict.tier);
+              verdict.tier,
+              // An agent-described request means the caller already knows the
+              // destination; a signed operation means it does not, and the tool result
+              // reaches the model provider.
+              !operation_id);
             emitToStderr(notice);
             noticeForAgent = `\n\n${notice.toolNote}`;
           }

@@ -1,0 +1,152 @@
+{
+  "verdict": "revise",
+  "summary": "The build adds a bounded local destination store, an effective recording off switch, tier-aware notices, and cross-process locking, while candidly leaving the uid split and unattended alerting unfinished. It does not yet uphold the central Tier 1 locality claim because the notice exposes the destination to remote-hosted models, and the lock has a concrete first-run failure. The private-origin portion of Part A also remains intentionally undelivered until a daemon-owned store exists.",
+  "spec_check": [
+    {
+      "requirement": "Tier 1 destinations never leave the customer's machine.",
+      "status": "unmet",
+      "evidence": "newDestinationNotice includes the Tier 1 origin and path in toolNote, which the source explicitly says the model reads; with a remotely hosted model, the MCP client sends that tool result off the machine. Approved private origins also remain server-side."
+    },
+    {
+      "requirement": "seen destinations (the \"new destination\" baseline) | local file",
+      "status": "met",
+      "evidence": "recordDestination persists normalized entry/origin observations through save to the local network.json store, including firstSeen, lastSeen, and count."
+    },
+    {
+      "requirement": "approved private origins | local file",
+      "status": "unmet",
+      "evidence": "The module deliberately exposes no approval API and its header states that approvals stay server-side until a daemon-owned path exists."
+    },
+    {
+      "requirement": "Tier 1 fact-of-call (entry, agent, time) | server | unchanged \u2014 stays server-side",
+      "status": "partial",
+      "evidence": "The excerpt shows local destination recording and notice integration but not the server-side audit write, so preservation of the fact-of-call cannot be verified from the supplied code."
+    },
+    {
+      "requirement": "Tier 2 requested operation | server | unchanged \u2014 approval needs it",
+      "status": "partial",
+      "evidence": "Tier 2 notice text correctly acknowledges server disclosure, but the actual approval and persistence path is outside the excerpt."
+    },
+    {
+      "requirement": "This is therefore a privacy improvement and NOT an integrity control until Part B moves it to a daemon-owned path.",
+      "status": "met",
+      "evidence": "The module header clearly says the same-uid agent can edit observations, calls the file privacy-only before the split, and keeps security approvals out of it. That caveat is acceptable provided the feature is not marketed as trustworthy audit evidence."
+    },
+    {
+      "requirement": "The daemon detects a first sighting locally.",
+      "status": "met",
+      "evidence": "recordDestination keys observations by entryId and normalized origin and returns isNew only when the pair was not already present."
+    },
+    {
+      "requirement": "To email the owner, the server must be told.",
+      "status": "partial",
+      "evidence": "Only stderr and tool-result notices exist. The source explicitly describes opt-in email as future work, so unattended runs currently produce no owner notification; this is an honestly documented deferral rather than a completed alerting path."
+    },
+    {
+      "requirement": "shorter retention option (7 days) for the server-side log",
+      "status": "partial",
+      "evidence": "No retention implementation is shown; it remains proposed."
+    },
+    {
+      "requirement": "an explicit off switch for destination recording, accepting that it disables alerting",
+      "status": "met",
+      "evidence": "WUNDERVAULT_RECORD_DESTINATIONS values 0, false, off, or no make recordDestination return before creating the lock, directory, or store, with isNew false so the caller emits no notice."
+    },
+    {
+      "requirement": "Proposal: authenticate with the per-agent token that already exists",
+      "status": "partial",
+      "evidence": "Part B is not implemented, and the package already acknowledges the unresolved verifier and ProtectHome conflict. A copyable bearer token is not equivalent to kernel-supplied SO_PEERCRED, while agents sharing one uid can read and replay one another's token files."
+    },
+    {
+      "requirement": "signed .deb/.rpm, verified before install. Not curl | sudo sh",
+      "status": "partial",
+      "evidence": "This is a stated distribution requirement, but no installer, package metadata, signing process, or verification path is included."
+    },
+    {
+      "requirement": "macOS signing + Keychain ACL + hardened runtime",
+      "status": "partial",
+      "evidence": "This remains a proposal. It can provide a strong code-identity boundary when every IPC endpoint, update, entitlement, and designated requirement is correct, but it is not the same primitive as uid separation and does not protect availability from the same user."
+    },
+    {
+      "requirement": "Service account via the SCM; named pipes with security descriptors; Authenticode verification of the connecting process; DPAPI",
+      "status": "partial",
+      "evidence": "The Windows work is explicitly sequenced last and no implementation or detailed threat model is supplied."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/network-store.ts",
+      "line": 241,
+      "claim": "The Tier 1 notice puts the full origin and path into a model-visible tool result, so Tier 1 destinations do not remain on the customer's machine when the model is remotely hosted.",
+      "failure_scenario": "A typed Tier 1 operation first calls GET https://payroll.internal:8443/employees through an MCP client backed by a hosted model; toolNote contains that URL and path, and the client sends the tool result to the model provider even though the notice says the destination was recorded on this machine only.",
+      "suggested_direction": "Keep destination details on a strictly local user interface or stderr channel, and make any model-visible notice destination-free unless the customer explicitly consents to external disclosure."
+    },
+    {
+      "id": "F2",
+      "severity": "major",
+      "file": "src/network-store.ts",
+      "line": 153,
+      "claim": "withStoreLock tries to create the lock before creating its parent directory, causing every fresh installation to busy-wait for five seconds and then perform its first update without a lock.",
+      "failure_scenario": "On a new account where ~/.wundervault does not exist, openSync on ~/.wundervault/network.json.lock repeatedly returns ENOENT; the synchronous loop consumes five seconds, then calls fn unlocked, and two simultaneous first-use processes can both load an empty store and overwrite one another's destinations.",
+      "suggested_direction": "Ensure the protected directory exists with the intended permissions before lock acquisition, and distinguish a missing parent or other filesystem error from genuine lock contention."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "src/network-store.ts",
+      "line": 23,
+      "claim": "Part A still leaves approved private origins on the server, so its proposed removal of the standing private-network profile is not delivered before Part B.",
+      "failure_scenario": "A customer approves http://10.20.0.15:8080 for a Tier 1 entry; the approval remains stored on the server entry, allowing a breach or subpoena to reveal that internal address despite A2 saying approved private origins move to a local file.",
+      "suggested_direction": "Explicitly move this requirement and the corresponding privacy claim to Part B rather than restoring an agent-writable approval control before the uid split."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "src/network-store.ts",
+      "line": 83,
+      "claim": "load accepts structurally invalid version-1 records, allowing semantically corrupt JSON to throw during recording and break subsequent vault calls.",
+      "failure_scenario": "If network.json contains {\"version\":1,\"seen\":[null]}, load returns the null element, and the next recordDestination call throws when its find callback reads s.entryId instead of treating the store as corrupt and starting clean.",
+      "suggested_direction": "Validate every persisted observation and either discard invalid records or quarantine the invalid store before recordDestination operates on it."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "Relay-but-not-store email still creates durable destination copies outside Wundervault.",
+      "why_it_matters": "Even if the Wundervault server suppresses application logs and persistence, the destination will normally be retained in the owner's mailbox, the outbound mail provider, delivery telemetry, backups, and possibly security scanners. Option 1 is defensible only as explicit opt-in disclosure described as \"Wundervault does not retain it,\" not as \"the destination never leaves the machine\"; destination-free option 2 is the stronger default."
+    },
+    {
+      "id": "B2",
+      "concern": "The remaining fact-of-call stream can become identifiable through correlation.",
+      "why_it_matters": "Exact entry, agent, and timestamp sequences still reveal cadence and activity windows, and a Tier 2 request or server-held private-origin approval can associate an entry with a service; subsequent Tier 1 facts for that entry may then reconstruct much of the supposedly hidden profile. Local destinations still buy meaningful protection against direct server inspection, but not unlinkability."
+    },
+    {
+      "id": "B3",
+      "concern": "The proposed daemon-owned per-machine store has no tenant or uid namespace in its record key.",
+      "why_it_matters": "After the Linux split, two customers or OS users sharing one machine would write into one /var/lib/wundervault/network.json keyed only by entryId and origin. If entry identifiers collide or an IPC query is insufficiently scoped, observations can merge, suppress a customer's first-use alert, or be disclosed across customers; agents sharing one uid additionally can read and replay one another's per-agent tokens and cannot receive trustworthy per-agent attribution."
+    },
+    {
+      "id": "B4",
+      "concern": "The platform plans discuss authenticating the caller but do not specify how clients authenticate the daemon endpoint.",
+      "why_it_matters": "Unless the omitted IPC setup guarantees a protected endpoint and server authentication, a same-user process that claims a socket, Mach service, or pipe name first can receive tokens or operation metadata from a legitimate client. Code-signing the caller does not prevent the client from connecting to an impostor."
+    },
+    {
+      "id": "B5",
+      "concern": "Signing on macOS proves code identity, not user intent or service availability.",
+      "why_it_matters": "A signed and extensible client can still be driven by a compromised plugin or agent, while the same user can kill an unprivileged daemon even if hardened runtime prevents reading its memory. The macOS design may be comparable for key-extraction resistance, but presenting one undifferentiated cross-platform \"strong\" guarantee would hide materially different availability, replay, and caller-intent properties."
+    },
+    {
+      "id": "B6",
+      "concern": "The effect of local-store write failures on an already executed HTTP operation is unspecified.",
+      "why_it_matters": "A full disk, read-only home, or permission error makes save throw. If recording occurs after the upstream request in the unshown server flow, the caller can receive a failure after the external side effect succeeded and retry it; if it occurs before, an optional privacy record can prevent an otherwise valid vault call."
+    }
+  ],
+  "_meta": {
+    "round": 10,
+    "at": "2026-09-15T05:45:17+00:00",
+    "package_bytes": 44873,
+    "schema_problems": []
+  }
+}

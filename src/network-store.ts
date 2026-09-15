@@ -76,7 +76,15 @@ export function load(storePath = defaultStorePath()): NetworkShape {
     if (!existsSync(storePath)) return { version: 1, seen: [] };
     const parsed = JSON.parse(readFileSync(storePath, 'utf8')) as NetworkShape;
     if (!parsed || parsed.version !== 1) return { version: 1, seen: [] };
-    return { version: 1, seen: Array.isArray(parsed.seen) ? parsed.seen : [] };
+    // Validate ELEMENTS, not just the array. {"seen":[null]} is valid JSON and a valid
+    // shape, and would throw on the next read when a find callback touched .entryId.
+    const seen = Array.isArray(parsed.seen)
+      ? parsed.seen.filter((r): r is SeenDestination =>
+          !!r && typeof r === 'object'
+          && typeof (r as SeenDestination).entryId === 'string'
+          && typeof (r as SeenDestination).origin === 'string')
+      : [];
+    return { version: 1, seen };
   } catch {
     // A corrupt store must not break every vault call. Start clean rather than throw —
     // the worst case is one spurious "new destination" notice.
@@ -145,6 +153,10 @@ export function recordDestination(
  */
 function withStoreLock<T>(storePath: string, fn: () => T): T {
   const lockPath = `${storePath}.lock`;
+  // Without this, the very first call on a fresh install spins for the whole timeout:
+  // openSync returns ENOENT because the directory does not exist yet, which is
+  // indistinguishable from contention in the loop below.
+  try { mkdirSync(path.dirname(storePath), { recursive: true, mode: 0o700 }); } catch { /* handled below */ }
   const deadline = Date.now() + 5000;
   let fd: number | undefined;
   for (;;) {
@@ -214,6 +226,19 @@ export function newDestinationNotice(
   secretName: string, origin: string, method: string, path: string,
   /** Which tier authorised this call. The notice must not describe the wrong one. */
   tier: string = '1',
+  /**
+   * Did the CALLER choose this destination?
+   *
+   * The tool result is read by the model, and for a hosted model that means it reaches
+   * the model provider. When the agent described the request itself, the destination is
+   * already in its context and repeating it discloses nothing new. When the operation
+   * was a SIGNED definition, the agent supplied only an operation id — the origin and
+   * path came from the definition, and putting them in the tool note would send a
+   * destination to the model provider that it never had. So the note omits them there,
+   * and stderr carries the detail, because stderr goes to the client process and never
+   * through the model.
+   */
+  callerChoseDestination: boolean = true,
 ): DestinationNotice {
   const at = new Date().toISOString();
   const isTier2 = String(tier) === '2';
@@ -222,17 +247,24 @@ export function newDestinationNotice(
   // telling them "this was not gated" and "the destination stayed on this machine"
   // would both be false — the approval is precisely where it was disclosed.
   const explanation = isTier2
-    ? `   You approved this operation, so it was gated. The destination was sent to the `
-      + `server as part of that approval; it is also recorded here.`
+    ? `   You approved this operation, so it was gated. The destination was sent to `
+      + `Wundervault as part of that approval; it is also recorded on this machine.`
     : `   Tier 1 does not gate destinations, so this is a notice rather than a block. `
       + `If you did not expect it, revoke this agent and rotate the secret at the provider. `
       + `Moving the secret to Tier 2 makes each new request wait for approval.\n`
-      + `   Recorded on this machine only — the destination was not sent to the server.`;
+      + `   Recorded on this machine; the destination was not sent to Wundervault. `
+      + `(This note travels in the tool result, so it reaches whoever runs your model.)`;
+
+  // The destination appears in the tool note ONLY when the caller already supplied it.
+  const where = callerChoseDestination
+    ? `against ${origin}.\n   ${method} ${origin}${path}\n`
+    : `on a destination fixed by its signed operation definition.\n`
+      + `   Details are on the daemon's stderr, which does not pass through your model.\n`;
 
   return {
     stderrLine:
       `[wundervault] NEW DESTINATION ${at} tier=${tier} secret="${secretName}" ${method} ${origin}${path}\n`,
-    toolNote: `⚠ First use of "${secretName}" against ${origin}.\n   ${method} ${origin}${path}\n${explanation}`,
+    toolNote: `⚠ First use of "${secretName}" ${where}${explanation}`,
   };
 }
 

@@ -40,13 +40,26 @@ requires seeing it. That is consented disclosure of one call, not a standing pro
 | data | today | proposed |
 |---|---|---|
 | seen destinations (the "new destination" baseline) | server access log | local file |
-| approved private origins | server, on the entry | local file |
+| approved private origins | server, on the entry | **stays server-side** — see A5a |
 | Tier 1 call destination | server access log | local only |
 | Tier 1 fact-of-call (entry, agent, time) | server | **unchanged — stays server-side** |
 | Tier 2 requested operation | server | unchanged — approval needs it |
 
 Keeping the fact-of-call server-side preserves the tamper-evident, HMAC-chained audit
 that already exists. Only the *where* becomes local.
+
+## A5a. Why approvals did NOT move
+
+An earlier draft moved them local with everything else. That was a regression: the file
+is writable by the agent's uid, so a compromised agent could write its own approval and
+walk through the SSRF filter it was meant to be constrained by.
+
+An observation being forgeable costs a missed notice. A control being forgeable costs the
+control. So the local store records what happened and never decides what is allowed, and
+approvals stay where the owner authenticates — at the cost of the server learning the
+internal addresses of entries you explicitly approve. That is a small consented
+disclosure rather than a standing profile, and it becomes local once a daemon-owned path
+exists.
 
 ## A3. The honest limit
 

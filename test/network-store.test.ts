@@ -204,3 +204,48 @@ describe('round 1 fixes', () => {
     expect(existsSync(`${store}.lock`)).toBe(false);
   });
 });
+
+describe('round 2 fixes', () => {
+  it('keeps a signed operation\'s destination out of the tool result', () => {
+    // The tool result is read by the model, and for a hosted model that reaches the
+    // model provider. With a signed operation the agent supplied only an operation id —
+    // the origin and path came from the definition, so putting them in the note would
+    // disclose a destination the model never had.
+    const n = newDestinationNotice('Payroll', 'https://payroll.internal:8443', 'GET', '/employees', '1', false);
+    expect(n.toolNote).not.toContain('payroll.internal');
+    expect(n.toolNote).not.toContain('/employees');
+    // stderr still carries it: that channel never passes through the model.
+    expect(n.stderrLine).toContain('payroll.internal');
+    expect(n.stderrLine).toContain('/employees');
+  });
+
+  it('includes the destination when the caller chose it', () => {
+    // Already in the agent's context, so repeating it discloses nothing new.
+    const n = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/zones', '1', true);
+    expect(n.toolNote).toContain('api.cf.com');
+  });
+
+  it('says Wundervault rather than "the server", and warns where the note travels', () => {
+    // "not sent to the server" was ambiguous: true of ours, false of the model provider.
+    const n = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/zones', '1', true);
+    expect(n.toolNote).toMatch(/not sent to Wundervault/);
+    expect(n.toolNote).toMatch(/reaches whoever runs your model/);
+  });
+
+  it('drops malformed rows instead of throwing on the next read', () => {
+    // {"seen":[null]} is valid JSON and a valid shape, and used to throw when a find
+    // callback touched .entryId.
+    writeFileSync(store, JSON.stringify({ version: 1, seen: [null, 'x', { entryId: 'e', origin: 'o', firstSeen: 'a', lastSeen: 'a', count: 1 }] }));
+    expect(load(store).seen).toHaveLength(1);
+    expect(() => recordDestination('e2', 'https://h.example:443', store)).not.toThrow();
+  });
+
+  it('does not spin when the store directory does not exist yet', () => {
+    // openSync on the lock returned ENOENT, which the loop could not tell from
+    // contention, so the first call on a fresh install burned the whole timeout.
+    const fresh = path.join(dir, 'nested', 'deeper', 'network.json');
+    const started = Date.now();
+    expect(recordDestination('e1', 'https://h.example:443', fresh).isNew).toBe(true);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+});
