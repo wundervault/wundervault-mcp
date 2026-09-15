@@ -170,3 +170,55 @@ export function revokePrivateOrigin(
   save(shape, storePath);
   return next;
 }
+
+
+// ── telling the owner, without telling the server ──────────────────────────────
+
+export interface DestinationNotice {
+  /** For stderr — the model cannot suppress this. */
+  stderrLine: string;
+  /** For the tool result — the model reads this and can explain it in context. */
+  toolNote: string;
+}
+
+/**
+ * Compose the first-sighting notice.
+ *
+ * Two channels, deliberately, and the split matters:
+ *
+ *  - **stderr** goes from this process straight to the MCP client and never passes
+ *    through the model. A compromised agent can decide not to mention a tool result; it
+ *    cannot strip a line already written to stderr. That makes this the channel of
+ *    record.
+ *  - **the tool result** is how the agent explains it to you in the conversation, which
+ *    is where you are actually looking.
+ *
+ * Neither reaches the server. The destination stays on this machine, so the default
+ * install leaves the server knowing nothing about where a secret goes — no relay, no
+ * transient handling, nothing to store.
+ *
+ * The case this does NOT cover is an unattended run: a scheduled agent at 3am with
+ * nobody watching the terminal. Email covers that and is therefore opt-in, labelled as
+ * the choice that sends the destination to the server in order to deliver it.
+ */
+export function newDestinationNotice(
+  secretName: string, origin: string, method: string, path: string,
+): DestinationNotice {
+  const at = new Date().toISOString();
+  return {
+    stderrLine:
+      `[wundervault] NEW DESTINATION ${at} secret="${secretName}" ${method} ${origin}${path}\n`,
+    toolNote:
+      `⚠ First use of "${secretName}" against ${origin}.\n`
+      + `   ${method} ${origin}${path}\n`
+      + `   Tier 1 does not gate destinations, so this is a notice rather than a block. `
+      + `If you did not expect it, revoke this agent and rotate the secret at the provider. `
+      + `Moving the secret to Tier 2 makes each new request wait for approval.\n`
+      + `   Recorded on this machine only — the destination was not sent to the server.`,
+  };
+}
+
+/** Write the notice where the model cannot interfere with it. */
+export function emitToStderr(notice: DestinationNotice): void {
+  try { process.stderr.write(notice.stderrLine); } catch { /* never break a call over a log line */ }
+}

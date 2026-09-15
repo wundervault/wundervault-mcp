@@ -17,6 +17,8 @@ import { createHash } from 'node:crypto';
 import { loadOpenSshEd25519, runSshBrokered, modeAllowsLegacyExec, modeAllowsSshBroker,
   modeAllowsHttpBroker, wrongModeMessage, type BrokeredOp } from './ssh-agent.js';
 import { verifyOperationDefinition, validateArguments } from './opdef.js';
+import { recordDestination, approvedPrivateOrigins as localApprovedOrigins,
+  newDestinationNotice, emitToStderr } from './network-store.js';
 import { definitionFromAgentRequest, originString, isApprovedPrivateOrigin, type AgentRequest } from './http-broker.js';
 import { performOperation } from './http-broker.js';
 import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey, commandInvokesSudo } from './exec.js';
@@ -673,12 +675,21 @@ export function createServer(args: { url?: string } = {}) {
             );
           }
 
-          let approvedOrigins: string[] = [];
-          try {
-            const raw = secretData.allowed_private_origins as unknown;
-            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-            if (Array.isArray(parsed)) approvedOrigins = parsed.filter((x): x is string => typeof x === 'string');
-          } catch { approvedOrigins = []; }
+          // Approvals are read from the LOCAL store. They name the customer's internal
+          // addresses, which is exactly the kind of thing that should not sit in someone
+          // else's database.
+          const approvedOrigins = localApprovedOrigins(entry_id);
+
+          // Recorded here, on this machine. The server is never told where this went.
+          const originStr = originString(def.origin);
+          const { isNew } = recordDestination(entry_id, originStr);
+          let noticeForAgent = '';
+          if (isNew) {
+            const notice = newDestinationNotice(
+              secretData.name ?? entry_id, originStr, def.route.method, def.route.path);
+            emitToStderr(notice);
+            noticeForAgent = `\n\n${notice.toolNote}`;
+          }
 
           const result = await performOperation(
             def,
@@ -703,7 +714,7 @@ export function createServer(args: { url?: string } = {}) {
           return CallToolResultSchema.parse({
             content: [{ type: 'text', text:
               `✅ ${label} → HTTP ${result.status} (tier ${verdict.tier}). The credential was used here, not returned to you.\n`
-              + `${JSON.stringify(result.body, null, 2)}` }],
+              + `${JSON.stringify(result.body, null, 2)}${noticeForAgent}` }],
           });
         } finally {
           plaintextBytes.fill(0);
