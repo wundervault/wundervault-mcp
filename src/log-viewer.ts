@@ -30,7 +30,8 @@
  * 0600 next to the store, which you open with your own browser and delete when done.
  */
 import { writeFileSync, readFileSync, mkdirSync, chmodSync, accessSync, existsSync,
-         openSync, closeSync, renameSync, unlinkSync, constants } from 'node:fs';
+         openSync, closeSync, renameSync, unlinkSync, statSync, constants } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import * as net from 'node:net';
 import * as path from 'node:path';
@@ -289,6 +290,51 @@ export function writeViewer(storePath = defaultStorePath(), outPath?: string,
   renameSync(tmp, target);
 
   return target;
+}
+
+/**
+ * Open the page, then destroy it.
+ *
+ * The store is protected; this page is a COPY of it, and it lands in a directory every
+ * agent can read — they run as the owner, so a 0600 file in the owner's home is a 0600
+ * file they can open. Protecting the vault and then leaving a snapshot beside it is a
+ * strange place to stop.
+ *
+ * So the copy is temporary: written, opened, and shredded when the viewer is done with it.
+ * The exposure goes from permanent to the length of time somebody is actually looking, and
+ * a browser has the file content in memory by then anyway, so nothing is lost by removing
+ * it from disk.
+ *
+ * It is NOT put in /tmp. That directory is world-traversable and shared with every other
+ * user on the machine; the owner's own directory, 0600, is a smaller audience than that
+ * even before the file disappears.
+ */
+export function shredViewer(target: string): void {
+  try {
+    if (!existsSync(target)) return;
+    const size = statSync(target).size;
+    // Overwrite before unlinking. Not a guarantee on a journalling or copy-on-write
+    // filesystem, and worth saying so rather than implying the bytes are gone.
+    if (size > 0) writeFileSync(target, randomBytes(size));
+    unlinkSync(target);
+  } catch { /* best effort: a leftover page is the thing we were avoiding, not a crash */ }
+}
+
+/**
+ * Hand the page to a browser without waiting on one.
+ *
+ * `xdg-open` returns as soon as it has handed off, so it cannot tell us when the reader is
+ * finished — which is why the caller waits on a signal or a timeout rather than on this.
+ * Failure is not fatal: on a headless box there is no opener, and printing the path is a
+ * perfectly good outcome.
+ */
+export function openInBrowser(target: string): boolean {
+  const opener = process.platform === 'darwin' ? 'open'
+    : process.platform === 'win32' ? 'start' : 'xdg-open';
+  try {
+    execFileSync(opener, [target], { stdio: 'ignore', timeout: 5_000 });
+    return true;
+  } catch { return false; }
 }
 
 /**

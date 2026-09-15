@@ -41,8 +41,33 @@ export const SYSTEM_ACCOUNT = 'wundervault';
  * cannot move the daemon's state by exporting a variable, because it does not control the
  * daemon's environment.
  */
+/**
+ * Is the uid split actually available here?
+ *
+ * Phase 4 is Linux, and macOS (4b) and Windows (4c) are deliberately later. But OUT OF
+ * SCOPE HAS TO MEAN UNCHANGED, not broken — and for two commits it meant broken. The
+ * daemon's constructor calls ensureSystemRoot() unconditionally, so on macOS it tried to
+ * mkdir /var/lib/wundervault as a normal user and died with EACCES where it had previously
+ * used the home directory. On Windows it is quieter and worse: /var/lib/wundervault
+ * resolves to C:\var\lib\wundervault, the mkdir SUCCEEDS, and the daemon then tries to
+ * bind unix domain sockets there, which Windows does not have.
+ *
+ * Every non-Linux platform therefore keeps the pre-split layout exactly: state in the
+ * user's own directory, daemon as the user. That is the old threat model, and the code
+ * says so out loud rather than letting anyone infer a boundary that is not there.
+ */
+export const SPLIT_AVAILABLE = process.platform === 'linux';
+
+/** True where the daemon holds a real privilege boundary rather than merely tidy habits. */
+export function splitAvailable(): boolean {
+  return SPLIT_AVAILABLE;
+}
+
 export function systemRoot(): string {
-  return process.env.WUNDERVAULT_SYSTEM_ROOT || DEFAULT_SYSTEM_ROOT;
+  if (process.env.WUNDERVAULT_SYSTEM_ROOT) return process.env.WUNDERVAULT_SYSTEM_ROOT;
+  // Off Linux there is no system account and no unit: the daemon is the user, as before.
+  if (!SPLIT_AVAILABLE) return userRoot();
+  return DEFAULT_SYSTEM_ROOT;
 }
 
 /**
@@ -77,6 +102,8 @@ export function userRoot(): string {
 export function runtimeDir(): string {
   if (process.env.RUNTIME_DIRECTORY) return process.env.RUNTIME_DIRECTORY.split(':')[0];
   if (process.env.WUNDERVAULT_RUNTIME_DIR) return process.env.WUNDERVAULT_RUNTIME_DIR;
+  // /run is a Linux thing, and so is the systemd RuntimeDirectory that manages it.
+  if (!SPLIT_AVAILABLE) return userRoot();
   const run = `/run/${SYSTEM_ACCOUNT}`;
   try { if (fs.existsSync(run)) return run; } catch { /* fall through */ }
   return path.join(systemRoot(), 'run');
@@ -112,10 +139,13 @@ export const networkStorePath = () => path.join(systemRoot(), 'network.json');
  * per-agent ones, and every action behind it carries its own proof — a setup link to
  * enrol, the agent's own token to remove. Nothing is protected by being hard to reach.
  */
-export const mgmtDir = () => path.join(runtimeDir(), 'mgmt');
+export const mgmtDir = () =>
+  SPLIT_AVAILABLE ? path.join(runtimeDir(), 'mgmt') : runtimeDir();
 export const mgmtSocketPath = () => path.join(mgmtDir(), 'agent.sock');
 export const agentSocketPath = (name: string) =>
-  path.join(runtimeDir(), `${safeName(name)}.sock`);
+  SPLIT_AVAILABLE
+    ? path.join(runtimeDir(), `${safeName(name)}.sock`)
+    : path.join(runtimeDir(), 'agents', `${safeName(name)}.sock`);
 
 // ── agent-side paths ──────────────────────────────────────────────────────────
 
@@ -189,6 +219,11 @@ export function safeName(name: string): string {
 export function ensureSystemRoot(root = systemRoot()): void {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   fs.chmodSync(root, 0o700);
+  // The mode check is the BOUNDARY on Linux and merely hygiene elsewhere, where the
+  // directory belongs to the same user the agents run as. Refusing to start over it off
+  // Linux would block a daemon on a platform that never claimed the boundary — Windows in
+  // particular reports modes that do not mean what they say.
+  if (!SPLIT_AVAILABLE) return;
   const mode = fs.statSync(root).mode & 0o777;
   if (mode !== 0o700) {
     throw new Error(

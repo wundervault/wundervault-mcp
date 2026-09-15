@@ -37,6 +37,7 @@ import { redeemSetupLink, peekAgentName } from './enrol.js';
 import {
   systemRoot, profilesPath, saltPath, mgmtSocketPath, agentSocketPath,
   runtimeDir, ensureSystemRoot, safeName, SYSTEM_ACCOUNT, mgmtDir, networkStorePath,
+  splitAvailable,
 } from './paths.js';
 import { load as loadNetworkShape } from './network-store.js';
 
@@ -60,6 +61,27 @@ interface ProfileStore {
  * every protection below would still appear to be working. Failing here makes the mistake
  * loud at the only moment anyone is watching.
  */
+/**
+ * Say which world this daemon is actually running in.
+ *
+ * On Linux after the install it holds a real boundary: a different uid, a directory the
+ * agent cannot open, memory the agent cannot read. Everywhere else it is the same uid as
+ * the agents it serves, which is careful handling and nothing more. Printing that at
+ * startup is the difference between a limitation and a false claim — the release notes say
+ * "the key never reaches the agent", and on macOS today that is true only of an agent that
+ * does not try.
+ */
+function announceBoundary(): void {
+  if (splitAvailable()) return;
+  console.error(
+    `[wundervault-agent] Running on ${process.platform}, where the uid split is not yet\n` +
+    `[wundervault-agent] available. State is in your own directory and this daemon runs as\n` +
+    `[wundervault-agent] YOU — so its key material and memory are readable by anything you\n` +
+    `[wundervault-agent] run, including your agents. That is the pre-split threat model.\n` +
+    `[wundervault-agent] The boundary is Linux-only for now.`,
+  );
+}
+
 function refuseRoot(): void {
   const uid = (process as unknown as { getuid?: () => number }).getuid?.();
   if (uid === 0) {
@@ -665,8 +687,10 @@ With no arguments it runs as the daemon. It is normally started by systemd as th
                 credentials never pass through this process.
   --migrate     Show which pre-split agents still need moving across, and how.
   --finish      With --migrate: delete the pre-split store, once every agent is across.
-  --destinations  Write the page showing where your agents have sent secrets.
-                Needs sudo: the record belongs to the daemon so your agents cannot read it.
+  --destinations  Show where your agents have sent secrets. Needs sudo: the record
+                belongs to the daemon so your agents cannot read it. The page is opened
+                and then DELETED, because it is a copy your agents could otherwise read.
+  --keep        With --destinations: leave the page on disk instead.
 
 State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
 `);
@@ -682,8 +706,8 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
     // refuseRoot is deliberately NOT called on this path: reading the store is the one
     // thing that requires being root, because the file belongs to the daemon's account and
     // that is what stops the agents reading it.
-    const { writeViewer, collectShape, resolveSudoUser, dropToSudoUser } =
-      await import('./log-viewer.js');
+    const { writeViewer, collectShape, resolveSudoUser, dropToSudoUser,
+            shredViewer, openInBrowser } = await import('./log-viewer.js');
     const { defaultStorePath } = await import('./network-store.js');
     const pathMod = await import('node:path');
     const store = defaultStorePath();
@@ -709,12 +733,42 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
         }
         const out = writeViewer(store, target, shape);
         const calls = shape.seen.reduce((n: number, x: { count: number }) => n + x.count, 0);
+        const keep = argv.includes('--keep');
+
         console.log(
           `\nDestination log — ${shape.seen.length} destination(s), ${calls} call(s)\n` +
-          `  store:  ${store}\n  viewer: ${out}\n\n` +
-          `Open that file in your browser. It contains the data already, loads nothing, and\n` +
-          `is blocked by its own content-security policy from making any network request.\n`);
-        process.exit(0);
+          `  store:  ${store}\n  viewer: ${out}\n`);
+
+        if (keep) {
+          // Deliberate, and said plainly. Someone may want the page to keep or to send.
+          console.log(
+            `Kept on disk at your request. It is a full copy of the record above, and your\n` +
+            `agents run as you — so anything you run can read it until you delete it.\n`);
+          process.exit(0);
+        }
+
+        // Removed on the way out however we leave: a clean exit, a ctrl-C, or the timeout.
+        // Leaving the copy behind is the thing being avoided, so it must not depend on the
+        // user choosing the tidy path.
+        let gone = false;
+        const cleanup = () => { if (!gone) { gone = true; shredViewer(out); } };
+        process.on('exit', cleanup);
+        for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+          process.on(sig, () => { cleanup(); process.exit(0); });
+        }
+
+        const opened = openInBrowser(out);
+        console.log(opened
+          ? `Opened in your browser. The copy is removed when you close this command —\n` +
+            `press ctrl-C when you are done, or it clears itself in 10 minutes.\n` +
+            `(--keep leaves it on disk instead.)\n`
+          : `Could not open a browser. Open the file above, then press ctrl-C here to\n` +
+            `remove it. It clears itself in 10 minutes. (--keep leaves it on disk.)\n`);
+        console.log(
+          `It is deleted because it is a COPY of a record your agents cannot otherwise\n` +
+          `read: they run as you, so a file in your home is a file they can open.\n`);
+
+        setTimeout(() => { cleanup(); process.exit(0); }, 10 * 60 * 1000);
       })
       .catch((e: Error) => { console.error(e.message); process.exit(1); });
   } else if (argv.includes('--enrol')) {
@@ -777,6 +831,7 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
     }
   } else {
     refuseRoot();
+    announceBoundary();
     const daemon = new AgentDaemon();
     daemon.start();
     process.on('SIGTERM', () => { daemon.shutdown(); process.exit(0); });

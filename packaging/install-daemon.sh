@@ -31,6 +31,13 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" = "0" ] || { echo "This step needs root. Re-run with sudo." >&2; exit 1; }
+case "$(uname -s)" in
+  Linux) ;;
+  *)
+    echo "This installer is for Linux. The uid split is not available on $(uname -s) yet —" >&2
+    echo "the daemon there runs as you, with the pre-split threat model. Nothing to install." >&2
+    exit 1 ;;
+esac
 command -v systemctl >/dev/null 2>&1 || {
   echo "systemd not found. This installer is for systemd Linux; see the docs for other init systems." >&2
   exit 1
