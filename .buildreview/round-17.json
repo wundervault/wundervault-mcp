@@ -1,0 +1,147 @@
+{
+  "verdict": "revise",
+  "summary": "The Linux split is substantially represented in the shown paths, root refusal, direct destination-store reader, and Linux-only installer gate, while most enrolment, authentication, migration, unit, and installer implementation remains outside the excerpt. The new destination viewer reduces persistence but has cleanup and concurrency failure modes, and the non-Linux path may alias the active profile store with the migration source. These issues should be resolved before presentation.",
+  "spec_check": [
+    {
+      "requirement": "E1. A system unit, `User=wundervault`, `Group=wundervault`.",
+      "status": "partial",
+      "evidence": "The daemon expects `SYSTEM_ACCOUNT = 'wundervault'`, rejects uid 0, and the package reports a real two-uid systemd test, but the unit file is not included."
+    },
+    {
+      "requirement": "D1. The agent's uid cannot read `/var/lib/wundervault`. Enforced by mode 0700 on a directory owned by another user.",
+      "status": "partial",
+      "evidence": "`systemRoot()` selects `/var/lib/wundervault` on Linux and `ensureSystemRoot()` forces and verifies mode 0700; ownership creation is in the omitted portion of the installer, although the package reports verification with two real uids."
+    },
+    {
+      "requirement": "D2. The agent cannot read the daemon's memory. Enforced by uid separation.",
+      "status": "partial",
+      "evidence": "The code rejects root and the package reports the service running as a separate `wundervault` uid, but the unit establishing that uid is not shown."
+    },
+    {
+      "requirement": "B1. The only way a profile enters the daemon is `enrol`, carrying a setup link. There is no `register_profile`.",
+      "status": "partial",
+      "evidence": "The visible dispatch includes `--enrol`, but the enrolment and management handlers where alternate profile-writing operations would exist are withheld."
+    },
+    {
+      "requirement": "B2\u2013B4a. The daemon redeems the setup link, enforces its configured origin, refuses redirects and non-JSON responses, stores before burning, reports burn failure, and permits one enrolment per connection.",
+      "status": "partial",
+      "evidence": "`redeemSetupLink` is imported and the package reports successful real enrolment and rogue-origin refusal, but `src/enrol.ts` and the management connection handler are not included."
+    },
+    {
+      "requirement": "C1\u2013C3. Sockets are connectable by the owner, tokens are compared in constant time, wrong callers alone pay the delay, and valid callers remain serviceable.",
+      "status": "partial",
+      "evidence": "The path layout places Linux sockets under the runtime directory and the package reports real valid-token operation, but socket modes, comparison, delay, and deadline logic are outside the extract."
+    },
+    {
+      "requirement": "D3. The destination store lives under `/var/lib/wundervault`, is not served over the management socket, and `--destinations` reads it as root.",
+      "status": "partial",
+      "evidence": "`networkStorePath()` derives from `systemRoot()`, and `collectShape()` reads the file directly rather than using the management socket. The complete management protocol is withheld, so absence of another read operation cannot be independently confirmed."
+    },
+    {
+      "requirement": "Acceptance check 12. `--destinations` refuses rather than showing an empty page to a user who cannot read the store, and names sudo as the way through.",
+      "status": "met",
+      "evidence": "`collectShape()` distinguishes an unreadable directory or file from an absent store, throws instead of calling the empty-on-error loader, and prints `sudo wundervault-agent --destinations`."
+    },
+    {
+      "requirement": "Acceptance check 20. `--destinations` is dispatched by the binary every message names, and does not refuse to run as root.",
+      "status": "met",
+      "evidence": "`src/agent.ts` dispatches `--destinations` before the daemon's `refuseRoot()` path, reads the store, then drops to `SUDO_USER` before writing into that user's home."
+    },
+    {
+      "requirement": "E2. The unit contains every listed hardening directive and does not set `MemoryDenyWriteExecute`.",
+      "status": "partial",
+      "evidence": "The unit file is not included; the package only states that the Linux behavior was re-verified under real systemd."
+    },
+    {
+      "requirement": "E3\u2013E5. Only `/var/lib/wundervault` is writable, systemd manages the runtime directory, and the daemon refuses root.",
+      "status": "partial",
+      "evidence": "`runtimeDir()` recognizes `RUNTIME_DIRECTORY`, and `refuseRoot()` exits for uid 0; `ReadWritePaths`, `RuntimeDirectory`, and the rest of the unit are not shown."
+    },
+    {
+      "requirement": "F1\u2013F5. Migration carries no credentials, removes the old user unit, preserves socket tokens, refuses premature deletion, and is idempotent.",
+      "status": "partial",
+      "evidence": "Legacy and split path helpers are visible, but migration implementation is withheld; the new non-Linux path alias also creates the conditional destructive case in F3."
+    },
+    {
+      "requirement": "G1\u2013G4. The privileged install is limited, verified rather than piped unverified into root, printed in full, and re-runnable.",
+      "status": "partial",
+      "evidence": "The shown installer now refuses non-Linux and systems without systemd, but only a small excerpt is provided, so package verification, command presentation, privileged scope, and idempotence cannot be checked."
+    },
+    {
+      "requirement": "Acceptance check 14. Nothing in the codebase resolves daemon state through `os.homedir()` any more.",
+      "status": "met",
+      "evidence": "For the Linux phase, daemon paths derive from `/var/lib/wundervault` and the runtime directory; `os.homedir()` remains only in `userRoot()` for agent-owned state and the deliberately pre-split non-Linux fallback."
+    },
+    {
+      "requirement": "Acceptance checks 15\u201319 and 21\u201324.",
+      "status": "partial",
+      "evidence": "The package reports tests for symlink escalation, origin refusal, token preservation, and real enrolment, but the installer checks, remove handler, setup-link transport, burn ordering, per-connection enrolment guard, and management deadline are not in the supplied files."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "major",
+      "file": "src/log-viewer.ts",
+      "line": null,
+      "claim": "`shredViewer()` skips the unlink whenever allocating or writing the full-size random overwrite fails, while suppressing the error and allowing the command to report successful cleanup.",
+      "failure_scenario": "An unbounded destination log produces a 500 MB viewer on a memory-constrained machine; `randomBytes(size)` throws an allocation error before `writeFileSync` runs, the single catch swallows it, `unlinkSync` is never attempted, and the complete readable viewer remains in the user's home after the command exits successfully.",
+      "suggested_direction": "Make unlinking an independent final action that is attempted even when overwriting fails, and either overwrite in bounded chunks or omit the overwrite rather than allocating a second full copy in memory."
+    },
+    {
+      "id": "F2",
+      "severity": "minor",
+      "file": "src/agent.ts",
+      "line": 760,
+      "claim": "The synchronous browser opener can block the event loop that must run the cleanup timer and installed signal handlers.",
+      "failure_scenario": "On a desktop where `xdg-open` waits on a browser helper that catches or ignores the timeout's SIGTERM, `execFileSync` does not return; the ten-minute timer cannot fire and Ctrl-C cannot run the JavaScript SIGINT handler, so the command and plaintext viewer remain indefinitely.",
+      "suggested_direction": "Launch the opener asynchronously without waiting for its completion, while retaining the existing timeout and cleanup lifecycle in the parent process."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "src/paths.ts",
+      "line": null,
+      "claim": "If the withheld `--migrate --finish` implementation deletes `legacy.profiles()` as required without a non-Linux guard, the new fallback makes it delete the active profile store on macOS and Windows.",
+      "failure_scenario": "With `process.platform === 'darwin'` and no path overrides, both `profilesPath()` and `legacy.profiles()` resolve to `~/.wundervault/agent-profiles.enc`; running the still-advertised `--migrate --finish` path can therefore classify the same profiles as already migrated and unlink the file the running pre-split daemon actually uses, losing all profiles after restart.",
+      "suggested_direction": "Refuse split migration where the split is unavailable, and defensively refuse deletion whenever the legacy and active profile paths resolve to the same file."
+    },
+    {
+      "id": "F4",
+      "severity": "minor",
+      "file": "src/agent.ts",
+      "line": 754,
+      "claim": "Cleanup identifies the viewer only by its fixed pathname, so one invocation can shred a newer viewer created or explicitly kept by another invocation.",
+      "failure_scenario": "Command A opens `~/.wundervault/destinations.html` and waits; command B then writes a newer page to the same path with `--keep` and exits; when A reaches its timer or receives Ctrl-C, A overwrites and deletes B's explicitly kept page.",
+      "suggested_direction": "Give each invocation a unique output path or retain file identity and delete only the inode that the invocation itself created."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The platform gate equates `process.platform === 'linux'` with an actual uid split.",
+      "why_it_matters": "A Linux user can manually run the daemon with `WUNDERVAULT_SYSTEM_ROOT` pointing into their home, or on a non-systemd installation, and receive no pre-split warning even though the daemon and agents share a uid; the announcement should reflect effective deployment state rather than OS name alone."
+    },
+    {
+      "id": "B2",
+      "concern": "Windows browser opening names `start` as though it were an executable.",
+      "why_it_matters": "`start` is normally a `cmd.exe` built-in, so `execFileSync('start', ...)` returns ENOENT and automatic opening always falls back to manual instructions on Windows despite the build claiming that `start` opens the page."
+    },
+    {
+      "id": "B3",
+      "concern": "Cleanup does not cover terminating signals such as SIGQUIT or process crashes before a normal exit.",
+      "why_it_matters": "Pressing Ctrl-\\ sends SIGQUIT, which bypasses the registered handlers and does not run the normal exit callback, leaving the full viewer on disk indefinitely just as SIGKILL does."
+    },
+    {
+      "id": "B4",
+      "concern": "The temporary page is written in a location that may be watched by backup, indexing, synchronization, or snapshot software.",
+      "why_it_matters": "A home-directory sync client or filesystem snapshot can copy the destination history during the ten-minute window, after which deleting or overwriting the original does not remove the persistent external copy."
+    }
+  ],
+  "_meta": {
+    "round": 17,
+    "at": "2026-09-15T21:59:16+00:00",
+    "package_bytes": 87123,
+    "schema_problems": []
+  }
+}

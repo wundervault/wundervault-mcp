@@ -750,8 +750,16 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
         // Removed on the way out however we leave: a clean exit, a ctrl-C, or the timeout.
         // Leaving the copy behind is the thing being avoided, so it must not depend on the
         // user choosing the tidy path.
+        // The inode, captured now, so cleanup can tell OUR page from one another
+        // invocation wrote to the same path — including one deliberately kept with --keep.
+        let stamp: { ino: number; mtimeMs: number } | undefined;
+        try {
+          const st = fs.statSync(out);
+          stamp = { ino: st.ino, mtimeMs: st.mtimeMs };
+        } catch { /* gone already; cleanup will no-op */ }
+
         let gone = false;
-        const cleanup = () => { if (!gone) { gone = true; shredViewer(out); } };
+        const cleanup = () => { if (!gone) { gone = true; shredViewer(out, stamp); } };
         process.on('exit', cleanup);
         for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
           process.on(sig, () => { cleanup(); process.exit(0); });

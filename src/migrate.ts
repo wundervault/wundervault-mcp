@@ -28,7 +28,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { legacy, mgmtSocketPath } from './paths.js';
+import { legacy, mgmtSocketPath, splitAvailable } from './paths.js';
 
 /** One request/response over a socket. */
 export function ask(payload: unknown, sockPath = mgmtSocketPath(), timeoutMs = 30_000): Promise<any> {
@@ -132,7 +132,27 @@ export interface MigrationStatus {
 }
 
 /** What still needs doing. Reads; changes nothing. */
+/**
+ * Migration is a Linux-only operation, and saying so prevents data loss.
+ *
+ * Off Linux there is no split to migrate TO: systemRoot() returns the user's own directory,
+ * which means `profilesPath()` and `legacy.profiles()` are THE SAME FILE. Every agent the
+ * daemon knows about therefore appears "already across", nothing is pending, and
+ * `--migrate --finish` shreds the store the running daemon is actually using. A cleanup
+ * step that deletes the live credential file because it mistook it for a leftover is about
+ * the worst outcome available here, and it would have looked like a successful migration.
+ */
+function refuseOffLinux(): void {
+  if (splitAvailable()) return;
+  throw new Error(
+    `Migration is Linux-only. On ${process.platform} the daemon already stores credentials ` +
+    `in your own directory and there is nothing to move — the source and destination are ` +
+    `the same file, so continuing would delete the store this machine is using.`,
+  );
+}
+
 export async function status(): Promise<MigrationStatus> {
+  refuseOffLinux();
   const oldStorePath = legacy.profiles();
   const ping = await ask({ action: 'ping' }).catch((e) => {
     throw new Error(
@@ -232,6 +252,7 @@ export interface CleanupResult { deleted: boolean; oldUnitStopped: boolean; pend
  * way back except creating a new one.
  */
 export async function cleanup(): Promise<CleanupResult> {
+  refuseOffLinux();
   const st = await status();
   if (st.alreadyDone) {
     // The store is already gone, but the old unit may not be — an earlier --finish could

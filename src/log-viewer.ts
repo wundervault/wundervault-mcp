@@ -32,7 +32,7 @@
 import { writeFileSync, readFileSync, mkdirSync, chmodSync, accessSync, existsSync,
          openSync, closeSync, renameSync, unlinkSync, statSync, constants } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import * as net from 'node:net';
 import * as path from 'node:path';
 import { load, defaultStorePath, type NetworkShape } from './network-store.js';
@@ -309,15 +309,35 @@ export function writeViewer(storePath = defaultStorePath(), outPath?: string,
  * user on the machine; the owner's own directory, 0600, is a smaller audience than that
  * even before the file disappears.
  */
-export function shredViewer(target: string): void {
+export interface ViewerStamp { ino: number; mtimeMs: number }
+
+export function shredViewer(target: string, expect?: ViewerStamp): void {
   try {
     if (!existsSync(target)) return;
-    const size = statSync(target).size;
-    // Overwrite before unlinking. Not a guarantee on a journalling or copy-on-write
-    // filesystem, and worth saying so rather than implying the bytes are gone.
-    if (size > 0) writeFileSync(target, randomBytes(size));
+
+    // Only shred the file WE wrote. The path is fixed, so a second invocation — or the same
+    // one run with --keep — can put a different page there; deleting by name alone would
+    // let one command destroy another's deliberately kept output.
+    //
+    // The inode ALONE is not enough, which a test caught: unlink the file and the very next
+    // create can be handed the same inode number back, so a genuinely different file matches.
+    // Pairing it with the modification time makes a collision require both a reused inode
+    // and an identical timestamp.
+    const st = statSync(target);
+    if (expect && (st.ino !== expect.ino || st.mtimeMs !== expect.mtimeMs)) return;
+
+    // The unlink is the point and it happens whatever the overwrite does.
+    //
+    // These used to share one try block, so an allocation failure on randomBytes(size) —
+    // entirely possible for a large log on a small machine — skipped the unlink, swallowed
+    // the error, and left the complete readable page behind while the command reported a
+    // clean exit. The overwrite is a nice-to-have; the removal is the reason this exists.
+    try {
+      if (st.size > 0) writeFileSync(target, randomBytes(st.size));
+    } catch { /* could not overwrite: still remove it */ }
+
     unlinkSync(target);
-  } catch { /* best effort: a leftover page is the thing we were avoiding, not a crash */ }
+  } catch { /* best effort: a leftover page is the thing being avoided, not a crash */ }
 }
 
 /**
@@ -332,7 +352,16 @@ export function openInBrowser(target: string): boolean {
   const opener = process.platform === 'darwin' ? 'open'
     : process.platform === 'win32' ? 'start' : 'xdg-open';
   try {
-    execFileSync(opener, [target], { stdio: 'ignore', timeout: 5_000 });
+    // Detached and unref'd, NOT execFileSync.
+    //
+    // A synchronous spawn blocks this process's event loop — the same loop that has to run
+    // the ten-minute cleanup timer and the SIGINT handler. xdg-open can sit waiting on a
+    // browser helper, and if that helper ignores the timeout signal the command never
+    // returns, ctrl-C cannot run the JavaScript handler, and the plaintext page stays on
+    // disk indefinitely. The cleanup must not depend on the browser behaving.
+    const child = spawn(opener, [target], { stdio: 'ignore', detached: true });
+    child.on('error', () => { /* no opener on this box; the caller prints the path */ });
+    child.unref();
     return true;
   } catch { return false; }
 }

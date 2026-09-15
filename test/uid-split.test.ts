@@ -597,3 +597,58 @@ describe('a damaged destination log is not an empty one', () => {
     expect(shape.seen).toEqual([]);
   });
 });
+
+describe('migration is Linux-only, and saying so prevents data loss', () => {
+  it('refuses off Linux, where source and destination are the same file', async () => {
+    // The platform gate made systemRoot() return userRoot() off Linux — which means
+    // profilesPath() and legacy.profiles() resolve to THE SAME FILE. Every agent then looks
+    // "already across", nothing is pending, and --migrate --finish shreds the store the
+    // running daemon is using. A cleanup step deleting the live credential file because it
+    // mistook it for a leftover, reported as a successful migration.
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'migrate.ts'), 'utf8');
+    expect(src).toMatch(/function refuseOffLinux/);
+    expect(src).toMatch(/Migration is Linux-only/);
+    // Both entry points, not just the reading one.
+    const statusFn = src.slice(src.indexOf('export async function status'));
+    expect(statusFn.slice(0, 200)).toMatch(/refuseOffLinux\(\)/);
+    const cleanupFn = src.slice(src.indexOf('export async function cleanup'));
+    expect(cleanupFn.slice(0, 200)).toMatch(/refuseOffLinux\(\)/);
+  });
+});
+
+describe('the ephemeral viewer removes the page it actually wrote', () => {
+  it('unlinks even when the overwrite cannot be done', async () => {
+    const { shredViewer } = await import('../src/log-viewer.js');
+    const f = path.join(dir, 'page.html');
+    fs.writeFileSync(f, 'x'.repeat(100));
+    shredViewer(f);
+    expect(fs.existsSync(f)).toBe(false);
+  });
+
+  it('leaves a page written by someone else at the same path', async () => {
+    // One invocation must not shred another's output — including a page deliberately kept.
+    const { shredViewer } = await import('../src/log-viewer.js');
+    const f = path.join(dir, 'shared.html');
+    fs.writeFileSync(f, 'first');
+    const st = fs.statSync(f);
+    const stamp = { ino: st.ino, mtimeMs: st.mtimeMs };
+    fs.unlinkSync(f);
+    fs.writeFileSync(f, 'second — a different file at the same name');
+    // The inode is very often REUSED here, which is exactly why the stamp carries mtime
+    // too: identity by inode alone would call this the same file and delete it.
+    fs.utimesSync(f, new Date(st.mtimeMs + 5000), new Date(st.mtimeMs + 5000));
+
+    shredViewer(f, stamp);
+    expect(fs.existsSync(f)).toBe(true);
+    expect(fs.readFileSync(f, 'utf8')).toMatch(/second/);
+  });
+
+  it('does not block the loop that has to run the cleanup', () => {
+    // execFileSync here blocks the event loop the timer and SIGINT handler live on, so a
+    // browser helper that hangs means the page never gets removed.
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'log-viewer.ts'), 'utf8');
+    const opener = src.slice(src.indexOf('export function openInBrowser'));
+    expect(opener.slice(0, 900)).toMatch(/spawn\(/);
+    expect(opener.slice(0, 900)).not.toMatch(/execFileSync\(/);
+  });
+});
