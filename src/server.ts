@@ -14,7 +14,9 @@ import net from 'node:net';
 import { AgentVaultAPI } from './api-client.js';
 import { loadEncryptionKey, verifyDirectiveSignature, decryptSecretContent } from './crypto.js';
 import { loadOpenSshEd25519, runSshBrokered, modeAllowsLegacyExec, modeAllowsSshBroker,
-  wrongModeMessage, type BrokeredOp } from './ssh-agent.js';
+  modeAllowsHttpBroker, wrongModeMessage, type BrokeredOp } from './ssh-agent.js';
+import { verifyOperationDefinition, validateArguments } from './opdef.js';
+import { performOperation } from './http-broker.js';
 import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey, commandInvokesSudo } from './exec.js';
 import { getRecipe, recipeIds } from './recipes.js';
 import type { Credentials, VaultEntry, RemoteHost } from './types.js';
@@ -147,6 +149,9 @@ function mockToolResult(name: string, args: Record<string, any>) {
     case 'vault_ssh_exec':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ Ran on ${args.destination ?? 'demo-host'} (exit 0). 1 signature, key never left the server.${MOCK_NOTE}` }] });
+    case 'vault_call':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `✅ ${args.operation_id ?? 'demo.op'} returned 200. Credential was used, not disclosed.${MOCK_NOTE}` }] });
     default:
       return CallToolResultSchema.parse({ content: [{ type: 'text', text: `Unknown tool: ${name}${MOCK_NOTE}` }], isError: true });
   }
@@ -241,6 +246,30 @@ export function createServer(args: { url?: string } = {}) {
             },
           },
           required: ['entry_id', 'purpose', 'file_path', 'env_key'],
+        },
+      },
+      {
+        name: 'vault_call',
+        description: (
+          'Perform a named operation using a vaulted credential that is never returned '
+          + 'to you.\n\n'
+          + 'You supply typed arguments; this server builds the request, attaches the '
+          + 'credential, sends it, and returns only the response fields the operation '
+          + 'permits. You cannot supply a URL, headers or a raw body — the operation '
+          + 'definition fixes the origin and route, and it is signed with a key derived '
+          + 'from the secret itself, so a definition altered anywhere in transit is '
+          + 'refused.\n\n'
+          + 'Use vault_entry_get to discover which operations an entry offers.'
+        ),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            entry_id: { type: 'string', description: 'Vault entry holding the credential.' },
+            operation_id: { type: 'string', description: 'Which of the entry\'s operations to run.' },
+            args: { type: 'object', description: 'Typed arguments, checked against the operation\'s schema.' },
+            purpose: { type: 'string', description: 'Why this is needed (audit log).' },
+          },
+          required: ['entry_id', 'operation_id', 'purpose'],
         },
       },
       {
@@ -539,6 +568,59 @@ export function createServer(args: { url?: string } = {}) {
         return CallToolResultSchema.parse({
           content: [{ type: 'text', text: `✅ ${env_key} injected into ${safePath}\nSecret retrieved and burned.` }],
         });
+      }
+
+      if (request.params.name === 'vault_call') {
+        const a = request.params.arguments as Record<string, unknown>;
+        const entry_id = String(a?.entry_id ?? '');
+        const operation_id = String(a?.operation_id ?? '');
+        const purpose = String(a?.purpose ?? '');
+        const callArgs = (a?.args ?? {}) as Record<string, unknown>;
+        const fail = (text: string) => CallToolResultSchema.parse({ content: [{ type: 'text', text }], isError: true });
+        if (!entry_id || !operation_id || !purpose) return fail('vault_call needs entry_id, operation_id and purpose.');
+
+        // Same fetch as every other tool: Tier 2 and the access log apply here too.
+        const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
+        if (!modeAllowsHttpBroker(secretData.entry_mode)) {
+          return fail(wrongModeMessage(secretData.entry_mode, 'http'));
+        }
+
+        let catalogue: Record<string, { definition: unknown; signature?: string }> = {};
+        try {
+          const raw = secretData.operations as unknown;
+          catalogue = (typeof raw === 'string' ? JSON.parse(raw) : (raw ?? {})) as typeof catalogue;
+        } catch { return fail('This entry\'s operation catalogue is not readable.'); }
+
+        const slot = catalogue?.[operation_id];
+        if (!slot) {
+          const known = Object.keys(catalogue || {});
+          return fail(`Entry has no operation "${operation_id}".` + (known.length ? ` Available: ${known.join(', ')}.` : ' It defines none.'));
+        }
+
+        const vaultKey = await api.ensureVaultKey();
+        const plaintextBytes = decryptSecretContent(vaultKey, secretData.encrypted_content, secretData.content_nonce);
+        try {
+          // Verified against the DECRYPTED SECRET, so a definition this server wrote or
+          // altered cannot pass — the server has never seen the plaintext.
+          const verified = verifyOperationDefinition(entry_id, slot.definition, slot.signature, plaintextBytes);
+          if (!verified.ok || !verified.definition) return fail(`Refused: ${verified.reason}`);
+
+          const argCheck = validateArguments(verified.definition, callArgs);
+          if (!argCheck.ok) return fail(`Refused: ${argCheck.reason}`);
+
+          const secret = new TextDecoder().decode(plaintextBytes);
+          const result = await performOperation(verified.definition, callArgs, secret);
+          if (!result.ok) {
+            return fail(`${operation_id} failed${result.status ? ` (HTTP ${result.status})` : ''}: ${result.error ?? 'unknown error'}`);
+          }
+          return CallToolResultSchema.parse({
+            content: [{ type: 'text', text:
+              `✅ ${operation_id} → HTTP ${result.status}. The credential was used, not disclosed.\n`
+              + `${JSON.stringify(result.body, null, 2)}` }],
+          });
+        } finally {
+          plaintextBytes.fill(0);
+        }
       }
 
       if (request.params.name === 'vault_ssh_exec') {

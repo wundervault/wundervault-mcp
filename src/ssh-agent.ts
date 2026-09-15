@@ -562,6 +562,7 @@ export async function runSshBrokered(opts: {
 // ── entry mode gating ──────────────────────────────────────────────────────────
 
 export const BROKER_SSH_AGENT = 'BROKER_SSH_AGENT';
+export const BROKER_HTTP = 'BROKER_HTTP';
 export const LEGACY_EXEC = 'LEGACY_EXEC';
 
 /**
@@ -587,7 +588,11 @@ export function modeAllowsSshBroker(mode: string | undefined): boolean {
   return (mode || LEGACY_EXEC).trim().toUpperCase() === BROKER_SSH_AGENT;
 }
 
-export function wrongModeMessage(mode: string | undefined, wanted: 'exec' | 'ssh'): string {
+export function modeAllowsHttpBroker(mode: string | undefined): boolean {
+  return (mode || LEGACY_EXEC).trim().toUpperCase() === BROKER_HTTP;
+}
+
+export function wrongModeMessage(mode: string | undefined, wanted: 'exec' | 'ssh' | 'http'): string {
   const m = (mode || LEGACY_EXEC).trim().toUpperCase();
   if (wanted === 'exec') {
     return `Refused: this entry is in ${m} mode, so its secret is not handed to a command. `
@@ -595,7 +600,8 @@ export function wrongModeMessage(mode: string | undefined, wanted: 'exec' | 'ssh
       + 'result. To move it back, change the entry mode in the dashboard — that is an '
       + 'owner action and it is logged as a downgrade.';
   }
-  return `Refused: this entry is in ${m} mode, not ${BROKER_SSH_AGENT}. `
-    + 'Convert it in the dashboard first; brokering a key that is still marked legacy '
+  const want = wanted === 'ssh' ? BROKER_SSH_AGENT : BROKER_HTTP;
+  return `Refused: this entry is in ${m} mode, not ${want}. `
+    + 'Convert it in the dashboard first; brokering a secret that is still marked legacy '
     + 'would claim a protection the entry does not have.';
 }
