@@ -120,7 +120,37 @@ echo
 
 # ── 1. the account ───────────────────────────────────────────────────────────
 if id -u "$ACCOUNT" >/dev/null 2>&1; then
-  echo "account ${ACCOUNT}: already exists"
+  # An existing account is NOT automatically the right account.
+  #
+  # If a human logs in as `wundervault` — their own uid, the uid their agents run as — then
+  # skipping creation here chowns the credential store to that uid and starts the daemon as
+  # them. The agent can then read the store and the daemon's memory, and the install prints
+  # "Running. /var/lib/wundervault is now readable only by wundervault." The boundary is
+  # gone and every message says it is there, which is worse than not installing at all.
+  EXISTING_UID=$(id -u "$ACCOUNT")
+  EXISTING_SHELL=$(getent passwd "$ACCOUNT" | cut -d: -f7)
+  if [ "$EXISTING_UID" -ge 1000 ] 2>/dev/null; then
+    cat >&2 <<EOM
+ERROR: an account named '${ACCOUNT}' already exists with uid ${EXISTING_UID}.
+
+That is a regular login account, not a system account. This daemon exists to hold
+credentials somewhere the accounts running your agents cannot reach — so it must not run
+as an account a person logs into. Installing anyway would report success while leaving
+every credential readable by whoever uses that account.
+
+If that account is yours, the daemon needs a different name: create a system account
+and pass it through, or rename the existing one.
+EOM
+    exit 1
+  fi
+  case "$EXISTING_SHELL" in
+    */nologin|*/false|"") ;;
+    *)
+      echo "WARNING: ${ACCOUNT} has login shell ${EXISTING_SHELL}." >&2
+      echo "         A daemon account should not be able to log in. Consider:" >&2
+      echo "         sudo usermod -s /usr/sbin/nologin ${ACCOUNT}" >&2 ;;
+  esac
+  echo "account ${ACCOUNT}: already exists (uid ${EXISTING_UID}, system account)"
 else
   # --system: no ageing, a low uid, and no login. --shell nologin so a credential leak
   # elsewhere cannot turn this into a way to get a shell.
@@ -162,7 +192,12 @@ echo "unit ${UNIT_PATH}: installed"
 
 # ── 4. start ─────────────────────────────────────────────────────────────────
 systemctl daemon-reload
-systemctl enable --now "$UNIT_NAME"
+systemctl enable "$UNIT_NAME"
+# restart, not `enable --now`. `--now` starts a stopped unit and leaves a RUNNING one
+# exactly as it was — so re-running the installer after a package upgrade rewrote the unit,
+# reported "Running", and left the old process going under the old configuration, including
+# an ExecStart pointing at the previous binary.
+systemctl restart "$UNIT_NAME"
 
 sleep 1
 if systemctl is-active --quiet "$UNIT_NAME"; then

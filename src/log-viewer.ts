@@ -29,7 +29,8 @@
  * What it IS: one self-contained HTML file with the data already inside it, written
  * 0600 next to the store, which you open with your own browser and delete when done.
  */
-import { writeFileSync, readFileSync, mkdirSync, chmodSync, chownSync, accessSync, existsSync, constants } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, chmodSync, accessSync, existsSync, constants } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import * as net from 'node:net';
 import * as path from 'node:path';
 import { load, defaultStorePath, type NetworkShape } from './network-store.js';
@@ -269,28 +270,57 @@ export function writeViewer(storePath = defaultStorePath(), outPath?: string,
   writeFileSync(target, renderViewer(shape, storePath), { mode: 0o600 });
   try { chmodSync(target, 0o600); } catch { /* best effort */ }
 
-  // Reading the store requires root, so this normally runs under sudo — and a page written
-  // 0600 root:root in someone's home is one they cannot open. Handing it back to the user
-  // who asked is the difference between the feature working and appearing to.
-  giveBackToSudoUser(target);
-  giveBackToSudoUser(path.dirname(target));
   return target;
 }
 
-/** chown a path to the user who invoked sudo. A no-op when not running as root. */
-function giveBackToSudoUser(target: string): void {
+/**
+ * Who invoked sudo, resolved through NSS rather than by reading /etc/passwd.
+ *
+ * `getent` goes through the name service switch, so it sees accounts from LDAP, SSSD and
+ * anything else the machine is configured with. Parsing /etc/passwd directly only sees
+ * local accounts, and on an enterprise host that means a valid user resolves to nothing.
+ */
+export function resolveSudoUser(): { uid: number; gid: number; home: string } | null {
   const uid = (process as unknown as { getuid?: () => number }).getuid?.();
   const sudoUser = process.env.SUDO_USER;
-  if (uid !== 0 || !sudoUser || sudoUser === 'root') return;
+  if (uid !== 0 || !sudoUser || sudoUser === 'root') return null;
   try {
-    const entry = readFileSync('/etc/passwd', 'utf8')
-      .split('\n').find(l => l.startsWith(`${sudoUser}:`));
-    const parts = entry?.split(':');
-    if (!parts) return;
-    chownSync(target, Number(parts[2]), Number(parts[3]));
-  } catch { /* best effort: a readable page in the wrong ownership still beats no page */ }
+    const out = execFileSync('getent', ['passwd', sudoUser], { encoding: 'utf8' }).trim();
+    const f = out.split(':');
+    if (f.length < 6) return null;
+    const u = Number(f[2]); const g = Number(f[3]);
+    if (!Number.isInteger(u) || !Number.isInteger(g) || u === 0) return null;
+    return { uid: u, gid: g, home: f[5] };
+  } catch { return null; }
 }
 
+/**
+ * Become the user who invoked sudo, irreversibly, before touching their home directory.
+ *
+ * This replaces a chown, and the difference is the whole point. Writing as root into a
+ * directory an agent can rearrange means root follows whatever it finds there: an agent
+ * that swapped the output file for a symlink to /etc/cron.d had root create that file and
+ * hand it over. Verified as a working escalation before this changed.
+ *
+ * Dropping first removes the class rather than the instance. After this call the process
+ * has exactly the authority the person already had, so a symlink they control points at
+ * something they could have written anyway. Order matters: supplementary groups, then the
+ * gid, then the uid — after setuid there is no privilege left to drop the others with.
+ */
+export function dropToSudoUser(who: { uid: number; gid: number }): void {
+  const p = process as unknown as {
+    setgroups?: (g: number[]) => void;
+    setgid?: (g: number) => void;
+    setuid?: (u: number) => void;
+    getuid?: () => number;
+  };
+  try { p.setgroups?.([who.gid]); } catch { /* not always permitted; the uid drop is what matters */ }
+  p.setgid?.(who.gid);
+  p.setuid?.(who.uid);
+  if (p.getuid?.() !== who.uid) {
+    throw new Error('Refusing to continue: could not drop root privileges before writing.');
+  }
+}
 
 /**
  * Get the destinations — by reading the file, as root.
@@ -355,6 +385,29 @@ export async function collectShape(
           `reading where every other agent has sent its secrets.\n\n` +
           `  sudo wundervault-agent --destinations\n`) +
       `Refusing to show you an empty page, which is what this used to do.`,
+    );
+  }
+  // load() turns a read or parse failure into an empty shape, which is right for a vault
+  // call — one damaged store must not break every request — and wrong here. A truncated
+  // network.json after a crash would render as "0 destinations" to someone looking at it
+  // precisely to find out where their keys went. Parse it here so a damaged audit record
+  // announces itself.
+  let raw: string;
+  try {
+    raw = readFileSync(storePath, 'utf8');
+  } catch (e) {
+    throw new Error(`Cannot read ${storePath}: ${(e as Error).message}`);
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.seen)) {
+      throw new Error('not a version-1 destination store');
+    }
+  } catch (e) {
+    throw new Error(
+      `The destination log at ${storePath} is damaged: ${(e as Error).message}.\n` +
+      `Refusing to show an empty page — this is the record of where your agents sent\n` +
+      `secrets, and "none" is a very different answer from "unreadable".`,
     );
   }
   return { shape: load(storePath), source: 'file' };

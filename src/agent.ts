@@ -682,12 +682,23 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
     // refuseRoot is deliberately NOT called on this path: reading the store is the one
     // thing that requires being root, because the file belongs to the daemon's account and
     // that is what stops the agents reading it.
-    const { writeViewer, collectShape } = await import('./log-viewer.js');
+    const { writeViewer, collectShape, resolveSudoUser, dropToSudoUser } =
+      await import('./log-viewer.js');
     const { defaultStorePath } = await import('./network-store.js');
+    const pathMod = await import('node:path');
     const store = defaultStorePath();
+    // Read as root — that is the only reason this needs privilege — then give it up before
+    // writing anything into a home directory. Root must not follow paths an agent can
+    // rearrange under it; doing so was a working escalation to a root cron job.
+    const sudoUser = resolveSudoUser();
     collectShape(store)
       .then(({ shape }) => {
-        const out = writeViewer(store, undefined, shape);
+        let target: string | undefined;
+        if (sudoUser) {
+          target = pathMod.join(sudoUser.home, '.wundervault', 'destinations.html');
+          dropToSudoUser(sudoUser);
+        }
+        const out = writeViewer(store, target, shape);
         const calls = shape.seen.reduce((n: number, x: { count: number }) => n + x.count, 0);
         console.log(
           `\nDestination log — ${shape.seen.length} destination(s), ${calls} call(s)\n` +

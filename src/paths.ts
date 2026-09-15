@@ -48,27 +48,19 @@ export function systemRoot(): string {
 /**
  * The agent's own directory: its token, and its view of things.
  *
- * Under `sudo`, `os.homedir()` is /root — so `sudo wundervault-agent --destinations`, which
- * is the ONLY supported way to read the destination log, wrote its page into root's home
- * where the person who asked for it cannot open it. `SUDO_USER` is honoured so the output
- * lands in the home of whoever invoked sudo.
+ * Deliberately does NOT consult `SUDO_USER`. An earlier version did, so that
+ * `sudo wundervault-agent --destinations` would write its page into the invoking user's
+ * home rather than root's — and that turned a root process into one that resolves a path
+ * through a directory the agent controls. The result was a working root escalation: an
+ * agent replaced `~/.wundervault/destinations.html` with a symlink to `/etc/cron.d/x`, root
+ * followed it, and the chown handed the agent a file it could fill with a root cron job.
  *
- * Only consulted when actually running as root: an agent cannot use it to redirect
- * anything, because setting SUDO_USER without being root changes nothing here.
+ * The sudo case is handled where it belongs — by dropping privileges before writing
+ * anything into a user's home (see `dropToSudoUser` in log-viewer.ts). A root process must
+ * not follow paths that an unprivileged account can rearrange under it.
  */
 export function userRoot(): string {
-  if (process.env.WUNDERVAULT_USER_ROOT) return process.env.WUNDERVAULT_USER_ROOT;
-  const uid = (process as unknown as { getuid?: () => number }).getuid?.();
-  const sudoUser = process.env.SUDO_USER;
-  if (uid === 0 && sudoUser && sudoUser !== 'root') {
-    try {
-      const entry = fs.readFileSync('/etc/passwd', 'utf8')
-        .split('\n').find(l => l.startsWith(`${sudoUser}:`));
-      const dir = entry?.split(':')[5];
-      if (dir) return path.join(dir, '.wundervault');
-    } catch { /* fall through to root's own home */ }
-  }
-  return path.join(os.homedir(), '.wundervault');
+  return process.env.WUNDERVAULT_USER_ROOT || path.join(os.homedir(), '.wundervault');
 }
 
 /**

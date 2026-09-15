@@ -509,3 +509,70 @@ describe('the unit file says what the code relies on', () => {
     expect(near).toMatch(/does NOT make the process\s*\n?#?\s*non-dumpable/);
   });
 });
+
+describe('a root process must not follow paths an agent controls', () => {
+  // The escalation this prevents was demonstrated end to end before it was fixed: an agent
+  // replaced ~/.wundervault/destinations.html with a symlink to /etc/cron.d/x, the owner
+  // ran the one supported command for reading their own log, and root created that file
+  // and chowned it to the agent's uid — which then wrote a root cron job into it.
+  it('drops privileges rather than chowning the result back', async () => {
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'log-viewer.ts'), 'utf8');
+    expect(src).toContain('dropToSudoUser');
+    // The chown is what made root's write exploitable; its absence is the property.
+    expect(src).not.toMatch(/chownSync/);
+  });
+
+  it('resolves the sudo user through NSS, not by parsing /etc/passwd', () => {
+    // An LDAP or SSSD account is a valid sudo user with no line in /etc/passwd.
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'log-viewer.ts'), 'utf8');
+    expect(src).toMatch(/execFileSync\('getent', \['passwd'/);
+    expect(src).not.toMatch(/readFileSync\('\/etc\/passwd'/);
+  });
+
+  it('keeps SUDO_USER out of path resolution entirely', () => {
+    // userRoot() backs the agent token paths and the legacy migration paths too, so a
+    // sudo-aware home here would widen far more than the viewer.
+    // Mentioned in the comment that explains why it is not consulted; never read.
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'paths.ts'), 'utf8');
+    expect(src).not.toMatch(/process\.env\.SUDO_USER/);
+    expect(src).toMatch(/does NOT consult `SUDO_USER`/);
+  });
+
+  it('refuses to carry on if the privilege drop did not take', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'log-viewer.ts'), 'utf8');
+    expect(src).toMatch(/could not drop root privileges/);
+  });
+});
+
+describe('the installer will not hand the boundary to a human account', () => {
+  const script = fs.readFileSync(path.join(ROOT, 'packaging', 'install-daemon.sh'), 'utf8');
+
+  it('refuses an existing wundervault account with a login uid', () => {
+    // Skipping creation for a human account named wundervault chowns the credential store
+    // to the agent's own uid and then reports that it is readable only by wundervault.
+    expect(script).toMatch(/EXISTING_UID.*-ge 1000|-ge 1000.*EXISTING_UID/s);
+    expect(script).toMatch(/regular login account, not a system account/);
+  });
+
+  it('restarts a running daemon rather than leaving the old config live', () => {
+    // `enable --now` starts a stopped unit and leaves a running one exactly as it was.
+    expect(script).toMatch(/systemctl restart "\$UNIT_NAME"/);
+  });
+});
+
+describe('a damaged destination log is not an empty one', () => {
+  it('refuses to render zero destinations for a store it could not parse', async () => {
+    const store = path.join(dir, 'broken-network.json');
+    fs.writeFileSync(store, '{"version":1,"seen":[{"host":"x"');
+    const { collectShape } = await import('../src/log-viewer.js');
+    await expect(collectShape(store)).rejects.toThrow(/damaged/);
+  });
+
+  it('reports genuinely empty as empty when the directory is readable', async () => {
+    const storeDir = path.join(dir, 'emptystate');
+    fs.mkdirSync(storeDir, { recursive: true });
+    const { collectShape } = await import('../src/log-viewer.js');
+    const { shape } = await collectShape(path.join(storeDir, 'network.json'));
+    expect(shape.seen).toEqual([]);
+  });
+});

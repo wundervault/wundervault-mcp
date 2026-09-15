@@ -1,0 +1,151 @@
+{
+  "verdict": "revise",
+  "summary": "The build implements the intended two-uid daemon, server-authorized enrolment, protected state directory, hardened system unit, and root-only destination-log reader, with a real two-uid rehearsal supporting the core design. It is not ready to ship because the root-run viewer follows paths inside an agent-writable directory, allowing a malicious agent to overwrite and take ownership of arbitrary root files when the owner runs the documented command. There are also concrete failures for malformed audit stores, NSS-backed users, installer reruns, and pre-existing account-name collisions.",
+  "spec_check": [
+    {
+      "requirement": "B1. The only way a profile enters the daemon is `enrol`, carrying a setup link. There is no `register_profile`.",
+      "status": "partial",
+      "evidence": "src/enrol.ts implements setup-link redemption and the package reports removal of register_profile, but the management handler in withheld src/server.ts is needed to verify that no other profile-writing action remains."
+    },
+    {
+      "requirement": "B2. The daemon performs the exchange: `GET /api/setup/agent/<token>`, PBKDF2-SHA256 over the fragment passphrase, AES-256-GCM, then `POST .../burn`.",
+      "status": "met",
+      "evidence": "src/enrol.ts performs the GET, PBKDF2-SHA256 with salt wv-agent-setup-v1 and 100,000 rounds, AES-256-GCM decryption, and exposes a burn operation for invocation after storage."
+    },
+    {
+      "requirement": "B2a. A link is accepted only from an origin in the daemon's own configuration.",
+      "status": "met",
+      "evidence": "parseSetupUrl compares URL.origin exactly against allowedOrigins(), defaulting to https://wundervault.com, and applies HTTPS in addition to the allowlist except for an explicitly configured loopback origin."
+    },
+    {
+      "requirement": "B2b. The link is read from stdin, never argv.",
+      "status": "partial",
+      "evidence": "No argv handling appears in src/enrol.ts and the package reports stdin-only handling, but the CLI dispatch code is in withheld src/server.ts."
+    },
+    {
+      "requirement": "B2c. Redirects are refused and a non-JSON content-type is refused rather than parsed.",
+      "status": "met",
+      "evidence": "httpJson uses redirect: 'error' and accepts only application/json or a structured +json media type."
+    },
+    {
+      "requirement": "B4. The burn happens after the profile is stored.",
+      "status": "partial",
+      "evidence": "redeemSetupLink returns the burn callback rather than invoking it, which permits the required ordering, but the storage and callback invocation are in withheld src/server.ts."
+    },
+    {
+      "requirement": "C2-C3. Tokens are compared in constant time; wrong tokens charge only the failing caller, while valid tokens remain serviceable.",
+      "status": "partial",
+      "evidence": "The rehearsal reports successful valid- and wrong-token behavior, but the comparison, delay, and connection-deadline implementation are in withheld src/server.ts."
+    },
+    {
+      "requirement": "D1-D2. The agent's uid cannot read `/var/lib/wundervault` or the daemon's memory.",
+      "status": "met",
+      "evidence": "The installer creates /var/lib/wundervault as mode 0700 owned by wundervault, the unit runs as that account, and the real two-uid rehearsal reports both filesystem and /proc/<pid>/mem denial."
+    },
+    {
+      "requirement": "D3. The destination store lives under `/var/lib/wundervault`, cannot be written by the agent, is not served over the management socket, and `--destinations` reads the file as root.",
+      "status": "partial",
+      "evidence": "networkStorePath resolves under systemRoot and collectShape reads it directly rather than using the management socket. The original store is protected, but the root-run output path is vulnerable to agent-controlled symlinks, and the resulting complete HTML copy is owned by the agent's uid."
+    },
+    {
+      "requirement": "E1-E5. A system unit runs as wundervault, contains all required hardening directives, has only `/var/lib/wundervault` writable, uses RuntimeDirectory, and the daemon refuses root.",
+      "status": "met",
+      "evidence": "packaging/wundervault-agent.service contains User/Group=wundervault, the listed E2 directives, ReadWritePaths=/var/lib/wundervault, and RuntimeDirectory=wundervault; the rehearsal confirms root refusal. MemoryDenyWriteExecute is correctly absent as required by E2a."
+    },
+    {
+      "requirement": "F1-F5. Migration carries no credentials, removes the old user unit, preserves socket tokens, deletes the old store only when complete, and is idempotent.",
+      "status": "partial",
+      "evidence": "The package reports successful migration and token preservation in rehearsal, but the migration implementation is not included in this excerpt."
+    },
+    {
+      "requirement": "G1-G4. The privileged installer creates the system user and state directory, installs and enables the unit, uses no network pipe, and is re-runnable.",
+      "status": "partial",
+      "evidence": "packaging/install-daemon.sh performs only local account, directory, unit, and service operations and prints a summary before modification. However, it trusts any existing account named wundervault and does not restart an already-running service after replacing its unit."
+    },
+    {
+      "requirement": "Acceptance 12. `--destinations` refuses rather than showing an empty page to a user who cannot read the store, and names sudo as the way through.",
+      "status": "partial",
+      "evidence": "collectShape explicitly refuses unreadable files and directories with the sudo instruction, but it delegates readable malformed files to load(), which this file says converts read errors to an empty shape."
+    },
+    {
+      "requirement": "Acceptance 15. The installer refuses an `ExecStart` under a home directory, symlinks resolved.",
+      "status": "met",
+      "evidence": "install-daemon.sh resolves the executable with readlink -f and refuses both the supplied and resolved path beneath /home, /root, or /run/user."
+    },
+    {
+      "requirement": "Acceptance 20. `--destinations` is dispatched by the binary every message names, and does not refuse to run as root.",
+      "status": "partial",
+      "evidence": "The package and installer consistently name wundervault-agent and collectShape supports direct root reads, but CLI dispatch is withheld and NSS-backed sudo users receive an inaccessible page under /root."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/log-viewer.ts",
+      "line": 274,
+      "claim": "The root-run destination viewer follows agent-controlled path components and then performs path-based chmod/chown operations, allowing an agent to overwrite and transfer ownership of arbitrary root files.",
+      "failure_scenario": "Before the owner runs `sudo wundervault-agent --destinations`, an agent running as the owner's uid replaces `~/.wundervault/destinations.html` with a symlink to `/etc/cron.d/wv`; writeFileSync follows it as root and creates or truncates that target, then chmodSync and chownSync make it mode 0600 and owned by the user, after which the agent can replace its contents with a root cron job. Replacing the entire `~/.wundervault` directory with a symlink is worse because the later chownSync on the directory follows that symlink as well.",
+      "suggested_direction": "Do not perform privileged path-based writes, chmods, or chowns inside a directory controlled by the agent uid. Create the output using a symlink-safe strategy and stable file descriptors, or arrange for the final user-owned output to be written after dropping to the invoking user's credentials while keeping the privileged store read separate."
+    },
+    {
+      "id": "F2",
+      "severity": "major",
+      "file": "src/log-viewer.ts",
+      "line": 361,
+      "claim": "If the imported load() behaves as this file states and converts read or parse errors into an empty shape, collectShape still reports a readable but corrupt destination store as an honest empty log.",
+      "failure_scenario": "If `/var/lib/wundervault/network.json` exists and is root-readable but contains truncated JSON after a crash, accessSync succeeds, load() swallows the parse failure, and `--destinations` renders zero destinations instead of warning that the audit record is damaged.",
+      "suggested_direction": "Treat only a confirmed absent file as an empty fresh-install store; use a strict load path for this command and propagate malformed JSON, short reads, and other I/O failures as explicit refusal errors."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "src/paths.ts",
+      "line": 59,
+      "claim": "Resolving SUDO_USER only by parsing `/etc/passwd` fails for valid users supplied by NSS providers such as LDAP or SSSD.",
+      "failure_scenario": "On an enterprise host where `sudo` recognizes user `alice` through SSSD but no `alice:` line exists in `/etc/passwd`, userRoot falls back to `/root/.wundervault` and giveBackToSudoUser also finds no uid; the command reports a generated `/root/.wundervault/destinations.html` file that Alice cannot open.",
+      "suggested_direction": "Resolve the sudo invoker through the operating system's NSS account lookup rather than the local passwd file alone, validate the resolved home and numeric ids, and fail visibly instead of silently producing an inaccessible root-owned page."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "packaging/install-daemon.sh",
+      "line": 171,
+      "claim": "Re-running the installer replaces and reloads the unit but does not restart an already-active daemon, so changed executable paths and hardening directives are not applied.",
+      "failure_scenario": "A machine has an active daemon from an earlier package whose unit lacks a newly required sandbox directive; the owner installs this package and reruns install-daemon.sh, which rewrites the unit and calls `systemctl daemon-reload` followed by `systemctl enable --now`, but systemd leaves the active process running under the old unit configuration and the installer reports `Running`.",
+      "suggested_direction": "After installing and reloading the unit, explicitly ensure the service is restarted or otherwise prove that the running process was started from the newly installed unit before reporting success."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "packaging/install-daemon.sh",
+      "line": 121,
+      "claim": "The installer accepts any pre-existing account named wundervault without verifying that it is a dedicated system identity distinct from the agent owner.",
+      "failure_scenario": "If the human account running the agents is itself named `wundervault`, `id -u wundervault` succeeds, the installer skips account creation, chowns `/var/lib/wundervault` to that same uid, and starts the daemon under the agent's uid; the agent can then read the profile store and daemon memory, eliminating the phase-4 boundary while installation reports success.",
+      "suggested_direction": "Validate an existing account before reuse, including that it is distinct from the invoking owner uid and has the expected dedicated, non-login system-account properties; refuse ambiguous collisions rather than adopting them."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The generated destinations HTML is a complete copy of the protected audit store but is deliberately chowned to the same uid as every agent and described in the page as safe to keep.",
+      "why_it_matters": "Immediately after the owner performs the sudo-authorized read, any agent under that uid can read `~/.wundervault/destinations.html` without sudo and learn every other agent's destinations until the file is deleted; the original store remains protected, but its confidentiality no longer does."
+    },
+    {
+      "id": "B2",
+      "concern": "The installer rejects executables under home directories but never verifies that the executable and its loaded package tree are not writable by the agent uid.",
+      "why_it_matters": "A global npm prefix such as `/opt/wundervault` can be outside `/home` yet owned by the user; in that state an agent can replace JavaScript loaded by the wundervault service and execute inside the process that owns all credentials."
+    },
+    {
+      "id": "B3",
+      "concern": "The live rehearsal covers one systemd and kernel version, while the unit relies on a broad SystemCallFilter and several directives whose availability and syscall groups vary by distribution.",
+      "why_it_matters": "On an older or differently patched distribution, directives may be ignored or Node operations such as DNS resolution and worker-thread creation may receive EPERM only when exercised after startup, so the one-second is-active check can pass despite a daemon that later fails in normal use."
+    }
+  ],
+  "_meta": {
+    "round": 15,
+    "at": "2026-09-15T21:13:38+00:00",
+    "package_bytes": 91932,
+    "schema_problems": []
+  }
+}
