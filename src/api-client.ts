@@ -48,6 +48,32 @@ export class AgentVaultAPI {
     return resp.json() as Promise<T>;
   }
 
+  /**
+   * Ask the server whether this brokered call may proceed.
+   *
+   * Deliberately asked BEFORE anything is sent upstream: a tier-2 call that needs
+   * consent must never reach the network, and the tier and the approvals live on the
+   * server, so the decision does too.
+   */
+  async checkOperation(body: {
+    entry_id: string; origin: string; method: string; path: string;
+    purpose: string; body_sha256?: string;
+  }): Promise<{ allowed: boolean; tier: string; request_id?: string; message?: string }> {
+    const resp = await fetch(`${this.baseUrl}/agent/vault/operation-check`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TIMEOUT),
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      const err: any = new Error(`HTTP ${resp.status}: ${text}`);
+      err.status = resp.status;
+      throw err;
+    }
+    return resp.json() as Promise<{ allowed: boolean; tier: string; request_id?: string; message?: string }>;
+  }
+
   async getProfile(): Promise<ProfileResponse> {
     return this.fetchJson<ProfileResponse>('/agent/profile');
   }

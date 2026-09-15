@@ -348,3 +348,61 @@ export async function performOperation(
     req.end();
   });
 }
+
+
+// ── tiered brokering ───────────────────────────────────────────────────────────
+
+/**
+ * A request the AGENT described, rather than one a signed definition fixed.
+ *
+ * This is the tier-1 shape: the agent knows where it is going because the secret's name
+ * and the user's prompt told it. What it does not get, at any tier, is the credential
+ * itself or a say in how the credential is framed.
+ */
+export interface AgentRequest {
+  origin: { scheme: string; host: string; port: number };
+  method: string;
+  path: string;
+  body?: unknown;
+  query?: Record<string, string>;
+}
+
+/**
+ * Turn an agent-described request into the definition shape the executor already takes.
+ *
+ * The credential binding comes from the ENTRY, never from the agent: an agent may choose
+ * where to send a request, never how the secret is framed on the way out. Without a
+ * signed definition there is no response allowlist, so everything comes back — scrubbed,
+ * which catches the credential verbatim and not an encoded copy. That is the honest
+ * difference between this tier and a typed adapter.
+ */
+export function definitionFromAgentRequest(
+  req: AgentRequest,
+  binding: { in: 'header' | 'query'; name: string; template: string },
+  limits?: { request_bytes?: number; response_bytes?: number },
+): OperationDefinition {
+  let path = req.path || '/';
+  if (req.query && Object.keys(req.query).length > 0) {
+    const qs = Object.entries(req.query)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&');
+    path += (path.includes('?') ? '&' : '?') + qs;
+  }
+  return {
+    op: 'agent.request',
+    origin: req.origin,
+    route: { method: (req.method || 'GET').toUpperCase(), path },
+    credential_binding: binding,
+    // No allowlist: an unsigned request has nothing describing its response, so the
+    // caller gets the body. `response.allow` with a single '*' would be a lie; the
+    // executor treats an absent allow-list as "return everything", and scrubSecret still
+    // runs over it.
+    response: undefined,
+    redirects: 'deny',
+    limits,
+  } as OperationDefinition;
+}
+
+/** Canonical origin string, for the server-side approval check and the audit row. */
+export function originString(o: { scheme: string; host: string; port: number }): string {
+  return `${o.scheme}://${o.host}:${o.port}`;
+}

@@ -273,6 +273,11 @@ export function validateArguments(
 /** Only the fields the definition allows reach the caller. */
 export function filterResponse(def: OperationDefinition, body: unknown): unknown {
   const allow = def.response?.allow;
+  // A SIGNED definition that allows nothing means nothing: the owner narrowed it to zero
+  // fields. An UNSIGNED agent request has no response section at all, and returning {}
+  // there would make every tier-1 call useless. Absent means "everything"; empty means
+  // "nothing".
+  if (def.response === undefined) return body;
   if (!allow || !Array.isArray(allow) || allow.length === 0) return {};
   if (!body || typeof body !== 'object' || Array.isArray(body)) return {};
   const out: Record<string, unknown> = {};

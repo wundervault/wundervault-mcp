@@ -10,7 +10,8 @@ import {
   canonicalJson, verifyOperationDefinition, validateShape, validateArguments,
   filterResponse, _clearDerivedKeyCache, type OperationDefinition,
 } from '../src/opdef.js';
-import { isBlockedAddress, resolvePinned, expandIPv6, scrubSecret, pinnedLookup } from '../src/http-broker.js';
+import { isBlockedAddress, resolvePinned, expandIPv6, scrubSecret, pinnedLookup,
+  definitionFromAgentRequest, originString } from '../src/http-broker.js';
 import { modeAllowsHttpBroker, modeAllowsLegacyExec, wrongModeMessage } from '../src/ssh-agent.js';
 
 const SECRET = Buffer.from('sk-ant-api03-EXAMPLE-SECRET-VALUE');
@@ -371,5 +372,68 @@ describe('pinned lookup shim', () => {
     const fn = pinnedLookup('::1', 6);
     const got = await new Promise((r) => fn('h', undefined, (_e, a, f) => r([a, f])));
     expect(got).toEqual(['::1', 6]);
+  });
+});
+
+describe('tiered brokering — agent-described requests', () => {
+  const BINDING = { in: 'header' as const, name: 'authorization', template: 'Bearer {secret}' };
+
+  it('builds a route from typed parts, never from a URL string', () => {
+    // No URL is parsed anywhere, so there is nothing to smuggle through parsing.
+    const d = definitionFromAgentRequest(
+      { origin: { scheme: 'https', host: 'api.cloudflare.com', port: 443 }, method: 'get', path: '/client/v4/zones' },
+      BINDING);
+    expect(d.route.method).toBe('GET');
+    expect(d.route.path).toBe('/client/v4/zones');
+    expect(d.origin.host).toBe('api.cloudflare.com');
+  });
+
+  it('encodes query parameters rather than trusting a caller-built string', () => {
+    const d = definitionFromAgentRequest(
+      { origin: { scheme: 'https', host: 'h.example', port: 443 }, method: 'GET', path: '/x',
+        query: { q: 'a b&c', page: '2' } }, BINDING);
+    expect(d.route.path).toBe('/x?q=a%20b%26c&page=2');
+  });
+
+  it('takes the credential binding from the entry, never from the agent', () => {
+    // An agent may choose where to send a request; it never chooses how the secret is
+    // framed on the way out.
+    const d = definitionFromAgentRequest(
+      { origin: { scheme: 'https', host: 'h.example', port: 443 }, method: 'GET', path: '/' },
+      { in: 'header', name: 'x-api-key', template: '{secret}' });
+    expect(d.credential_binding.name).toBe('x-api-key');
+    expect(d.credential_binding.template).toBe('{secret}');
+  });
+
+  it('denies redirects on an agent-described request too', () => {
+    const d = definitionFromAgentRequest(
+      { origin: { scheme: 'https', host: 'h.example', port: 443 }, method: 'GET', path: '/' }, BINDING);
+    expect(d.redirects).toBe('deny');
+  });
+
+  it('returns the whole body when no allowlist was declared', () => {
+    // An unsigned request has no response section, and returning {} would make every
+    // tier-1 call useless. Absent means everything; empty means nothing.
+    const d = definitionFromAgentRequest(
+      { origin: { scheme: 'https', host: 'h.example', port: 443 }, method: 'GET', path: '/' }, BINDING);
+    expect(filterResponse(d, { a: 1, b: 2 })).toEqual({ a: 1, b: 2 });
+  });
+
+  it('still returns nothing when a signed definition allows nothing', () => {
+    const d = definitionFromAgentRequest(
+      { origin: { scheme: 'https', host: 'h.example', port: 443 }, method: 'GET', path: '/' }, BINDING);
+    expect(filterResponse({ ...d, response: { allow: [] } }, { a: 1 })).toEqual({});
+  });
+
+  it('renders a canonical origin for the approval record and the audit row', () => {
+    expect(originString({ scheme: 'https', host: 'api.openai.com', port: 443 }))
+      .toBe('https://api.openai.com:443');
+  });
+
+  it('an agent-described request is still subject to the address filter', () => {
+    // Tier 1 removes the approval, not the SSRF protection.
+    const d = definitionFromAgentRequest(
+      { origin: { scheme: 'https', host: '169.254.169.254', port: 443 }, method: 'GET', path: '/' }, BINDING);
+    expect(isBlockedAddress(d.origin.host)).toBe(true);
   });
 });

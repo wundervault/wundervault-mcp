@@ -13,9 +13,11 @@ import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmdirSync, exists
 import net from 'node:net';
 import { AgentVaultAPI } from './api-client.js';
 import { loadEncryptionKey, verifyDirectiveSignature, decryptSecretContent } from './crypto.js';
+import { createHash } from 'node:crypto';
 import { loadOpenSshEd25519, runSshBrokered, modeAllowsLegacyExec, modeAllowsSshBroker,
   modeAllowsHttpBroker, wrongModeMessage, type BrokeredOp } from './ssh-agent.js';
 import { verifyOperationDefinition, validateArguments } from './opdef.js';
+import { definitionFromAgentRequest, originString, type AgentRequest } from './http-broker.js';
 import { performOperation } from './http-broker.js';
 import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey, commandInvokesSudo } from './exec.js';
 import { getRecipe, recipeIds } from './recipes.js';
@@ -265,8 +267,14 @@ export function createServer(args: { url?: string } = {}) {
           type: 'object',
           properties: {
             entry_id: { type: 'string', description: 'Vault entry holding the credential.' },
-            operation_id: { type: 'string', description: 'Which of the entry\'s operations to run.' },
-            args: { type: 'object', description: 'Typed arguments, checked against the operation\'s schema.' },
+            operation_id: { type: 'string', description: 'A signed operation on the entry. Use this OR request, not both.' },
+            args: { type: 'object', description: 'Typed arguments for operation_id, checked against its schema.' },
+            request: {
+              type: 'object',
+              description: 'Describe the call yourself: {origin:{scheme,host,port}, method, path, body?, query?}. '
+                + 'Tier 1 secrets proceed and are logged. Tier 2 secrets are refused until the owner approves '
+                + 'this exact origin, method and path.',
+            },
             purpose: { type: 'string', description: 'Why this is needed (audit log).' },
           },
           required: ['entry_id', 'operation_id', 'purpose'],
@@ -577,7 +585,10 @@ export function createServer(args: { url?: string } = {}) {
         const purpose = String(a?.purpose ?? '');
         const callArgs = (a?.args ?? {}) as Record<string, unknown>;
         const fail = (text: string) => CallToolResultSchema.parse({ content: [{ type: 'text', text }], isError: true });
-        if (!entry_id || !operation_id || !purpose) return fail('vault_call needs entry_id, operation_id and purpose.');
+        const agentReq = a?.request as AgentRequest | undefined;
+        if (!entry_id || !purpose) return fail('vault_call needs entry_id and purpose.');
+        if (!operation_id && !agentReq) return fail('vault_call needs either operation_id or request.');
+        if (operation_id && agentReq) return fail('Give either operation_id or request, not both.');
 
         // Same fetch as every other tool: Tier 2 and the access log apply here too.
         const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
@@ -585,37 +596,90 @@ export function createServer(args: { url?: string } = {}) {
           return fail(wrongModeMessage(secretData.entry_mode, 'http'));
         }
 
-        let catalogue: Record<string, { definition: unknown; signature?: string }> = {};
-        try {
-          const raw = secretData.operations as unknown;
-          catalogue = (typeof raw === 'string' ? JSON.parse(raw) : (raw ?? {})) as typeof catalogue;
-        } catch { return fail('This entry\'s operation catalogue is not readable.'); }
-
-        const slot = catalogue?.[operation_id];
-        if (!slot) {
-          const known = Object.keys(catalogue || {});
-          return fail(`Entry has no operation "${operation_id}".` + (known.length ? ` Available: ${known.join(', ')}.` : ' It defines none.'));
-        }
-
         const vaultKey = await api.ensureVaultKey();
         const plaintextBytes = decryptSecretContent(vaultKey, secretData.encrypted_content, secretData.content_nonce);
         try {
-          // Verified against the DECRYPTED SECRET, so a definition this server wrote or
-          // altered cannot pass — the server has never seen the plaintext.
-          const verified = verifyOperationDefinition(entry_id, slot.definition, slot.signature, plaintextBytes, operation_id);
-          if (!verified.ok || !verified.definition) return fail(`Refused: ${verified.reason}`);
-
-          const argCheck = validateArguments(verified.definition, callArgs);
-          if (!argCheck.ok) return fail(`Refused: ${argCheck.reason}`);
-
           const secret = new TextDecoder().decode(plaintextBytes);
-          const result = await performOperation(verified.definition, callArgs, secret);
+
+          // The credential binding always comes from the ENTRY. An agent may choose
+          // where to send a request; it never chooses how the secret is framed on the
+          // way out, at either tier.
+          let binding: { in: 'header' | 'query'; name: string; template: string } = {
+            in: 'header', name: 'authorization', template: 'Bearer {secret}',
+          };
+          try {
+            const rawCfg = secretData.exec_config as unknown;
+            const cfg = (typeof rawCfg === 'string' ? JSON.parse(rawCfg) : (rawCfg ?? {})) as
+              { credential_binding?: typeof binding };
+            if (cfg?.credential_binding?.name && cfg.credential_binding.template?.includes('{secret}')) {
+              binding = cfg.credential_binding;
+            }
+          } catch { /* keep the default */ }
+
+          let def;
+          let label: string;
+
+          if (operation_id) {
+            // Signed path: a typed adapter. Strongest, because the owner fixed the route
+            // AND the response fields in advance.
+            let catalogue: Record<string, { definition: unknown; signature?: string }> = {};
+            try {
+              const raw = secretData.operations as unknown;
+              catalogue = (typeof raw === 'string' ? JSON.parse(raw) : (raw ?? {})) as typeof catalogue;
+            } catch { return fail("This entry's operation catalogue is not readable."); }
+
+            const slot = catalogue?.[operation_id];
+            if (!slot) {
+              const known = Object.keys(catalogue || {});
+              return fail(`Entry has no operation "${operation_id}".` + (known.length ? ` Available: ${known.join(', ')}.` : ' It defines none.'));
+            }
+            const verified = verifyOperationDefinition(entry_id, slot.definition, slot.signature, plaintextBytes, operation_id);
+            if (!verified.ok || !verified.definition) return fail(`Refused: ${verified.reason}`);
+            const argCheck = validateArguments(verified.definition, callArgs);
+            if (!argCheck.ok) return fail(`Refused: ${argCheck.reason}`);
+            def = verified.definition;
+            label = operation_id;
+          } else {
+            // Agent-described path. The agent knows where it is going because the
+            // secret's name and the user's prompt told it — a definition would add
+            // nothing to its capability, only to a human's ability to review. So the
+            // review requirement lives on the TIER, checked server-side below.
+            const r = agentReq!;
+            if (!r?.origin?.host || !r.origin.scheme || !r.origin.port) {
+              return fail('request.origin needs scheme, host and port.');
+            }
+            def = definitionFromAgentRequest(r, binding);
+            label = `${def.route.method} ${originString(r.origin)}${r.path || '/'}`;
+          }
+
+          // Ask the server BEFORE anything goes upstream. Tier 1 proceeds and is logged;
+          // tier 2 is refused into the approval flow, scoped to this exact request.
+          const bodyHash = agentReq?.body !== undefined
+            ? createHash('sha256').update(JSON.stringify(agentReq.body)).digest('hex')
+            : undefined;
+          const verdict = await api.checkOperation({
+            entry_id,
+            origin: originString(def.origin),
+            method: def.route.method,
+            path: def.route.path,
+            purpose: purpose.slice(0, 200),
+            body_sha256: bodyHash,
+          });
+          if (!verdict.allowed) {
+            return fail(
+              `${verdict.message ?? 'This call needs owner approval.'}\n\n`
+              + `Nothing was sent. The owner sees exactly: ${def.route.method} `
+              + `${originString(def.origin)}${def.route.path}`,
+            );
+          }
+
+          const result = await performOperation(def, operation_id ? callArgs : ((agentReq?.body ?? {}) as Record<string, unknown>), secret);
           if (!result.ok) {
-            return fail(`${operation_id} failed${result.status ? ` (HTTP ${result.status})` : ''}: ${result.error ?? 'unknown error'}`);
+            return fail(`${label} failed${result.status ? ` (HTTP ${result.status})` : ''}: ${result.error ?? 'unknown error'}`);
           }
           return CallToolResultSchema.parse({
             content: [{ type: 'text', text:
-              `✅ ${operation_id} → HTTP ${result.status}. The credential was used here, not returned to you; the response was filtered to this operation's allowed fields.\n`
+              `✅ ${label} → HTTP ${result.status} (tier ${verdict.tier}). The credential was used here, not returned to you.\n`
               + `${JSON.stringify(result.body, null, 2)}` }],
           });
         } finally {
