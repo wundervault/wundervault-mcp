@@ -9,11 +9,20 @@
  *
  * The split that makes this coherent:
  *
- *   Tier 1 — the destination NEVER leaves this machine. The server learns that a call
- *            happened, not where it went.
+ *   Tier 1 — the destination is INTENDED to stay on this machine. The server should
+ *            learn that a call happened, not where it went.
  *   Tier 2 — the destination IS sent, because the whole point of tier 2 is that a human
  *            reviews the request, and they cannot review what they cannot see. That is
  *            consented disclosure for one specific call, not a standing profile.
+ *
+ * NOT TRUE YET, and saying so here rather than letting the comment flatter the code:
+ * `checkOperation` sends origin, method and path on EVERY call, tier 1 included, because
+ * the tier gate and the audit log both live on the server and both read those fields. So
+ * today the server does learn tier 1 destinations. Closing that means the client deciding
+ * the tier locally before it asks, and the account's audit log losing the destination
+ * column for tier 1 entries — a product change, not a refactor, and it is owed a decision
+ * rather than a quiet commit. Until it is made, the per-entry email switch controls
+ * whether a destination is MAILED, not whether it is transmitted.
  *
  * HONEST LIMIT: this file lives in the agent's own home directory and is writable by the
  * agent's uid. A compromised agent can edit its own record of where it sent things — the
@@ -214,13 +223,14 @@ export interface DestinationNotice {
  *  - **the tool result** is how the agent explains it to you in the conversation, which
  *    is where you are actually looking.
  *
- * Neither reaches the server. The destination stays on this machine, so the default
- * install leaves the server knowing nothing about where a secret goes — no relay, no
- * transient handling, nothing to store.
+ * Neither of those two channels reaches the server. (The operation-check that precedes
+ * this notice does — see the header. These channels add nothing to what it already sent.)
  *
- * The case this does NOT cover is an unattended run: a scheduled agent at 3am with
- * nobody watching the terminal. Email covers that and is therefore opt-in, labelled as
- * the choice that sends the destination to the server in order to deliver it.
+ * The case NEITHER covers is an unattended run: a scheduled agent at 3am with nobody
+ * watching the terminal. Both channels are written blind — sent, with no way to know a
+ * human read them — and on an unattended run none did. Email is the channel that reaches
+ * someone who is not there, so it is opt-in per entry, and the notice says which channels
+ * carried it so an owner can tell coverage from the appearance of coverage.
  */
 export function newDestinationNotice(
   secretName: string, origin: string, method: string, path: string,
@@ -239,6 +249,17 @@ export function newDestinationNotice(
    * through the model.
    */
   callerChoseDestination: boolean = true,
+  /**
+   * Is the unattended email channel on for this entry?
+   *
+   * The notice has to say, and has to say it accurately in BOTH directions. Claiming a
+   * mail went out when none did leaves someone believing they are covered at 3am when
+   * they are not. Staying silent when one DID go out is the other half of the same
+   * problem: the mail names the destination, so it is the moment this server learns
+   * where the secret went, and that is not something to disclose only in a settings
+   * page the owner configured weeks ago.
+   */
+  emailOn: boolean = false,
 ): DestinationNotice {
   const at = new Date().toISOString();
   const isTier2 = String(tier) === '2';
@@ -246,14 +267,22 @@ export function newDestinationNotice(
   // Tier 2 already required the owner to see and approve this exact operation, so
   // telling them "this was not gated" and "the destination stayed on this machine"
   // would both be false — the approval is precisely where it was disclosed.
+  // Where this notice actually went. Terminal-only reaches nobody on an unattended run,
+  // so an owner who has not turned email on should be told that in the notice itself
+  // rather than discovering it after a 3am first sighting nobody saw.
+  const channels = emailOn
+    ? `   Emailed to you as well, so an unattended run still reaches you.`
+    : `   Terminal only — nobody is emailed. If this entry runs unattended, turn email `
+      + `alerts on for it in the dashboard, or a first sighting at 3am is seen by no one.`;
+
   const explanation = isTier2
     ? `   You approved this operation, so it was gated. The destination was sent to `
       + `Wundervault as part of that approval; it is also recorded on this machine.`
     : `   Tier 1 does not gate destinations, so this is a notice rather than a block. `
       + `If you did not expect it, revoke this agent and rotate the secret at the provider. `
       + `Moving the secret to Tier 2 makes each new request wait for approval.\n`
-      + `   Recorded on this machine; the destination was not sent to Wundervault. `
-      + `(This note travels in the tool result, so it reaches whoever runs your model.)`;
+      + `${channels}\n`
+      + `   (This note travels in the tool result, so it reaches whoever runs your model.)`;
 
   // The destination appears in the tool note ONLY when the caller already supplied it.
   const where = callerChoseDestination

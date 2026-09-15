@@ -108,9 +108,15 @@ describe('the notice, and where it goes', () => {
     expect(notice.toolNote).toContain('api.cloudflare.com');
   });
 
-  it('says plainly that the destination did not go to the server', () => {
-    // The whole point of the local store; if the notice does not say so, nobody knows.
-    expect(n().toolNote).toMatch(/not sent to Wundervault/i);
+  it('says which channels actually carried it, and does not claim the destination stayed local', () => {
+    // This test used to assert "not sent to Wundervault". That claim was false:
+    // checkOperation sends origin, method and path on EVERY call, tier 1 included. A
+    // test asserting a false security claim is worse than no test — it defends the
+    // claim against being corrected. What the notice can honestly say is which channels
+    // the NOTICE went to, which is what decides whether anyone hears it at 3am.
+    expect(n().toolNote).not.toMatch(/not sent to Wundervault/i);
+    expect(n().toolNote).toMatch(/Terminal only/i);
+    expect(n().toolNote).toMatch(/nobody is emailed/i);
   });
 
   it('describes itself as a notice, not a block', () => {
@@ -181,10 +187,22 @@ describe('round 1 fixes', () => {
     expect(t2.stderrLine).toContain('tier=2');
   });
 
-  it('still tells a Tier 1 caller the destination stayed local', () => {
-    const t1 = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/x', '1');
-    expect(t1.toolNote).toMatch(/not sent to Wundervault/i);
-    expect(t1.toolNote).toMatch(/notice rather than a block/i);
+  it('tells a Tier 1 caller it is a notice, and whether anyone was emailed', () => {
+    const off = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/x', '1');
+    expect(off.toolNote).toMatch(/notice rather than a block/i);
+    expect(off.toolNote).toMatch(/Terminal only/i);
+
+    const on = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/x', '1', true, true);
+    expect(on.toolNote).toMatch(/Emailed to you/i);
+    expect(on.toolNote).not.toMatch(/Terminal only/i);
+  });
+
+  it('never claims mail went out when it did not', () => {
+    // The asymmetry that matters: believing you are covered at 3am and not being is
+    // strictly worse than knowing you are not covered.
+    const off = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/x', '1', true, false);
+    expect(off.toolNote).not.toMatch(/[Ee]mailed to you/);
+    expect(off.stderrLine).toContain('api.cf.com');
   });
 
   it('does not lose a record when two writers interleave', () => {
@@ -225,10 +243,10 @@ describe('round 2 fixes', () => {
     expect(n.toolNote).toContain('api.cf.com');
   });
 
-  it('says Wundervault rather than "the server", and warns where the note travels', () => {
-    // "not sent to the server" was ambiguous: true of ours, false of the model provider.
+  it('warns where the note travels', () => {
+    // The tool result reaches the model provider. That warning survives; the neighbouring
+    // "not sent to Wundervault" claim did not, because it was not true.
     const n = newDestinationNotice('CF', 'https://api.cf.com:443', 'GET', '/zones', '1', true);
-    expect(n.toolNote).toMatch(/not sent to Wundervault/);
     expect(n.toolNote).toMatch(/reaches whoever runs your model/);
   });
 

@@ -667,11 +667,45 @@ export function createServer(args: { url?: string } = {}) {
             body_sha256: bodyHash,
           });
           if (!verdict.allowed) {
-            return fail(
-              `${verdict.message ?? 'This call needs owner approval.'}\n\n`
-              + `Nothing was sent. The owner sees exactly: ${def.route.method} `
-              + `${originString(def.origin)}${def.route.path}`,
-            );
+            // Park and poll rather than refusing outright, exactly as the plaintext path
+            // does. Without this the agent gets an instant "ask your owner" and the tool
+            // call is over, so an owner who approves thirty seconds later approves
+            // nothing — the work has already been abandoned and has to be re-driven by
+            // hand. Waiting turns the approval into something that resolves THIS call.
+            //
+            // It also creates the timeout, which is the only evidence available that
+            // nobody was at the terminal. waitForTier2Approval reports an expired wait to
+            // the server, which escalates to a second email. An attended run never
+            // reaches that line, because an attended run gets approved.
+            const approved = verdict.request_id
+              ? await api.waitForTier2Approval(verdict.request_id)
+              : false;
+            if (!approved) {
+              return fail(
+                `${verdict.message ?? 'This call needs owner approval.'}\n\n`
+                + `Nothing was sent. The owner sees exactly: ${def.route.method} `
+                + `${originString(def.origin)}${def.route.path}`,
+              );
+            }
+            // Re-ask rather than assuming. The approval is scoped to this exact origin,
+            // method and path and may be single-use or time-boxed; the server owns that
+            // decision and is the only thing that should conclude the call may proceed.
+            const second = await api.checkOperation({
+              entry_id,
+              origin: originString(def.origin),
+              method: def.route.method,
+              path: def.route.path,
+              purpose: purpose.slice(0, 200),
+              body_sha256: bodyHash,
+            });
+            if (!second.allowed) {
+              return fail(
+                `${second.message ?? 'This call needs owner approval.'}\n\n`
+                + `Nothing was sent. The owner sees exactly: ${def.route.method} `
+                + `${originString(def.origin)}${def.route.path}`,
+              );
+            }
+            verdict.tier = second.tier;
           }
 
           // Approvals come from the SERVER, not from a local file. They are a control,
@@ -696,7 +730,8 @@ export function createServer(args: { url?: string } = {}) {
               // An agent-described request means the caller already knows the
               // destination; a signed operation means it does not, and the tool result
               // reaches the model provider.
-              !operation_id);
+              !operation_id,
+              (secretData.alert_email ?? 'off') === 'on');
             emitToStderr(notice);
             noticeForAgent = `\n\n${notice.toolNote}`;
           }

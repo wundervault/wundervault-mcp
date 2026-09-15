@@ -103,8 +103,21 @@ export class AgentVaultAPI {
     }
   }
 
-  /** Poll a tier-2 approval request for up to ~90s. True once approved. */
-  private async waitForTier2Approval(requestId: string): Promise<boolean> {
+  /**
+   * Poll a tier-2 approval request for up to ~90s. True once approved.
+   *
+   * Running out of patience is not the same as being refused, and the difference is
+   * worth reporting. A denial means somebody looked and said no. A timeout means nobody
+   * looked at all — which is the only signal this system ever gets that the terminal had
+   * no one reading it. So the deadline expiring reports itself, and the server turns that
+   * into the second, louder notice.
+   *
+   * Only the expiry reports. A denial and an explicit expiry both mean a human was
+   * involved or the request is already dead, and mailing about either would make the
+   * escalation routine — at which point it stops being read, which is the failure mode
+   * that matters for a channel whose entire job is to work at 3am.
+   */
+  async waitForTier2Approval(requestId: string): Promise<boolean> {
     const deadline = Date.now() + 90_000;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 5_000));
@@ -118,7 +131,27 @@ export class AgentVaultAPI {
         // transient poll error — keep waiting until the deadline
       }
     }
+    await this.reportUnanswered(requestId);
     return false;
+  }
+
+  /**
+   * Tell the server nobody answered, so the owner hears about it a second time.
+   *
+   * Best effort by design. This runs at the end of a call that has already failed, and
+   * the caller is about to report that failure; turning a broken notification into a
+   * different error would replace an accurate message ("approval never came") with a
+   * misleading one ("could not reach Wundervault"). The server is idempotent on its side,
+   * so a retried call cannot multiply the mail.
+   */
+  private async reportUnanswered(requestId: string): Promise<void> {
+    try {
+      await fetch(`${this.baseUrl}/agent/vault/tier2-requests/${requestId}/unanswered`, {
+        method: 'POST',
+        headers: this.headers(),
+        signal: AbortSignal.timeout(TIMEOUT),
+      });
+    } catch { /* the call already failed; do not fail it differently */ }
   }
 
   async getMcpSettings(): Promise<{

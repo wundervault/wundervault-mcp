@@ -52,6 +52,8 @@ export interface SecretResponse {
   operations?: string;
   /** Exact private origins the owner approved for this entry. */
   allowed_private_origins?: string;
+  /** "on" | "off" — does a first sighting on this entry also go out by email? */
+  alert_email?: string;
   name?: string;
   encrypted_content: string;
   content_nonce: string;
