@@ -22,9 +22,34 @@ const { values } = parseArgs({
   options: {
     url: { type: 'string', short: 'u' },
     help: { type: 'boolean' },
+    destinations: { type: 'boolean' },
   },
   allowPositionals: false,
 });
+
+// ── Destination log viewer ────────────────────────────────────────────────────
+//
+// Handled before anything else touches the daemon: reading your own log should work when
+// the daemon is down, when the credential is held by another agent, and when you are
+// looking at this precisely because something is wrong.
+if (values.destinations) {
+  const { writeViewer } = await import('./log-viewer.js');
+  const { destinationsFor, defaultStorePath, load } = await import('./network-store.js');
+  const store = defaultStorePath();
+  const shape = load(store);
+  const out = writeViewer(store);
+  const calls = shape.seen.reduce((n, s) => n + s.count, 0);
+  console.log(`
+Destination log — ${shape.seen.length} destination(s), ${calls} call(s)
+  store:  ${store}
+  viewer: ${out}
+
+Open that file in your browser. It contains the data already, loads nothing, and is
+blocked by its own content-security policy from making any network request. Nothing was
+sent anywhere to produce it.
+`);
+  process.exit(0);
+}
 
 if (values.help) {
   console.log(`
@@ -35,8 +60,10 @@ Secure vault tool provider for AI agents via MCP protocol.
 Usage: wundervault-mcp [options]
 
 Options:
-  --url <url>   API base URL override (default: from daemon)
-  --help        Show this help
+  --url <url>      API base URL override (default: from daemon)
+  --destinations   Write a local HTML view of where this machine's agents have sent
+                   secrets, and print its path. Never leaves this machine.
+  --help           Show this help
 
 Credentials are loaded from the wundervault-agent daemon.
 Set WUNDERVAULT_AGENT_NAME in your MCP config to identify this agent.
