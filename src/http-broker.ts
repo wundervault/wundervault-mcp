@@ -26,6 +26,26 @@ export interface CallResult {
   redirectedTo?: string;
 }
 
+/**
+ * Remove the credential from anything on its way back to the caller.
+ *
+ * The field allowlist is not sufficient by itself: an upstream can echo the credential
+ * in a field the operation legitimately allows. This is exact-match scrubbing, so it is
+ * defence in depth and NOT a guarantee — an upstream that encodes the value still
+ * defeats it, which is why the tool no longer claims non-disclosure outright.
+ */
+export function scrubSecret(value: unknown, secret: string): unknown {
+  if (!secret) return value;
+  if (typeof value === 'string') return value.split(secret).join('[REDACTED]');
+  if (Array.isArray(value)) return value.map((v) => scrubSecret(v, secret));
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = scrubSecret(v, secret);
+    return out;
+  }
+  return value;
+}
+
 const DEFAULT_RESPONSE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_REQUEST_BYTES = 1024 * 1024;
 const CONNECT_TIMEOUT_MS = 10_000;
@@ -58,21 +78,49 @@ function isBlockedIPv4(ip: string): boolean {
   return false;
 }
 
+/** Expand any IPv6 spelling to eight 16-bit groups, or null if it is not one. */
+export function expandIPv6(ip: string): number[] | null {
+  let s = ip;
+  // A trailing dotted-quad (::ffff:127.0.0.1) becomes two hex groups first.
+  const dotted = /^(.*:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(s);
+  if (dotted) {
+    const p = dotted[2].split('.').map(Number);
+    if (p.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return null;
+    s = dotted[1] + ((p[0] << 8) | p[1]).toString(16) + ':' + ((p[2] << 8) | p[3]).toString(16);
+  }
+  const halves = s.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 2 ? fill < 0 : fill !== 0) return null;
+  const groups = [...head, ...Array(halves.length === 2 ? fill : 0).fill('0'), ...tail];
+  if (groups.length !== 8) return null;
+  const out = groups.map((g) => (g === '' ? 0 : parseInt(g, 16)));
+  if (out.some((n) => Number.isNaN(n) || n < 0 || n > 0xffff)) return null;
+  return out;
+}
+
 export function isBlockedAddress(ip: string): boolean {
   const v = isIP(ip);
   if (v === 4) return isBlockedIPv4(ip);
   if (v !== 6) return true;                                  // not an address at all
 
   const lower = ip.toLowerCase();
-  // IPv4-mapped (::ffff:127.0.0.1) and IPv4-compatible forms smuggle a v4 address
-  // through a v6 check. Unwrap and apply the v4 rules rather than treating it as "some
-  // v6 address, looks fine".
-  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(lower);
-  if (mapped) return isBlockedIPv4(mapped[1]);
-  const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(lower);
-  if (mappedHex) {
-    const hi = parseInt(mappedHex[1], 16), lo = parseInt(mappedHex[2], 16);
-    return isBlockedIPv4([hi >> 8, hi & 255, lo >> 8, lo & 255].join('.'));
+
+  // IPv4-mapped forms smuggle a v4 address through a v6 check, and they have MANY
+  // spellings: ::ffff:127.0.0.1, ::ffff:7f00:1, and the fully-expanded
+  // 0:0:0:0:0:ffff:127.0.0.1 — an earlier version matched only the compressed ones and
+  // let the expanded form through to loopback. Expand to eight groups first, then
+  // decide once.
+  const expanded = expandIPv6(lower);
+  if (expanded) {
+    const g = expanded;
+    const isMapped = g.slice(0, 5).every((x) => x === 0) && (g[5] === 0xffff || g[5] === 0);
+    if (isMapped && !(g[5] === 0 && g[6] === 0 && g[7] <= 1)) {
+      const v4 = [g[6] >> 8, g[6] & 255, g[7] >> 8, g[7] & 255].join('.');
+      return isBlockedIPv4(v4);
+    }
   }
 
   if (lower === '::' || lower === '::1') return true;        // unspecified, loopback
@@ -184,9 +232,12 @@ export async function performOperation(
       // whatever host the upstream nominates, which is a one-request exfiltration.
       if (status >= 300 && status < 400) {
         res.resume();
+        // The Location header is NOT echoed. The upstream has already received the
+        // credential, so it can put it anywhere it likes — including Location — and
+        // returning that verbatim hands the secret straight back to the caller.
         return finish({
-          ok: false, status, redirectedTo: res.headers.location,
-          error: `Upstream redirected to ${res.headers.location ?? 'an unnamed location'}. Redirects are not followed, because the credential would travel with them. If this destination is legitimate, define an operation for it.`,
+          ok: false, status,
+          error: 'Upstream redirected. The redirect is not followed, because the credential would travel with it, and the target is not shown, because an upstream that holds the credential can put it in the Location header. If the destination is legitimate, define an operation for it.',
         });
       }
 
@@ -194,8 +245,17 @@ export async function performOperation(
       if (stream !== res) res.pipe(stream as NodeJS.WritableStream & NodeJS.ReadableStream);
 
       let size = 0;
+      let wire = 0;
       const chunks: Buffer[] = [];
       let over = false;
+
+      // Cap the WIRE bytes too. Counting only after decompression meant a 20 MiB
+      // compressed stream that expands to "{}" downloaded in full before anything
+      // noticed — the decompressed cap catches bombs, this one catches the download.
+      res.on('data', (c: Buffer) => {
+        wire += c.length;
+        if (wire > maxRes) { over = true; req.destroy(); }
+      });
       (stream as NodeJS.ReadableStream).on('data', (c: Buffer) => {
         // Counted AFTER decompression, so a small compressed bomb cannot expand past
         // the cap unnoticed.
@@ -211,8 +271,11 @@ export async function performOperation(
         if (parsed === undefined) {
           return finish({ ok: false, status, error: 'Upstream returned a body this operation could not parse as JSON.' });
         }
-        // Only the fields the definition allows reach the caller.
-        finish({ ok: status >= 200 && status < 300, status, body: filterResponse(def, parsed) });
+        // Only the fields the definition allows reach the caller — and even then the
+        // secret is scrubbed, because an upstream can echo it in an ALLOWED field and
+        // the allowlist alone would pass it through.
+        const filtered = filterResponse(def, parsed);
+        finish({ ok: status >= 200 && status < 300, status, body: scrubSecret(filtered, secret) });
       });
       (stream as NodeJS.ReadableStream).on('error', (e: Error) => finish({ ok: false, status, error: `Response error: ${e.message}` }));
     });

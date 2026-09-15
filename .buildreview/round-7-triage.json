@@ -1,0 +1,16 @@
+{"round": 7, "decisions": [
+ {"id":"F1","action":"fixed","claim":"the redirect Location header is returned to the caller and can carry the credential",
+  "reason":"confirmed. The upstream RECEIVED the secret, so it can echo it in Location, and I put that header verbatim into the error. Upstream-controlled strings no longer reach the caller, and the secret is scrubbed from all output as defence in depth."},
+ {"id":"F2","action":"fixed","claim":"the catalogue key is not bound to the signature, so a signed definition can be moved to another slot",
+  "reason":"confirmed and it is the sharpest finding — I never bound operation_id to the definition. Both definitions are legitimately signed, so verification passes while the caller gets an operation it did not ask for. The definition carries an `op` field; it must now equal the requested operation_id."},
+ {"id":"F3","action":"fixed","claim":"limits are signed but not type-checked, so a string defeats the size cap via NaN",
+  "reason":"confirmed: 2 > 'none' is false, so no comparison ever fires. Limits are validated as positive integers at shape time."},
+ {"id":"F4","action":"fixed","claim":"the credential-management regex misses /v1/apikeys",
+  "reason":"confirmed — my pattern required a separator, and 'keys' inside 'apikeys' has none. Matching is substring-based now; false positives are the right direction for this check and the explicit flag exists for them."},
+ {"id":"F5","action":"fixed","claim":"0:0:0:0:0:ffff:127.0.0.1 bypasses the IPv4-mapped check",
+  "reason":"confirmed. My regexes assumed the compressed '::ffff:' form. The address is normalised before the mapped check."},
+ {"id":"F6","action":"fixed","claim":"counting only decompressed bytes lets a large stream download fully",
+  "reason":"confirmed. Both wire bytes and decompressed bytes are capped now — the first stops the download, the second stops the bomb."},
+ {"id":"F7","action":"fixed","claim":"a credential echoed in an ALLOWED field passes through while the message claims non-disclosure",
+  "reason":"confirmed, and the overclaim is the worse half. The secret is scrubbed from the returned body and the wording no longer asserts something the mechanism cannot guarantee."}
+]}

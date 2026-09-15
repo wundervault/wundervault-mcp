@@ -602,7 +602,7 @@ export function createServer(args: { url?: string } = {}) {
         try {
           // Verified against the DECRYPTED SECRET, so a definition this server wrote or
           // altered cannot pass — the server has never seen the plaintext.
-          const verified = verifyOperationDefinition(entry_id, slot.definition, slot.signature, plaintextBytes);
+          const verified = verifyOperationDefinition(entry_id, slot.definition, slot.signature, plaintextBytes, operation_id);
           if (!verified.ok || !verified.definition) return fail(`Refused: ${verified.reason}`);
 
           const argCheck = validateArguments(verified.definition, callArgs);
@@ -615,7 +615,7 @@ export function createServer(args: { url?: string } = {}) {
           }
           return CallToolResultSchema.parse({
             content: [{ type: 'text', text:
-              `✅ ${operation_id} → HTTP ${result.status}. The credential was used, not disclosed.\n`
+              `✅ ${operation_id} → HTTP ${result.status}. The credential was used here, not returned to you; the response was filtered to this operation's allowed fields.\n`
               + `${JSON.stringify(result.body, null, 2)}` }],
           });
         } finally {

@@ -41,7 +41,10 @@ const HMAC_BYTES = 32;
  * refused unless the owner said so explicitly, because "fetch me a new API key" defeats
  * the entire point of never releasing the old one.
  */
-const CREDENTIAL_MANAGEMENT = /(^|[/_-])(tokens?|keys?|credentials?|secrets?|passwords?|oauth|authorize|sessions?)([/_-]|$)/i;
+// Substring, deliberately not boundary-anchored. An earlier version required a
+// separator and so missed "/v1/apikeys", where "keys" sits inside a longer segment.
+// False positives are the safe direction here — the explicit flag exists for them.
+const CREDENTIAL_MANAGEMENT = /(token|key|credential|secret|password|oauth|authoriz|session)/i;
 
 /**
  * Canonical JSON: keys sorted at every level, no insignificant whitespace.
@@ -69,6 +72,8 @@ export function canonicalJson(value: unknown): string {
  * plaintext is hashed rather than stored so the cache key is not itself key material.
  */
 const derivedKeys = new Map<string, Buffer>();
+/** Bounded so a long-lived process cannot accumulate one entry per secret seen. */
+const MAX_CACHED_KEYS = 64;
 
 function cacheKeyFor(entryId: string, salt: Buffer, plaintext: Uint8Array): string {
   const pt = createHash('sha256').update(Buffer.from(plaintext)).digest('base64');
@@ -80,6 +85,11 @@ export function deriveOpKey(entryId: string, plaintext: Uint8Array, salt: Buffer
   const hit = derivedKeys.get(k);
   if (hit) return hit;
   const derived = pbkdf2Sync(Buffer.from(plaintext), salt, PBKDF2_ITERATIONS, 32, 'sha256');
+  if (derivedKeys.size >= MAX_CACHED_KEYS) {
+    // Oldest-first eviction; Map preserves insertion order.
+    const oldest = derivedKeys.keys().next().value;
+    if (oldest !== undefined) derivedKeys.delete(oldest);
+  }
   derivedKeys.set(k, derived);
   return derived;
 }
@@ -105,6 +115,14 @@ export function verifyOperationDefinition(
   rawDefinition: unknown,
   signatureB64: string | undefined,
   plaintext: Uint8Array,
+  /**
+   * The catalogue key the caller asked for. The signature covers the definition but NOT
+   * where it was filed, so without this a server can move one legitimately signed
+   * definition into another's slot: the caller asks for health.check, verification
+   * passes against the jobs.trigger definition, and the credential goes somewhere it
+   * never asked to send it.
+   */
+  expectedOperationId?: string,
 ): VerifyResult {
   if (!signatureB64) {
     return { ok: false, reason: 'This operation has no signature. An unsigned definition is refused: without it, a definition the server wrote is indistinguishable from one you approved.' };
@@ -135,6 +153,10 @@ export function verifyOperationDefinition(
 
   const shaped = validateShape(rawDefinition);
   if (!shaped.ok) return shaped;
+
+  if (expectedOperationId !== undefined && shaped.definition!.op !== expectedOperationId) {
+    return { ok: false, reason: `Catalogue mismatch: the entry files this definition under "${expectedOperationId}", but the signed definition is for "${shaped.definition!.op}". Refusing — a definition moved into another slot is still validly signed.` };
+  }
   return { ok: true, definition: shaped.definition };
 }
 
@@ -180,6 +202,22 @@ export function validateShape(raw: unknown): VerifyResult {
     for (const k of Object.keys(d.static_headers)) {
       if (k.toLowerCase() === lower) {
         return { ok: false, reason: `Operation "${d.op}" sets "${k}" as both the credential binding and a static header.` };
+      }
+    }
+  }
+
+  // Limits are signed data but were never type-checked. A string sails through
+  // verification and then defeats every size comparison via NaN: `2 > "none"` is false,
+  // so no cap ever fires and an arbitrarily large response is buffered.
+  if (d.limits !== undefined) {
+    if (typeof d.limits !== 'object' || d.limits === null || Array.isArray(d.limits)) {
+      return { ok: false, reason: `Operation "${d.op}" has a malformed limits object.` };
+    }
+    for (const field of ['request_bytes', 'response_bytes'] as const) {
+      const v = (d.limits as Record<string, unknown>)[field];
+      if (v === undefined) continue;
+      if (typeof v !== 'number' || !Number.isInteger(v) || v <= 0) {
+        return { ok: false, reason: `Operation "${d.op}" limits.${field} must be a positive integer, got ${JSON.stringify(v)}.` };
       }
     }
   }

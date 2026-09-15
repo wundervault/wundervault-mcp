@@ -10,7 +10,7 @@ import {
   canonicalJson, verifyOperationDefinition, validateShape, validateArguments,
   filterResponse, _clearDerivedKeyCache, type OperationDefinition,
 } from '../src/opdef.js';
-import { isBlockedAddress, resolvePinned } from '../src/http-broker.js';
+import { isBlockedAddress, resolvePinned, expandIPv6, scrubSecret } from '../src/http-broker.js';
 import { modeAllowsHttpBroker, modeAllowsLegacyExec, wrongModeMessage } from '../src/ssh-agent.js';
 
 const SECRET = Buffer.from('sk-ant-api03-EXAMPLE-SECRET-VALUE');
@@ -227,5 +227,82 @@ describe('mode gating for BROKER_HTTP', () => {
 
   it('names the mode the caller needs', () => {
     expect(wrongModeMessage('LEGACY_EXEC', 'http')).toContain('BROKER_HTTP');
+  });
+});
+
+describe('round 1 regressions', () => {
+  const base = {
+    op: 'x', origin: { scheme: 'https', host: 'h.example', port: 443 },
+    credential_binding: { in: 'header' as const, name: 'a', template: '{secret}' },
+  };
+
+  it('binds the catalogue key, so a signed definition cannot be filed elsewhere', () => {
+    // Both definitions are legitimately signed; moving one into another's slot used to
+    // pass verification and send the credential to a route nobody asked for.
+    const def = { ...base, op: 'jobs.trigger', route: { method: 'POST', path: '/v1/jobs' } };
+    const sig = sign(def, SECRET);
+    expect(verifyOperationDefinition('e', def, sig, SECRET, 'jobs.trigger').ok).toBe(true);
+    const moved = verifyOperationDefinition('e', def, sig, SECRET, 'health.check');
+    expect(moved.ok).toBe(false);
+    expect(moved.reason).toMatch(/Catalogue mismatch/);
+  });
+
+  it('refuses a non-numeric byte limit', () => {
+    // `2 > "none"` is false, so a string limit silently disabled every size check.
+    const r = validateShape({ ...base, route: { method: 'GET', path: '/x' }, limits: { response_bytes: 'none' } });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/positive integer/);
+  });
+
+  it('refuses a zero or negative byte limit', () => {
+    expect(validateShape({ ...base, route: { method: 'GET', path: '/x' }, limits: { response_bytes: 0 } }).ok).toBe(false);
+    expect(validateShape({ ...base, route: { method: 'GET', path: '/x' }, limits: { request_bytes: -1 } }).ok).toBe(false);
+  });
+
+  it('catches a credential-management path with no separator around the word', () => {
+    // "/v1/apikeys" — "keys" sits inside a longer segment, which a boundary-anchored
+    // pattern missed entirely.
+    expect(validateShape({ ...base, route: { method: 'GET', path: '/v1/apikeys' } }).ok).toBe(false);
+    expect(validateShape({ ...base, route: { method: 'GET', path: '/oauth2/authorize' } }).ok).toBe(false);
+  });
+
+  it('still allows ordinary routes', () => {
+    expect(validateShape({ ...base, route: { method: 'POST', path: '/v1/messages' } }).ok).toBe(true);
+    expect(validateShape({ ...base, route: { method: 'GET', path: '/v1/user' } }).ok).toBe(true);
+  });
+
+  it('blocks the fully-expanded IPv4-mapped loopback form', () => {
+    // Only the compressed spellings were matched before, so this reached 127.0.0.1.
+    expect(isBlockedAddress('0:0:0:0:0:ffff:127.0.0.1')).toBe(true);
+    expect(isBlockedAddress('0:0:0:0:0:ffff:169.254.169.254')).toBe(true);
+  });
+
+  it('still permits a genuine public IPv6 address', () => {
+    expect(isBlockedAddress('2606:4700:4700::1111')).toBe(false);
+  });
+
+  it('scrubs the credential from a response even in an allowed field', () => {
+    // The allowlist alone cannot help when the upstream echoes the secret into a field
+    // the operation legitimately permits.
+    const out = scrubSecret({ content: 'sk-live-123', nested: [{ x: 'pre sk-live-123 post' }] }, 'sk-live-123');
+    expect(JSON.stringify(out)).not.toContain('sk-live-123');
+    expect(JSON.stringify(out)).toContain('[REDACTED]');
+  });
+
+  it('leaves a response alone when it does not contain the secret', () => {
+    expect(scrubSecret({ a: 'ordinary' }, 'sk-live')).toEqual({ a: 'ordinary' });
+  });
+});
+
+describe('IPv6 expansion', () => {
+  it('expands compressed and dotted forms to eight groups', () => {
+    expect(expandIPv6('::1')).toEqual([0, 0, 0, 0, 0, 0, 0, 1]);
+    expect(expandIPv6('::ffff:127.0.0.1')).toEqual([0, 0, 0, 0, 0, 0xffff, 0x7f00, 1]);
+    expect(expandIPv6('0:0:0:0:0:ffff:127.0.0.1')).toEqual([0, 0, 0, 0, 0, 0xffff, 0x7f00, 1]);
+  });
+
+  it('returns null for things that are not addresses', () => {
+    expect(expandIPv6('nonsense')).toBeNull();
+    expect(expandIPv6('1::2::3')).toBeNull();
   });
 });

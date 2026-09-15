@@ -1,0 +1,209 @@
+{
+  "verdict": "revise",
+  "summary": "The build implements signed operation definitions, typed argument checking, pinned HTTPS requests, response filtering, and BROKER_HTTP mode gating. It does not yet hold up against the authorization and confidentiality requirements: redirect headers can disclose the credential, catalogue entries can be relabelled to invoke a different signed operation, malformed limits disable response caps, and several required verification and SSRF checks are incomplete.",
+  "spec_check": [
+    {
+      "requirement": "A definition with a valid signature verifies; one with a tampered field does not.",
+      "status": "met",
+      "evidence": "verifyOperationDefinition derives the HMAC key from the plaintext and embedded salt, compares with timingSafeEqual, and the tests cover valid and tampered definitions."
+    },
+    {
+      "requirement": "A definition the server altered (any field) fails verification and the call is refused.",
+      "status": "met",
+      "evidence": "The HMAC covers canonicalJson(rawDefinition), and the handler refuses a failed verification before performOperation."
+    },
+    {
+      "requirement": "An unsigned definition is refused.",
+      "status": "met",
+      "evidence": "verifyOperationDefinition returns failure immediately when signatureB64 is absent."
+    },
+    {
+      "requirement": "Canonicalisation is stable: key order and whitespace do not change the signature.",
+      "status": "met",
+      "evidence": "canonicalJson recursively sorts object keys and emits no insignificant whitespace; reordered-key tests are present."
+    },
+    {
+      "requirement": "A definition that does not round-trip canonicalisation is rejected before any network call.",
+      "status": "partial",
+      "evidence": "The definition is canonicalized for HMAC verification, but there is no explicit serialize/parse round-trip check or rejection of non-JSON runtime values."
+    },
+    {
+      "requirement": "The derived key is cached per (entry, salt); a new salt forces re-derivation.",
+      "status": "met",
+      "evidence": "The cache key includes entry ID, salt, and a plaintext hash, so different salts and rotated plaintexts cannot reuse the prior key."
+    },
+    {
+      "requirement": "vault_call rejects arguments that do not match arguments_schema.",
+      "status": "met",
+      "evidence": "validateArguments checks required names, top-level runtime types, and rejects unknown arguments before the request."
+    },
+    {
+      "requirement": "A caller cannot supply headers, a URL, or a raw body.",
+      "status": "met",
+      "evidence": "The handler passes only the selected signed definition, validated args, and decrypted secret to performOperation; extra top-level caller properties are not used in request construction."
+    },
+    {
+      "requirement": "The caller invokes a named operation with vault_call(entry_id, operation_id, args, purpose).",
+      "status": "partial",
+      "evidence": "operation_id selects a catalogue slot, but the handler never checks that the selected signed definition's op field equals operation_id, allowing signed operations to be relabelled."
+    },
+    {
+      "requirement": "Exact scheme + host + port. HTTPS only. Normal WebPKI validation.",
+      "status": "met",
+      "evidence": "Shape validation requires https and a numeric port, while httpsRequest uses the definition host and port with rejectUnauthorized enabled."
+    },
+    {
+      "requirement": "Resolve the name once, pin the chosen IP for the connection, keep the original hostname for Host/SNI/validation, and ensure the HTTP client cannot perform a second lookup.",
+      "status": "met",
+      "evidence": "resolvePinned resolves once, and the request lookup callback always returns the vetted address while servername remains the original host."
+    },
+    {
+      "requirement": "Reject loopback, link-local, RFC1918, ULA, multicast, unspecified, CGNAT, benchmarking and cloud-metadata ranges \u2014 including IPv4-mapped IPv6 forms.",
+      "status": "partial",
+      "evidence": "The common ranges and compressed mapped forms are blocked, but equivalent expanded IPv4-mapped IPv6 notation is accepted."
+    },
+    {
+      "requirement": "A 3xx is returned, not followed.",
+      "status": "met",
+      "evidence": "The node:https client does not follow redirects, and the response callback returns an error result for all 300-399 statuses."
+    },
+    {
+      "requirement": "Only static_headers from the definition plus the credential binding. Nothing caller-supplied.",
+      "status": "met",
+      "evidence": "Headers are assembled from static_headers and the credential binding; request framing and Host headers are added by the engine rather than the caller."
+    },
+    {
+      "requirement": "The credential header name is refused if it also appears in static_headers, in any case variant.",
+      "status": "met",
+      "evidence": "validateShape compares lower-cased static header names with the lower-cased credential header name."
+    },
+    {
+      "requirement": "Request and response byte caps, and a cap on the decompressed response.",
+      "status": "unmet",
+      "evidence": "Limit field types are not verified and a nonnumeric signed response_bytes value disables comparison; additionally, compressed wire bytes are never counted separately from decompressed output."
+    },
+    {
+      "requirement": "Connect, TLS, header, total and idle timeouts.",
+      "status": "partial",
+      "evidence": "The implementation has one request/socket timeout and one total timer, but no separately enforced TLS or header deadlines; DNS resolution also occurs before the total timer starts."
+    },
+    {
+      "requirement": "Only fields named in response.allow are returned to the caller. Everything else is dropped, including headers.",
+      "status": "unmet",
+      "evidence": "JSON bodies are filtered by top-level allowlist, but a redirect's Location header is copied into redirectedTo and the returned error text regardless of response.allow."
+    },
+    {
+      "requirement": "This does not make disclosure impossible \u2014 a listed field can still contain it \u2014 and that limitation is documented, not implied away.",
+      "status": "unmet",
+      "evidence": "The tool description says the credential is never returned and successful results assert it was not disclosed, even though filterResponse returns allowed values without checking whether they contain the credential."
+    },
+    {
+      "requirement": "A definition whose route matches a known credential-management shape (paths containing token, key, credential, secret, password) must set allows_credential_management true explicitly.",
+      "status": "unmet",
+      "evidence": "The boundary-based regular expression misses paths where the required word is embedded in a segment, such as /v1/apikeys."
+    },
+    {
+      "requirement": "An entry in BROKER_HTTP mode is refused by vault_exec, vault_entry_get and vault_entry_inject_env.",
+      "status": "partial",
+      "evidence": "modeAllowsLegacyExec is shown rejecting BROKER_HTTP and is tested directly, but the excerpt does not show the three named handlers using that helper."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/http-broker.ts",
+      "line": 171,
+      "claim": "A redirect's Location response header bypasses response.allow and is returned verbatim to the caller.",
+      "failure_scenario": "The authenticated upstream receives secret sk-live and responds with HTTP 302 plus Location: https://example.invalid/?echo=sk-live; performOperation embeds that header in its error, and the vault_call handler returns the full credential to the caller.",
+      "suggested_direction": "Do not expose redirect headers or destinations unless they pass an explicitly authorized response schema, and ensure redirect diagnostics cannot include credential-derived data."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/server.ts",
+      "line": 591,
+      "claim": "The catalogue key selected by operation_id is not checked against the signed definition's op field.",
+      "failure_scenario": "An entry has separately signed no-argument definitions for health.check and jobs.trigger; the server places the jobs.trigger definition in the health.check catalogue slot, so a caller requesting health.check passes signature and argument validation but sends the credential to the trigger route.",
+      "suggested_direction": "Bind the requested operation identifier to the signed operation identity and refuse a catalogue slot whose signed op does not exactly match the requested ID."
+    },
+    {
+      "id": "F3",
+      "severity": "blocker",
+      "file": "src/opdef.ts",
+      "line": 181,
+      "claim": "validateShape does not validate limit types or finiteness, allowing a signed malformed definition to disable byte caps.",
+      "failure_scenario": "A signed JSON definition contains limits.response_bytes set to \"none\"; verification succeeds, maxRes becomes that string, every size > maxRes comparison is false because numeric coercion produces NaN, and an arbitrarily large response is buffered.",
+      "suggested_direction": "Reject definitions unless request_bytes and response_bytes are finite, positive numeric values within enforced operational bounds."
+    },
+    {
+      "id": "F4",
+      "severity": "blocker",
+      "file": "src/opdef.ts",
+      "line": 39,
+      "claim": "The credential-management detector checks token boundaries rather than the required substring shapes.",
+      "failure_scenario": "A signed definition targets /v1/apikeys without allows_credential_management; the path contains \"key\" but CREDENTIAL_MANAGEMENT does not match because \"keys\" is embedded in the apikeys segment, so verification accepts the operation.",
+      "suggested_direction": "Detect the specified credential-management substrings after applying the same path normalization and decoding semantics the upstream will use."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "src/http-broker.ts",
+      "line": 68,
+      "claim": "The IPv4-mapped IPv6 filter recognizes only compressed textual forms and accepts equivalent expanded forms.",
+      "failure_scenario": "isBlockedAddress receives 0:0:0:0:0:ffff:127.0.0.1; node:net identifies it as IPv6, neither mapped regular expression matches, and the function returns false even though the address maps to IPv4 loopback.",
+      "suggested_direction": "Normalize IPv6 addresses to binary form and classify mapped IPv4 addresses and reserved prefixes from their bytes rather than matching selected string spellings."
+    },
+    {
+      "id": "F6",
+      "severity": "major",
+      "file": "src/http-broker.ts",
+      "line": 183,
+      "claim": "For compressed responses, the code enforces only the decompressed-size limit and has no cap on bytes received over the network.",
+      "failure_scenario": "With response_bytes set to 1 MiB, an upstream sends a 20 MiB concatenated gzip stream that expands to the two-byte JSON body {}; size reaches only 2, so the broker downloads the entire 20 MiB response and returns success instead of refusing at the response cap.",
+      "suggested_direction": "Track and enforce compressed wire bytes independently from decompressed output bytes, while retaining the post-decompression cap."
+    },
+    {
+      "id": "F7",
+      "severity": "major",
+      "file": "src/server.ts",
+      "line": 623,
+      "claim": "The caller-facing text promises non-disclosure even though an allowed response field can contain the credential.",
+      "failure_scenario": "A definition allows the content field and the upstream returns {\"content\":\"sk-live\"}; filterResponse returns that value, while the tool output simultaneously states that the credential was not disclosed.",
+      "suggested_direction": "Document the allowlisted-field limitation in the tool contract and avoid making an unconditional non-disclosure claim in successful results."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "Query-string credential bindings place bearer secrets in URLs.",
+      "why_it_matters": "Even when the response is filtered, upstream access logs, reverse proxies, tracing systems, browser-style diagnostics, and error telemetry commonly retain full query strings, creating durable copies of the credential."
+    },
+    {
+      "id": "B2",
+      "concern": "There is no rate, concurrency, cost, or idempotency control per operation.",
+      "why_it_matters": "A same-uid caller can repeatedly invoke a destructive or billable approved operation, causing duplicate mutations, provider throttling, or substantial spend even though it never learns the secret."
+    },
+    {
+      "id": "B3",
+      "concern": "DNS resolution has no deadline and happens before the total-operation timer is installed.",
+      "why_it_matters": "A stalled or unhealthy system resolver can leave vault_call pending indefinitely despite the advertised 60-second total timeout."
+    },
+    {
+      "id": "B4",
+      "concern": "The build does not define a safe discovery path for operation IDs on BROKER_HTTP entries.",
+      "why_it_matters": "The vault_call description directs callers to vault_entry_get, while the acceptance criteria require vault_entry_get to refuse BROKER_HTTP entries, so callers without out-of-band catalogue knowledge may be unable to discover callable operations."
+    },
+    {
+      "id": "B5",
+      "concern": "The process-lifetime derived-key cache has no size bound or eviction policy.",
+      "why_it_matters": "Entries repeatedly re-signed with new salts retain a new 32-byte derived key plus map metadata for every salt until restart, allowing long-lived processes to accumulate memory indefinitely."
+    }
+  ],
+  "_meta": {
+    "round": 7,
+    "at": "2026-09-15T01:10:41+00:00",
+    "package_bytes": 86793,
+    "schema_problems": []
+  }
+}
