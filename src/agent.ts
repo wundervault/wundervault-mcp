@@ -37,7 +37,7 @@ import { redeemSetupLink, peekAgentName } from './enrol.js';
 import {
   systemRoot, profilesPath, saltPath, mgmtSocketPath, agentSocketPath,
   runtimeDir, ensureSystemRoot, safeName, SYSTEM_ACCOUNT, mgmtDir, networkStorePath,
-  splitAvailable, systemdCredential,
+  splitAvailable, systemdCredential, sealedWithTpm,
 } from './paths.js';
 import { load as loadNetworkShape } from './network-store.js';
 
@@ -118,7 +118,7 @@ function refuseRoot(): void {
  * the weaker mode while the release notes describe the stronger one, so the mode in force is
  * reported at startup and by `ping`.
  */
-type KeyMode = 'sealed' | 'derived';
+type KeyMode = 'sealed-tpm' | 'sealed-host' | 'derived';
 
 function legacyDerivedKey(): Buffer {
   let machineId = 'unknown';
@@ -150,7 +150,7 @@ function sealedKey(): Buffer | null {
 
 function deriveMachineKey(): { key: Buffer; mode: KeyMode } {
   const sealed = sealedKey();
-  if (sealed) return { key: sealed, mode: 'sealed' };
+  if (sealed) return { key: sealed, mode: sealedWithTpm() ? 'sealed-tpm' : 'sealed-host' };
   return { key: legacyDerivedKey(), mode: 'derived' };
 }
 
@@ -294,7 +294,7 @@ class AgentDaemon {
       // rewrite the store under the sealed one immediately. Migration has to be automatic —
       // an upgrade that leaves every existing install unable to start is not an upgrade, and
       // one that needs a manual step is one most people will not take.
-      if (this.keyMode === 'sealed') {
+      if (this.keyMode !== 'derived') {
         try {
           const viaLegacy = decryptProfiles(fs.readFileSync(pp), legacyDerivedKey()).profiles;
           this.profiles = viaLegacy;
@@ -694,10 +694,21 @@ class AgentDaemon {
     );
     // Said out loud, every start. A machine quietly running in the weaker mode while the
     // documentation describes the stronger one is the failure this line exists to prevent.
-    if (this.keyMode === 'sealed') {
+    if (this.keyMode === 'sealed-tpm') {
       console.log(
-        '[wundervault-agent] Store key: SEALED to this machine (systemd/TPM). ' +
+        '[wundervault-agent] Store key: SEALED TO THIS MACHINE\'S TPM. ' +
         'A copy of the disk does not open it.',
+      );
+    } else if (this.keyMode === 'sealed-host') {
+      // Deliberately NOT the sentence above. systemd's host key lives at
+      // /var/lib/systemd/credential.secret — on the same disk as the sealed store — so a copy
+      // of that disk plus root does open this. Better than a key derived from public inputs,
+      // and not the same claim.
+      console.log(
+        '[wundervault-agent] Store key: sealed to systemd\'s HOST KEY (no TPM found).\n' +
+        '[wundervault-agent] That key is on this same disk, so an offline copy plus root\n' +
+        '[wundervault-agent] WOULD open the store. It stops a casual file read, not a\n' +
+        '[wundervault-agent] stolen disk. A TPM is what makes the disk copy useless.',
       );
     } else {
       console.error(

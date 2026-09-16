@@ -232,10 +232,23 @@ elif command -v systemd-creds >/dev/null 2>&1; then
       | systemd-creds encrypt --name=wv-store-key - "$SEALED_KEY" 2>/dev/null; then
     chown "${ACCOUNT}:$(id -gn "$ACCOUNT")" "$SEALED_KEY"
     chmod 0600 "$SEALED_KEY"
+    # Record WHICH kind of sealing happened, because the two make different promises and
+    # the broker must not claim the stronger one. A drop-in rather than the unit template, so
+    # a re-run updates it and a package upgrade does not overwrite it.
+    mkdir -p "/etc/systemd/system/${UNIT_NAME}.d"
     case "$TPM_STATE" in
-      yes) echo "store key: sealed to this machine's TPM" ;;
-      *)   echo "store key: sealed to the host key (no TPM found — still not portable,"
-           echo "           but a disk copy plus root would open it)" ;;
+      yes)
+        printf '[Service]\nEnvironment=WUNDERVAULT_SEAL_KIND=tpm\n' \
+          > "/etc/systemd/system/${UNIT_NAME}.d/seal.conf"
+        echo "store key: sealed to this machine's TPM — a copy of the disk does not open it"
+        ;;
+      *)
+        printf '[Service]\nEnvironment=WUNDERVAULT_SEAL_KIND=host\n' \
+          > "/etc/systemd/system/${UNIT_NAME}.d/seal.conf"
+        echo "store key: sealed to systemd's HOST KEY (no TPM found)"
+        echo "           That key lives on this same disk, so an offline copy plus root"
+        echo "           would open the store. Better than a derived key; not a sealed one."
+        ;;
     esac
   else
     echo "WARNING: could not seal a store key with systemd-creds." >&2
@@ -278,22 +291,35 @@ systemctl restart "$UNIT_NAME"
 
 sleep 1
 
-# Did the sealing actually take EFFECT? Sealing a key and delivering it are separate things,
-# and the gap between them is silent: systemd can set CREDENTIALS_DIRECTORY and still fail to
-# materialise the file, which leaves the broker on the derived key while a sealed blob sits
-# on disk looking like proof of something. Ask the broker what key it is actually using.
+# Did the sealing actually take EFFECT?
+#
+# Sealing a key and USING it are separate things and the gap between them is silent. Ask the
+# broker directly rather than grepping its log: a fixed journal window can scroll past the
+# line entirely if the service is chatty at startup, and then a machine reports a clean
+# install while running on the weaker key.
 if [ -f "$SEALED_KEY" ] && systemctl is-active --quiet "$UNIT_NAME"; then
   sleep 1
-  if journalctl -u "$UNIT_NAME" -n 20 --no-pager 2>/dev/null | grep -q "Store key: DERIVED"; then
-    echo >&2
-    echo "WARNING: a sealed key exists but the broker is NOT using it." >&2
-    echo "         systemd did not deliver the credential — check:" >&2
-    echo "           systemd-creds decrypt --name=wv-store-key ${SEALED_KEY} -" >&2
-    echo "           journalctl -u ${UNIT_NAME} | grep -i credential" >&2
-    echo "         The store is running on a key derived from /etc/machine-id and the" >&2
-    echo "         broker's uid, which anyone able to read ${STATE_DIR} can recompute." >&2
-    echo "         Do not describe this machine as having a sealed store." >&2
+  KEY_MODE=$(printf '{"action":"ping"}\n' \
+    | timeout 5 socat - UNIX-CONNECT:/run/wundervault/mgmt/agent.sock 2>/dev/null \
+    | sed -n 's/.*"key_mode":"\([a-z-]*\)".*/\1/p')
+  if [ -z "$KEY_MODE" ]; then
+    # socat may not be installed; fall back to the log, and say that the check was weaker.
+    KEY_MODE=$(journalctl -u "$UNIT_NAME" --since "-2 min" --no-pager 2>/dev/null \
+      | sed -n 's/.*Store key: \(SEALED TO THIS MACHINE.S TPM\|sealed to systemd.s HOST KEY\|DERIVED\).*/\1/p' \
+      | tail -1)
   fi
+  case "$KEY_MODE" in
+    *DERIVED*|derived)
+      echo >&2
+      echo "WARNING: a sealed key exists but the broker is NOT using it." >&2
+      echo "         systemd did not deliver it — check:" >&2
+      echo "           systemd-creds decrypt --name=wv-store-key ${SEALED_KEY} -" >&2
+      echo "           journalctl -u ${UNIT_NAME} | grep -i 'store key'" >&2
+      echo "         The store is running on a key derived from /etc/machine-id and the" >&2
+      echo "         broker's uid, which anyone able to read ${STATE_DIR} can recompute." >&2
+      echo "         Do not describe this machine as having a sealed store." >&2
+      ;;
+  esac
 fi
 
 if systemctl is-active --quiet "$UNIT_NAME"; then

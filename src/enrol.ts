@@ -222,9 +222,21 @@ export async function redeemSetupLink(
   const blob = Buffer.from(b64, 'base64');
   if (blob.length < 29) throw new Error('The credential blob is too short to be valid.');
 
+  // pbkdf2, NOT pbkdf2Sync.
+  //
+  // This runs inside the broker, on the event loop every agent's credential socket shares.
+  // 600,000 synchronous rounds is a few hundred milliseconds during which nothing else is
+  // served — and while both KDF versions are supported, a v1 link pays for a failed v2
+  // attempt first. Asynchronous keeps that cost on the caller's request rather than on
+  // everyone else's.
+  const pbkdf2 = (pass: string, salt: string, rounds: number) =>
+    new Promise<Buffer>((resolve, reject) =>
+      crypto.pbkdf2(pass, salt, rounds, 32, 'sha256',
+        (err, dk) => (err ? reject(err) : resolve(dk))));
+
   let plain: Buffer | null = null;
   for (const { salt, rounds } of KDF_VERSIONS) {
-    const key = crypto.pbkdf2Sync(passphrase, salt, rounds, 32, 'sha256');
+    const key = await pbkdf2(passphrase, salt, rounds);
     try {
       const decipher = crypto.createDecipheriv('aes-256-gcm', key, blob.subarray(0, 12));
       // GCM in this format carries its tag at the END of the ciphertext, the way the Python

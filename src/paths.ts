@@ -121,12 +121,37 @@ export function runtimeDir(): string {
 export const CREDENTIAL_NAME = 'wv-store-key';
 
 export function systemdCredential(name = CREDENTIAL_NAME): Buffer | null {
+  // Two places, because the unit unseals with ExecStartPre rather than
+  // LoadCredentialEncrypted — that mechanism is fatal when the source cannot be decrypted,
+  // which turns a cleared TPM into a broker that will not start. $CREDENTIALS_DIRECTORY is
+  // still checked first so the unit can be switched back without touching this code.
+  const candidates: string[] = [];
   const dir = process.env.CREDENTIALS_DIRECTORY;
-  if (!dir) return null;
-  try {
-    const buf = fs.readFileSync(path.join(dir, name));
-    return buf.length >= 32 ? buf : null;
-  } catch { return null; }
+  if (dir) candidates.push(path.join(dir, name));
+  candidates.push(path.join(runtimeDir(), 'store.key'));
+
+  for (const p of candidates) {
+    try {
+      const buf = fs.readFileSync(p);
+      if (buf.length >= 32) return buf;
+    } catch { /* try the next */ }
+  }
+  return null;
+}
+
+/**
+ * Was the key sealed to the TPM, or only to systemd's host key?
+ *
+ * The difference is the entire claim. A TPM-sealed key does not leave the machine: copy the
+ * disk and it does not open. A HOST-KEY-sealed one is protected by a file at
+ * /var/lib/systemd/credential.secret which lives ON THE SAME DISK, so a copy of that disk
+ * plus root access opens it — verified by decrypting a sealed blob using nothing but files
+ * from the same filesystem. It is still far better than a key derived from public inputs, but
+ * saying "a copy of the disk does not open it" about it is simply false, and that sentence
+ * was being printed.
+ */
+export function sealedWithTpm(): boolean {
+  return process.env.WUNDERVAULT_SEAL_KIND === 'tpm';
 }
 
 /** The sealed blob on disk. Written by the installer, read by systemd, never by us. */

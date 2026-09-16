@@ -652,3 +652,53 @@ describe('the ephemeral viewer removes the page it actually wrote', () => {
     expect(opener.slice(0, 900)).not.toMatch(/execFileSync\(/);
   });
 });
+
+describe('the store key claim matches the store key', () => {
+  it('distinguishes TPM sealing from host-key sealing', () => {
+    // These make different promises. A TPM-sealed key does not leave the machine. systemd's
+    // host key lives at /var/lib/systemd/credential.secret — on the SAME DISK as the sealed
+    // store — so an offline copy plus root opens it, which was verified by decrypting a
+    // sealed blob using nothing but files from that filesystem. The code printed "a copy of
+    // the disk does not open it" for both.
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'agent.ts'), 'utf8');
+    expect(src).toMatch(/'sealed-tpm' \| 'sealed-host' \| 'derived'/);
+    // The strong sentence must appear only on the TPM branch.
+    const tpmIdx = src.indexOf("SEALED TO THIS MACHINE");
+    const hostIdx = src.indexOf("sealed to systemd\\'s HOST KEY");
+    expect(tpmIdx).toBeGreaterThan(-1);
+    expect(hostIdx).toBeGreaterThan(-1);
+    const hostBranch = src.slice(hostIdx, hostIdx + 700);
+    expect(hostBranch).toMatch(/WOULD open the store/);
+    expect(hostBranch).not.toMatch(/does not open it/);
+  });
+
+  it('does not let a cleared TPM stop the broker starting', () => {
+    // LoadCredentialEncrypted is fatal when the source cannot be decrypted, which turns a
+    // cleared or replaced TPM into a broker that never reaches ExecStart — so the derived-key
+    // fallback it carries could never run, and the store has already been migrated away from
+    // that key. ExecStartPre with '-' is non-fatal by construction; '+' runs it as root,
+    // which is what reaching the TPM needs.
+    const unit = fs.readFileSync(path.join(ROOT, 'packaging', 'wundervault-agent.service'), 'utf8');
+    expect(unit).toMatch(/^ExecStartPre=-\+/m);
+    expect(unit).not.toMatch(/^LoadCredentialEncrypted=/m);
+  });
+
+  it('asks the broker which key it used, rather than grepping a log window', () => {
+    // A fixed `journalctl -n 20` window can scroll past the line on a chatty start, and then
+    // the install reports success while the machine runs on the weaker key.
+    const script = fs.readFileSync(path.join(ROOT, 'packaging', 'install-daemon.sh'), 'utf8');
+    expect(script).toMatch(/"action":"ping"/);
+    expect(script).toMatch(/key_mode/);
+    expect(script).not.toMatch(/journalctl -u "\$UNIT_NAME" -n 20/);
+  });
+
+  it('derives the setup-link key asynchronously', () => {
+    // 600,000 synchronous rounds block the loop every agent's credential socket shares, and
+    // a v1 link pays for a failed v2 attempt first.
+    // Matching the CALL, not the word — the comment above it names pbkdf2Sync to say why it
+    // is not used, and a blunt search flagged that as the defect it was describing.
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'enrol.ts'), 'utf8');
+    expect(src).not.toMatch(/crypto\.pbkdf2Sync\(/);
+    expect(src).toMatch(/crypto\.pbkdf2\(/);
+  });
+});

@@ -1,0 +1,177 @@
+{
+  "verdict": "revise",
+  "summary": "The build retains the Linux uid boundary and adds automatic migration from the derived profile-store key to a systemd-sealed random key, while supporting both setup-link KDF versions. The cryptographic migration itself uses authenticated decryption and write-then-rename appropriately, but host-key sealing is reported with a false disk-theft guarantee, TPM loss has no viable fallback after migration, and the installer's weak-mode verification can silently miss the condition it is meant to expose.",
+  "spec_check": [
+    {
+      "requirement": "B1. The only way a profile enters the daemon is `enrol`, carrying a setup link. There is no `register_profile`.",
+      "status": "partial",
+      "evidence": "The shown enrolment module only redeems setup links, while agent.ts has an internal registerProfile method; the management action dispatch proving that `register_profile` is absent is in the withheld portion."
+    },
+    {
+      "requirement": "B2. The daemon performs the exchange: `GET /api/setup/agent/<token>`, PBKDF2-SHA256 over the fragment passphrase (salt `wv-agent-setup-v1`, 100,000 rounds), AES-256-GCM, then `POST .../burn`.",
+      "status": "partial",
+      "evidence": "src/enrol.ts performs GET, authenticated decryption, and returns a burn callback, but now attempts `wv-agent-setup-v2` at 600,000 rounds before the specified v1/100,000-round construction."
+    },
+    {
+      "requirement": "B2a. A link is accepted only from an origin in the daemon's own configuration.",
+      "status": "met",
+      "evidence": "parseSetupUrl compares URL.origin against allowedOrigins derived from WUNDERVAULT_SETUP_ORIGIN and rejects all other origins, including unconfigured loopback origins."
+    },
+    {
+      "requirement": "B2c. Redirects are refused (`redirect: 'error'`) and a non-JSON content-type is refused rather than parsed.",
+      "status": "met",
+      "evidence": "httpJson sets redirect to error and accepts only application/json or a structured +json media type."
+    },
+    {
+      "requirement": "B4. The burn happens after the profile is stored.",
+      "status": "partial",
+      "evidence": "redeemSetupLink returns the burn operation separately so it can be called after storage, but the calling enrolment handler and its failed-burn response are in the withheld agent.ts portion."
+    },
+    {
+      "requirement": "C2. Compared in constant time. A wrong token closes the connection without saying whether the agent name exists.",
+      "status": "partial",
+      "evidence": "tokenMatches uses timingSafeEqual after decoding equal-length byte strings; the socket response behavior and any input-format validation performed before this function are not shown."
+    },
+    {
+      "requirement": "D1. The agent's uid cannot read `/var/lib/wundervault`.",
+      "status": "met",
+      "evidence": "The installer owns the directory by the wundervault account, forces mode 0700, and verifies that mode; the unit runs under the separate wundervault uid."
+    },
+    {
+      "requirement": "D2. The agent cannot read the daemon's memory. Enforced by uid separation.",
+      "status": "met",
+      "evidence": "The system unit specifies User=wundervault and Group=wundervault, with an empty capability bounding set."
+    },
+    {
+      "requirement": "D5. The at-rest encryption of the profile store is defence in depth, not the boundary.",
+      "status": "partial",
+      "evidence": "Derived mode is accurately described as recomputable, but sealed mode is reported as resisting disk copies even when systemd used its host key, which the installer itself acknowledges can be recovered from a disk copy with root access."
+    },
+    {
+      "requirement": "E1. A system unit, `User=wundervault`, `Group=wundervault`.",
+      "status": "met",
+      "evidence": "packaging/wundervault-agent.service contains both directives and the installer verifies User before starting it."
+    },
+    {
+      "requirement": "E2. `NoNewPrivileges=yes`, `CapabilityBoundingSet=` (empty), `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `RestrictSUIDSGID=yes`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `LockPersonality=yes`, `ProtectProc=invisible`, `LimitCORE=0`.",
+      "status": "met",
+      "evidence": "Every listed directive is present in packaging/wundervault-agent.service, and MemoryDenyWriteExecute is absent as required by E2a."
+    },
+    {
+      "requirement": "E3. `ReadWritePaths=/var/lib/wundervault` and nothing else writable.",
+      "status": "met",
+      "evidence": "The unit contains the single specified ReadWritePaths entry under ProtectSystem=strict."
+    },
+    {
+      "requirement": "E4. `RuntimeDirectory=wundervault`.",
+      "status": "met",
+      "evidence": "The unit declares RuntimeDirectory=wundervault and RuntimeDirectoryMode=0755."
+    },
+    {
+      "requirement": "E5. The daemon must refuse to start as root.",
+      "status": "partial",
+      "evidence": "A refuseRoot function is visible only at the edge of the agent.ts extract; its complete condition and startup invocation are not included."
+    },
+    {
+      "requirement": "F1. Migration carries no credentials.",
+      "status": "partial",
+      "evidence": "The phase-4 user migration implementation is outside the provided excerpt; the newly added local key migration decrypts and rewrites the daemon-owned profile store but does not establish the behavior of `--migrate`."
+    },
+    {
+      "requirement": "F3. The user's `~/.wundervault/agents/<name>.token` STAYS, and migration must PRESERVE its value.",
+      "status": "partial",
+      "evidence": "paths.ts continues to place tokens in the user root, but the enrolment caller that preserves an existing token is withheld."
+    },
+    {
+      "requirement": "G1. One privileged step, doing only: create the system user, install the unit, create `/var/lib/wundervault`, enable the service.",
+      "status": "partial",
+      "evidence": "There is one privileged installer, but this round also generates and seals a store key as root and restarts the service."
+    },
+    {
+      "requirement": "G4. The privileged step is printed in full before it runs, and is re-runnable.",
+      "status": "partial",
+      "evidence": "The installer prints a four-item summary and preserves an existing sealed key on rerun, but it does not print the actual sealing command or resulting unit in full before execution."
+    },
+    {
+      "requirement": "17. A setup link from any origin but the configured one is refused, including a server the caller started on loopback.",
+      "status": "met",
+      "evidence": "Loopback HTTP is only protocol-eligible; it is still rejected unless its exact origin appears in the daemon-controlled allowlist."
+    },
+    {
+      "requirement": "19. A failure after redemption does not burn the link, and one connection cannot trigger more than one enrolment.",
+      "status": "partial",
+      "evidence": "The burn callback permits storage before burning, but the one-enrolment-per-connection guard is in withheld code."
+    },
+    {
+      "requirement": "23. A failed burn is reported to the caller rather than reported as success.",
+      "status": "partial",
+      "evidence": "The burn callback returns false and logs on failure, but the omitted caller determines whether that false result is actually reported over the management connection."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": 699,
+      "claim": "Host-key-backed credentials are classified and announced as resisting a copied disk even though the systemd host key is stored on that disk.",
+      "failure_scenario": "On a machine without a usable TPM, systemd-creds seals with its root-only host key; an offline full-disk copy contains both that host key and `/var/lib/wundervault/store.key.cred`, so someone with root-equivalent access to the copy can decrypt the store key, while startup reports `SEALED ... A copy of the disk does not open it` and ping reports the undifferentiated `sealed` mode.",
+      "suggested_direction": "Represent TPM-backed and host-key-backed sealing as distinct modes and make every startup, ping, installer, and documentation statement describe the actual protection of each mode."
+    },
+    {
+      "id": "F2",
+      "severity": "major",
+      "file": "packaging/wundervault-agent.service",
+      "line": 27,
+      "claim": "Once the store has been migrated to a TPM-sealed key, loss of TPM unsealing prevents systemd from starting the broker, so the broker's advertised derived-key fallback cannot run.",
+      "failure_scenario": "After a successful migration rewrites `agent-profiles.enc` under the sealed key and deletes the legacy salt, clearing or replacing the TPM makes LoadCredentialEncrypted fail before ExecStart; repeated service restarts and installer reruns keep using the existing undecryptable `store.key.cred`, and the agents cannot retrieve any credentials.",
+      "suggested_direction": "Define and implement a recovery and resealing lifecycle for TPM reset or hardware replacement, and distinguish service-manager credential-load failure from the in-process no-credential fallback."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "packaging/install-daemon.sh",
+      "line": 285,
+      "claim": "The installer does not actually query ping for `key_mode`; it searches only the last 20 journal records, so it can silently miss a derived-key fallback.",
+      "failure_scenario": "A sealed blob exists but the running broker receives no credential and logs `Store key: DERIVED`; if 20 or more later unit log records arrive before the installer's check, `journalctl -n 20` excludes that line, the grep does not match, and installation completes without the promised warning that sealing is not in effect.",
+      "suggested_direction": "Obtain the current mode directly from the running broker through its ping response, and fail or warn explicitly if that query cannot establish the mode."
+    },
+    {
+      "id": "F4",
+      "severity": "minor",
+      "file": "src/enrol.ts",
+      "line": 54,
+      "claim": "The setup-link implementation no longer performs only the v1/100,000-round KDF specified by B2 and synchronously computes an unnecessary 600,000-round v2 attempt for every valid v1 link.",
+      "failure_scenario": "When the specified server supplies a v1 link, enrolment blocks the daemon event loop for 600,000 v2 PBKDF2 rounds that cannot decrypt the blob and then performs the required 100,000 v1 rounds, delaying all credential and management socket handling during the combined synchronous work.",
+      "suggested_direction": "Make KDF version selection an explicit, authenticated part of the setup format and align the deployed producer, specification, and daemon before preferring v2; avoid running multiple synchronous password KDFs on the shared event loop."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "No end-to-end test has started, restarted, and migrated the real service with a credential materialized by a working TPM.",
+      "why_it_matters": "The untested path includes systemd's credential decryption, sandbox setup, uid transition, automatic store rewrite, and subsequent restart; a failure in any of those steps can leave every agent unavailable despite all unit tests passing."
+    },
+    {
+      "id": "B2",
+      "concern": "Backup and restore semantics for the sealed store are undefined.",
+      "why_it_matters": "A backup containing `agent-profiles.enc` and `store.key.cred` may restore on the original host but fail after motherboard replacement or TPM clearing, while a host-key-backed backup may be decryptable by anyone who also captured systemd's host key."
+    },
+    {
+      "id": "B3",
+      "concern": "There is no operational procedure to rotate or reseal the random store key before TPM maintenance.",
+      "why_it_matters": "Firmware servicing, TPM ownership changes, motherboard replacement, or deliberate TPM clearing can turn routine maintenance into loss of access to every stored agent credential."
+    },
+    {
+      "id": "B4",
+      "concern": "The v1/v2 setup-link rollout has not been shown against the actual server implementation.",
+      "why_it_matters": "The burnbox/server repository is withheld, so tests against Python AESGCM vectors do not prove that production links carry the same salt, iteration count, byte encoding, and deployment timing expected by this decryptor."
+    }
+  ],
+  "_meta": {
+    "round": 18,
+    "at": "2026-09-16T01:46:28+00:00",
+    "package_bytes": 106698,
+    "schema_problems": []
+  }
+}
