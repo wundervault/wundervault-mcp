@@ -1,0 +1,123 @@
+{
+  "verdict": "revise",
+  "summary": "The broker now dispatches operations instead of returning vault credentials, enforces entry modes in the broker, and hosts HTTP and SSH-key use on the privileged side. It does not yet satisfy Part 3 because the connection deadline is explicitly 180 seconds instead of 120, the package does not show the required MCP-client migration, and the rewritten framing permits a quadratic pre-authentication CPU attack.",
+  "spec_check": [
+    {
+      "requirement": "17. The per-agent socket never emits `api_key` or `enc_key`.",
+      "status": "met",
+      "evidence": "The credential reply was removed from `src/agent.ts`; authenticated requests now pass through `serve`, whose defined replies do not directly include either credential field."
+    },
+    {
+      "requirement": "18. An old-shape `{token}` request returns an upgrade error, not credentials.",
+      "status": "met",
+      "evidence": "`serve` treats a missing `op` as an old client and returns `UPGRADE_REQUIRED`, `upgrade: true`, and the broker version."
+    },
+    {
+      "requirement": "19. `get_entry` on a BROKER_SSH_AGENT or BROKER_HTTP entry is refused BY THE BROKER, with every client-side mode check deleted in the test build.",
+      "status": "partial",
+      "evidence": "`BrokerOps.getEntry` calls `modeAllowsLegacyExec` before decrypting or returning plaintext, so broker-side enforcement is present; the package does not show the MCP test build with its client-side checks deleted."
+    },
+    {
+      "requirement": "19a. Each RPC causes exactly one `getSecret` against the vault API \u2014 the access log and the tier-2 gate behave identically to today.",
+      "status": "met",
+      "evidence": "Each secret-bearing implementation shown\u2014`getEntry`, `call`, and `sshAgentOpen`\u2014has one direct `this.api.getSecret` call and does not perform a separate metadata fetch."
+    },
+    {
+      "requirement": "20. `call` performs the HTTP operation with the plaintext never appearing in any socket reply.",
+      "status": "met",
+      "evidence": "`BrokerOps.call` decrypts locally, passes the resulting secret to broker-side `performOperation`, wipes the byte buffer, and returns only the scrubbed operation result and metadata."
+    },
+    {
+      "requirement": "21. `ssh_agent_open` lets `ssh` authenticate without the private key crossing the socket, and the session is closed on `ssh_agent_close` and on a timeout.",
+      "status": "partial",
+      "evidence": "`sshAgentOpen` keeps the loaded identity in the broker-hosted agent, returns only socket and public-key paths, and installs both explicit-close and timeout cleanup; the required end-to-end SSH authentication test is not included in the package."
+    },
+    {
+      "requirement": "22. No file under `src/` other than the broker's own modules imports `decryptVaultKey`, `decryptSecretContent` or `loadEncryptionKey`. Grep test.",
+      "status": "partial",
+      "evidence": "`src/broker-ops.ts` is a broker module and legitimately imports decryption functions, but the package does not show the rest of `src/` or the stated grep test."
+    },
+    {
+      "requirement": "23. The SSRF guard, the pinned lookup, the private-origin allowlist and the scrubbing behave identically after the move.",
+      "status": "partial",
+      "evidence": "`BrokerOps.call` reuses `performOperation` and `isApprovedPrivateOrigin`, but the unchanged tests running specifically through the broker-hosted path are not shown."
+    },
+    {
+      "requirement": "24. `recordDestination` writes `/var/lib/wundervault/network.json` as the broker, and an agent cannot write that file.",
+      "status": "partial",
+      "evidence": "`recordDestination` is now called from `BrokerOps.call`, which runs in the broker, but the file ownership and installed two-uid permission check are outside the excerpt."
+    },
+    {
+      "requirement": "25. A request larger than 1 MiB is refused, and a connection held open past 120s is closed, while a legitimate 30s upstream call completes.",
+      "status": "unmet",
+      "evidence": "The raw-byte cap and disarmed post-request inactivity timer address the first and third clauses, but `src/agent.ts` sets the absolute deadline to 180,000 ms rather than 120,000 ms."
+    },
+    {
+      "requirement": "26. A wrong token still costs the failing caller the exponential penalty, and a valid token is still served during another caller's flood.",
+      "status": "partial",
+      "evidence": "The token check is restored before dispatch, but every incoming chunk triggers `Buffer.concat(chunks)`, allowing a pre-authentication sender to impose quadratic copying and delay valid callers."
+    },
+    {
+      "requirement": "27. The seven live agents' flow \u2014 repair, pair, claim, enrol, then every tool \u2014 works end to end in the rehearsal container.",
+      "status": "unmet",
+      "evidence": "The package reports 446 tests but no seven-agent rehearsal, and it describes this round as broker-side only; no MCP-server migration from credential retrieval to the new operation RPCs is shown."
+    },
+    {
+      "requirement": "28. `SPEC-tiered-broker.md`'s \"the key never reaches the agent\" is true for tier 1 after this change, or the sentence is corrected.",
+      "status": "partial",
+      "evidence": "The broker-side paths shown retain the vault key in `BrokerOps`, but neither the MCP-process imports nor the documentation change are included, so the repository-wide claim cannot be verified."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "The absolute socket deadline is 180 seconds, directly violating the required 120-second deadline and acceptance check 25.",
+      "failure_scenario": "An authenticated request begins an operation that remains pending for 150 seconds; at 121 seconds its connection is still open and consuming broker resources, whereas the specification requires it to have been closed.",
+      "suggested_direction": "Restore a 120-second absolute connection budget and make the tier-2 wait, second check, and upstream timeout share that budget rather than extending the externally specified deadline."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/server.ts",
+      "line": 143,
+      "claim": "If `src/server.ts` remains as described by the spec\u2014which this broker-side package does not show changing\u2014the MCP process still sends the old `{token}` request and cannot use the new operation protocol.",
+      "failure_scenario": "Start one of the existing seven MCP agents against the rebuilt broker: it sends its valid token without `op`, receives `UPGRADE_REQUIRED` instead of `api_key` and `enc_key`, and initialization or every vault-backed tool fails rather than completing the required end-to-end flow.",
+      "suggested_direction": "Migrate every MCP call site to the operation RPCs, remove agent-side credential loading and decryption imports, and demonstrate the complete repair-through-tool-use flow in the rehearsal container."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "The framing loop concatenates every previously received chunk after every `data` event, making pre-authentication request processing quadratic in the number of chunks.",
+      "failure_scenario": "An unauthenticated local process writes a sub-1-MiB line in thousands of small paced chunks without a newline; the broker repeatedly copies all accumulated bytes, consuming disproportionate CPU before either byte cap or deadline applies and delaying a valid agent during the flood.",
+      "suggested_direction": "Search only newly received bytes for the delimiter while retaining bounded chunks, and concatenate and decode the request once after the newline is found."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "There is no per-agent or global ceiling on concurrently open SSH-agent sessions.",
+      "why_it_matters": "A token holder can repeatedly call `ssh_agent_open` and leave every session alive for up to 900 seconds, accumulating listeners, timers, directories, file descriptors, and loaded key objects until the broker or host hits resource limits."
+    },
+    {
+      "id": "B2",
+      "concern": "The package provides no coordinated rollout or compatibility plan for upgrading MCP clients before the broker.",
+      "why_it_matters": "The old protocol is intentionally rejected rather than deprecated, so installing the broker first causes an immediate outage for every still-old agent; an operational deployment must update or stage all clients before switching the broker."
+    },
+    {
+      "id": "B3",
+      "concern": "The excerpt shows a request-size cap but no corresponding broker-socket response-size or serialization bound.",
+      "why_it_matters": "If the reused HTTP path or vault API does not impose a bound in unshown code, a very large upstream body, settings object, or entry list can consume broker memory during `JSON.stringify` and socket buffering even though incoming requests are capped."
+    }
+  ],
+  "_meta": {
+    "round": 20,
+    "at": "2026-09-17T17:02:16+00:00",
+    "package_bytes": 95574,
+    "schema_problems": []
+  }
+}

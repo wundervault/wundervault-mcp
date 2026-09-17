@@ -223,6 +223,48 @@ echo "state dir ${STATE_DIR}: 0700 ${ACCOUNT}"
 # otherwise. Either way the blob does not open on another machine, and the broker never needs
 # TPM access itself: systemd unseals it as root at start and hands it over through a private
 # tmpfs (LoadCredentialEncrypted= in the unit).
+# ── the broker's own identity ────────────────────────────────────────────────
+#
+# A P-256 keypair, generated HERE and never leaving this machine. Its public half is what
+# an owner pairs with their account; after that, a repair seals the agent's credential to
+# it and the thing the owner carries to this terminal is a claim code, which opens nothing.
+#
+# Without this, the credential has to travel as a setup link — a bearer credential that
+# yields the agent's vault key to whoever reads it inside fifteen minutes. On a machine
+# where the agents run as the owner, there is no channel for that which an agent cannot
+# read.
+#
+# Generated with openssl rather than by the broker at first start, so that the key exists
+# before anything can ask for it and so the mode is set by root while root is still here.
+BROKER_KEY="${STATE_DIR}/broker-key.pem"
+if [ -f "$BROKER_KEY" ]; then
+  echo "broker key: already present at ${BROKER_KEY}"
+elif command -v openssl >/dev/null 2>&1; then
+  # umask before the write, not chmod after: openssl creates the file itself, and a
+  # chmod that lands a moment later is a moment in which the key was world-readable.
+  ( umask 077 && openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+      -out "$BROKER_KEY" 2>/dev/null )
+  if [ -s "$BROKER_KEY" ]; then
+    chown "${ACCOUNT}:$(id -gn "$ACCOUNT")" "$BROKER_KEY"
+    chmod 0600 "$BROKER_KEY"
+    BK_MODE=$(stat -c '%a' "$BROKER_KEY" 2>/dev/null || stat -f '%Lp' "$BROKER_KEY")
+    [ "$BK_MODE" = "600" ] || { echo "ERROR: ${BROKER_KEY} is mode ${BK_MODE}, expected 600." >&2; exit 1; }
+    echo "broker key: created, 0600 ${ACCOUNT}"
+  else
+    rm -f "$BROKER_KEY"
+    echo "WARNING: could not generate the broker key with openssl." >&2
+    echo "         The broker will create one at first --pair instead." >&2
+  fi
+else
+  echo "NOTE: openssl not found; the broker will create its key at first --pair." >&2
+fi
+
+echo ""
+echo "  Next, ONCE per machine:  sudo wundervault-agent --pair"
+echo "  That prints a code and a fingerprint. Type the code into the dashboard and check"
+echo "  the fingerprint matches before you confirm. Neither value is a secret."
+echo ""
+
 SEALED_KEY="${STATE_DIR}/store.key.cred"
 if [ -f "$SEALED_KEY" ]; then
   echo "store key: already sealed at ${SEALED_KEY}"

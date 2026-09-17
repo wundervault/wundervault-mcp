@@ -273,15 +273,45 @@ export interface AgentHandle {
  * merely deleted but its parent goes too — a stray socket outliving its command is the
  * thing that turns a bounded capability into an ambient one.
  */
-export function startAgent(identity: LoadedIdentity, onSign?: (e: SignEvent) => void, host = ''): AgentHandle {
+/**
+ * Where the socket goes, and who may reach it.
+ *
+ * The default — a 0700 directory under the process's own tmpdir — is right when the
+ * agent protocol is served by the same process that will run `ssh`. It is WRONG when the
+ * broker serves it for somebody else: the unit sets `PrivateTmp=yes`, so the broker's
+ * /tmp exists only inside its own mount namespace and the agent would never find the
+ * socket; and even if it could see the path, a 0700 directory owned by `wundervault`
+ * excludes the very uid that has to connect.
+ *
+ * So the broker passes its own directory under /run and opens the modes. The secrecy
+ * moves from the file mode to the unguessable path plus the session's short life — the
+ * same trade every other broker socket makes, for the same reason, and it is recorded as
+ * a limit rather than described as a control.
+ */
+export interface AgentSocketOptions {
+  /** Pre-made directory to host the socket. Caller owns its mode and its removal. */
+  dir?: string;
+  socketMode?: number;
+  publicKeyMode?: number;
+}
+
+export function startAgent(
+  identity: LoadedIdentity,
+  onSign?: (e: SignEvent) => void,
+  host = '',
+  opts: AgentSocketOptions = {},
+): AgentHandle {
   if (process.platform === 'win32') {
     throw new Error('The ssh-agent broker needs unix domain sockets and POSIX permissions; run on Linux or macOS.');
   }
 
-  const dir = mkdtempSync(path.join(os.tmpdir(), 'wv-agent-'));
+  const providedDir = typeof opts.dir === 'string' && opts.dir.length > 0;
+  const dir = providedDir ? opts.dir! : mkdtempSync(path.join(os.tmpdir(), 'wv-agent-'));
   // mkdtemp is already 0700, but state it rather than inherit it by luck — and a umask
-  // cannot widen it back.
-  chmodSync(dir, 0o700);
+  // cannot widen it back. A caller-supplied directory keeps the mode its caller chose.
+  if (!providedDir) chmodSync(dir, 0o700);
+  const socketMode = opts.socketMode ?? 0o600;
+  const publicKeyMode = opts.publicKeyMode ?? 0o600;
   const socketPath = path.join(dir, 'agent.sock');
 
   // The PUBLIC half, written to the same 0700 directory. This is not a secret, and ssh
@@ -294,8 +324,13 @@ export function startAgent(identity: LoadedIdentity, onSign?: (e: SignEvent) => 
   writeFileSync(
     publicKeyPath,
     `ssh-ed25519 ${identity.keyBlob.toString('base64')} ${identity.comment || 'wundervault'}\n`,
-    { mode: 0o600 },
+    { mode: publicKeyMode },
   );
+  // writeFileSync's mode applies only when it CREATES the file, and is masked by umask
+  // either way. The public half is not a secret, but ssh must be able to read it, and a
+  // 0644 asked for under umask 0077 arrives as 0600 — which fails silently as "ssh did
+  // not offer the key" rather than as a permission error.
+  try { chmodSync(publicKeyPath, publicKeyMode); } catch { /* best effort */ }
 
   let signs = 0;
   const sockets = new Set<Socket>();
@@ -343,7 +378,7 @@ export function startAgent(identity: LoadedIdentity, onSign?: (e: SignEvent) => 
     // this — connecting needs traverse on the dir AND write on the socket — but the
     // socket lands 0775 under a default umask, so a single wrong directory mode would
     // otherwise leave it open to everyone. Tighten the socket itself too.
-    try { chmodSync(socketPath, 0o600); } catch { /* the directory is still the guard */ }
+    try { chmodSync(socketPath, socketMode); } catch { /* the directory is still the guard */ }
   });
 
   let closed = false;
@@ -358,7 +393,9 @@ export function startAgent(identity: LoadedIdentity, onSign?: (e: SignEvent) => 
       sockets.clear();
       try { server.close(); } catch { /* ignore */ }
       // rm -rf the directory: removing only the socket would leave the 0700 dir behind
-      // every single run.
+      // every single run. A caller-supplied directory is removed too — the broker makes
+      // one per session for exactly this reason, so leaving it would accumulate a
+      // directory per ssh call under /run.
       try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
       process.removeListener('exit', onExit);
     },
@@ -441,28 +478,49 @@ export type BrokeredOp =
   | { kind: 'ssh'; destination: string; remoteArgv: string[] }
   | { kind: 'rsync'; destination: string; rsyncArgs: string[] };
 
-export async function runSshBrokered(opts: {
-  identity: LoadedIdentity;
-  op: BrokeredOp;
-  allowedHosts: string[];
-  cwd?: string;
-  timeoutMs?: number;
-  onSign?: (e: SignEvent) => void;
-}): Promise<SshBrokerResult> {
-  const { identity, op, allowedHosts, cwd, timeoutMs = 120_000, onSign } = opts;
-
+/**
+ * Is this destination one the entry authorises, and what host should the audit name?
+ *
+ * Split out of `runSshBrokered` so the BROKER can make this decision. It used to run in
+ * the MCP server — the agent's own process — which meant the allowlist was advice the
+ * caller gave itself. The broker now refuses to open a signing session for a host the
+ * entry does not list, so the check happens where the key is.
+ */
+export function checkSshDestination(
+  op: BrokeredOp,
+  allowedHosts: string[],
+): { ok: true; auditedHost: string } | { ok: false; error: string } {
   // Fail closed. An entry that names no hosts authorises nothing — treating "unset" as
   // "anywhere" is how an allowlist becomes decoration.
   if (!allowedHosts || allowedHosts.length === 0) {
-    return { exitCode: 1, stdout: '', stderr:
+    return { ok: false, error:
       'Refused: this entry lists no permitted SSH hosts, so it authorises nothing. '
-      + "Add ssh_hosts to the entry's exec_config in the dashboard.", signCount: 0 };
+      + "Add ssh_hosts to the entry's exec_config in the dashboard." };
   }
 
-  const deny = (msg: string): SshBrokerResult => ({ exitCode: 1, stdout: '', stderr: msg, signCount: 0 });
   const host = hostOf(op.destination);
   if (!allowedHosts.includes(host)) {
-    return deny(`Refused: "${host}" is not in this entry's permitted hosts (${allowedHosts.join(', ')}).`);
+    return { ok: false, error:
+      `Refused: "${host}" is not in this entry's permitted hosts (${allowedHosts.join(', ')}).` };
+  }
+
+  if (op.kind === 'ssh') {
+    if (!Array.isArray(op.remoteArgv) || op.remoteArgv.length === 0) {
+      return { ok: false, error: 'Refused: remoteArgv must be a non-empty array.' };
+    }
+  } else {
+    if (!Array.isArray(op.rsyncArgs) || op.rsyncArgs.length === 0) {
+      return { ok: false, error: 'Refused: rsyncArgs must be a non-empty array.' };
+    }
+    // rsync carries its destination inside its path arguments, so every remote-looking
+    // argument is checked against the same allowlist rather than trusting one field.
+    for (const a of op.rsyncArgs) {
+      const h = rsyncRemoteHost(a);
+      if (h !== null && !allowedHosts.includes(h)) {
+        return { ok: false, error:
+          `Refused: rsync argument targets "${h}", which is not in this entry's permitted hosts (${allowedHosts.join(', ')}).` };
+      }
+    }
   }
 
   // rsync carries its destination in its path arguments, so with two allowlisted hosts
@@ -474,84 +532,121 @@ export async function runSshBrokered(opts: {
     const targets = [...new Set(op.rsyncArgs.map(rsyncRemoteHost).filter((h): h is string => h !== null))];
     if (targets.length > 0) auditedHost = targets.join(',');
   }
+  return { ok: true, auditedHost };
+}
 
-  const agent = startAgent(identity, onSign, auditedHost);
-  let argv: string[];
-  try {
-    if (op.kind === 'ssh') {
-      if (!Array.isArray(op.remoteArgv) || op.remoteArgv.length === 0) {
-        agent.close();
-        return deny('Refused: remoteArgv must be a non-empty array.');
-      }
-      // The destination is OURS, not the caller's. Previously the caller passed a whole
-      // argv and the validated host was merely advisory: argv ["ssh","evil.example"]
-      // sailed through a check for "good.example" and the key signed for evil.example.
-      // Building the command here makes the check the thing that decides.
-      // One quoted string, not N arguments: see quoteForRemoteShell.
-      argv = [
-        'ssh', ...hardenedSshOptions(agent.socketPath, agent.publicKeyPath), op.destination, '--',
-        op.remoteArgv.map(quoteForRemoteShell).join(' '),
-      ];
-    } else {
-      if (!Array.isArray(op.rsyncArgs) || op.rsyncArgs.length === 0) {
-        agent.close();
-        return deny('Refused: rsyncArgs must be a non-empty array.');
-      }
-      // rsync carries its destination inside its path arguments, so every remote-looking
-      // argument is checked against the same allowlist rather than trusting one field.
-      for (const a of op.rsyncArgs) {
-        const h = rsyncRemoteHost(a);
-        if (h !== null && !allowedHosts.includes(h)) {
-          agent.close();
-          return deny(`Refused: rsync argument targets "${h}", which is not in this entry's permitted hosts (${allowedHosts.join(', ')}).`);
-        }
-      }
-      const sshCmd = ['ssh', ...hardenedSshOptions(agent.socketPath, agent.publicKeyPath)]
-        .map((t) => (/[\s"']/.test(t) ? JSON.stringify(t) : t)).join(' ');
-      argv = ['rsync', '-e', sshCmd, ...op.rsyncArgs];
-    }
+/**
+ * The argv for a brokered operation, given a signing socket somebody else is hosting.
+ *
+ * The destination is OURS, not the caller's. Previously the caller passed a whole argv
+ * and the validated host was merely advisory: argv ["ssh","evil.example"] sailed through
+ * a check for "good.example" and the key signed for evil.example. Building the command
+ * here makes the check the thing that decides.
+ */
+export function buildSshArgv(op: BrokeredOp, socketPath: string, publicKeyPath: string): string[] {
+  if (op.kind === 'ssh') {
+    // One quoted string, not N arguments: see quoteForRemoteShell.
+    return [
+      'ssh', ...hardenedSshOptions(socketPath, publicKeyPath), op.destination, '--',
+      (op.remoteArgv as string[]).map(quoteForRemoteShell).join(' '),
+    ];
+  }
+  const sshCmd = ['ssh', ...hardenedSshOptions(socketPath, publicKeyPath)]
+    .map((t) => (/[\s"']/.test(t) ? JSON.stringify(t) : t)).join(' ');
+  return ['rsync', '-e', sshCmd, ...(op.rsyncArgs as string[])];
+}
 
-    // spawn, NOT spawnSync. The agent's listener lives on this process's event loop, so
-    // a synchronous spawn would block the very loop that has to answer the child's
-    // signature request — the command would hang until its timeout, every time.
-    return await new Promise<SshBrokerResult>((resolve) => {
-      const child = spawn(argv[0], argv.slice(1), {
-        shell: false,
-        cwd,
-        env: { ...process.env, SSH_AUTH_SOCK: agent.socketPath },
-      });
+/**
+ * Run the command against a signing socket this process does NOT own.
+ *
+ * This is the half that stays in the agent's process after key custody moved. The broker
+ * holds the private key and answers signatures; the command is the agent's own, run on
+ * the agent's own machine, as the agent's own uid. The broker must never run it — a
+ * broker that executes a caller-supplied command hands that caller code execution as the
+ * uid that owns every credential on the box.
+ */
+export async function runSshWithAgent(opts: {
+  op: BrokeredOp;
+  socketPath: string;
+  publicKeyPath: string;
+  cwd?: string;
+  timeoutMs?: number;
+}): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const { op, socketPath, publicKeyPath, cwd, timeoutMs = 120_000 } = opts;
+  const argv = buildSshArgv(op, socketPath, publicKeyPath);
 
-      // Bounded. A chatty or hostile remote could otherwise grow these strings for the
-      // whole timeout window; truncation is visible rather than silent.
-      const MAX_OUTPUT = 4 * 1024 * 1024;
-      let stdout = '';
-      let stderr = '';
-      let truncated = false;
-      const append = (cur: string, add: string): string => {
-        if (cur.length >= MAX_OUTPUT) { truncated = true; return cur; }
-        const room = MAX_OUTPUT - cur.length;
-        if (add.length > room) { truncated = true; return cur + add.slice(0, room); }
-        return cur + add;
-      };
-      let settled = false;
-      const finish = (exitCode: number, extra = '') => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        const note = truncated ? `\n[output truncated at ${MAX_OUTPUT} bytes]` : '';
-        resolve({ exitCode, stdout, stderr: stderr + extra + note, signCount: agent.signCount() });
-      };
-
-      const timer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
-        finish(124, `\nCommand timed out after ${Math.round(timeoutMs / 1000)}s.`);
-      }, timeoutMs);
-
-      child.stdout?.on('data', (d) => { stdout = append(stdout, d.toString()); });
-      child.stderr?.on('data', (d) => { stderr = append(stderr, d.toString()); });
-      child.on('error', (e) => finish(1, `\nFailed to run ${argv[0]}: ${e.message}`));
-      child.on('close', (code) => finish(code ?? 1));
+  // spawn, NOT spawnSync. When this process hosts the agent listener, a synchronous
+  // spawn blocks the very loop that has to answer the child's signature request. It is
+  // kept asynchronous now that the broker hosts it too, because the child still has to
+  // be able to talk while we wait.
+  return await new Promise((resolve) => {
+    const child = spawn(argv[0], argv.slice(1), {
+      shell: false,
+      cwd,
+      env: { ...process.env, SSH_AUTH_SOCK: socketPath },
     });
+
+    // Bounded. A chatty or hostile remote could otherwise grow these strings for the
+    // whole timeout window; truncation is visible rather than silent.
+    const MAX_OUTPUT = 4 * 1024 * 1024;
+    let stdout = '';
+    let stderr = '';
+    let truncated = false;
+    const append = (cur: string, add: string): string => {
+      if (cur.length >= MAX_OUTPUT) { truncated = true; return cur; }
+      const room = MAX_OUTPUT - cur.length;
+      if (add.length > room) { truncated = true; return cur + add.slice(0, room); }
+      return cur + add;
+    };
+    let settled = false;
+    const finish = (exitCode: number, extra = '') => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const note = truncated ? `\n[output truncated at ${MAX_OUTPUT} bytes]` : '';
+      resolve({ exitCode, stdout, stderr: stderr + extra + note });
+    };
+
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      finish(124, `\nCommand timed out after ${Math.round(timeoutMs / 1000)}s.`);
+    }, timeoutMs);
+
+    child.stdout?.on('data', (d) => { stdout = append(stdout, d.toString()); });
+    child.stderr?.on('data', (d) => { stderr = append(stderr, d.toString()); });
+    child.on('error', (e) => finish(1, `\nFailed to run ${argv[0]}: ${e.message}`));
+    child.on('close', (code) => finish(code ?? 1));
+  });
+}
+
+/**
+ * Check, start an agent, run, close — the single-process path.
+ *
+ * Kept because it is the whole operation in one call for the pre-split layout, for
+ * macOS and Windows, and for the tests that exercise the allowlist and the argv
+ * construction end to end. After key custody it is composed from the three pieces above
+ * rather than duplicating them, so a change to the allowlist cannot apply to one path
+ * and not the other.
+ */
+export async function runSshBrokered(opts: {
+  identity: LoadedIdentity;
+  op: BrokeredOp;
+  allowedHosts: string[];
+  cwd?: string;
+  timeoutMs?: number;
+  onSign?: (e: SignEvent) => void;
+}): Promise<SshBrokerResult> {
+  const { identity, op, allowedHosts, cwd, timeoutMs = 120_000, onSign } = opts;
+
+  const check = checkSshDestination(op, allowedHosts);
+  if (!check.ok) return { exitCode: 1, stdout: '', stderr: check.error, signCount: 0 };
+
+  const agent = startAgent(identity, onSign, check.auditedHost);
+  try {
+    const r = await runSshWithAgent({
+      op, socketPath: agent.socketPath, publicKeyPath: agent.publicKeyPath, cwd, timeoutMs,
+    });
+    return { ...r, signCount: agent.signCount() };
   } finally {
     // Always — including on throw and on timeout. A socket outliving its command is an
     // ambient signing capability.

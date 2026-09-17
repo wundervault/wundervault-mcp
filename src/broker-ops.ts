@@ -1,0 +1,443 @@
+/**
+ * What the broker does on an agent's behalf, now that it does not hand over the key.
+ *
+ * Phase 4 moved the credentials into an account the agent cannot read. It did not stop
+ * the broker giving them back: the per-agent socket answered a valid token with
+ * `{api_key, enc_key, vault_url}`, and the MCP server — which runs as the AGENT's uid —
+ * used `enc_key` to unwrap `vault_key_for_agent` and decrypt the whole vault in its own
+ * memory. The boundary held for the disk and for the broker's memory, and the front door
+ * handed out the key.
+ *
+ * So the socket stops serving credentials and starts serving OPERATIONS. Everything in
+ * this file runs inside the broker's uid. `vault_key` is derived here, used here, and
+ * never crosses the socket.
+ *
+ * THE RULE THAT SHAPES EVERY OPERATION BELOW
+ *
+ * The broker never runs a command the agent chose. `ProtectHome=yes` already means it
+ * could not reach the agent's files, but the real reason is worse than inconvenience: a
+ * broker that executes an agent-supplied command hands that agent code execution as the
+ * uid that owns /var/lib/wundervault, which is every credential on the machine. So the
+ * operations here are exactly three shapes, and no more:
+ *
+ *   - hand back a plaintext, ONLY for an entry whose mode says that is what it is for;
+ *   - perform a typed HTTP request and return the scrubbed response;
+ *   - answer ssh-agent signature requests on a socket, holding the private key.
+ *
+ * `vault_exec`, `vault_rsync` and `vault_ssh_exec` keep running in the agent's process.
+ * They are the agent's own commands on the agent's own machine; what changed is where
+ * their key material comes from and what the broker will agree to release.
+ *
+ * ONE getSecret PER OPERATION, DELIBERATELY
+ *
+ * Each operation makes exactly one `getSecret` call, the same one the agent used to make.
+ * That keeps the server's access log and the tier-2 gate seeing precisely what they saw
+ * before. A separate "just the metadata" probe would have been convenient here and would
+ * have added an access-log row per call and a second chance to trip tier 2.
+ */
+import { createHash, randomBytes } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { AgentVaultAPI } from './api-client.js';
+import { decryptSecretContent, verifyDirectiveSignature, loadEncryptionKey } from './crypto.js';
+import {
+  modeAllowsLegacyExec, modeAllowsSshBroker, modeAllowsHttpBroker, wrongModeMessage,
+  loadOpenSshEd25519, startAgent, checkSshDestination, type AgentHandle, type BrokeredOp,
+} from './ssh-agent.js';
+import {
+  performOperation, definitionFromAgentRequest, originString, isApprovedPrivateOrigin,
+  type AgentRequest,
+} from './http-broker.js';
+import { verifyOperationDefinition, validateArguments } from './opdef.js';
+import { recordDestination, newDestinationNotice, emitToStderr } from './network-store.js';
+import { runtimeDir } from './paths.js';
+import type { ExecConfig, VaultEntry } from './types.js';
+import { DIRECTIVE } from './directive.js';
+
+export interface OpError { error: string; code?: string }
+
+function err(message: string, code?: string): OpError {
+  return code ? { error: message, code } : { error: message };
+}
+
+/** Parse exec_config, which the backend sends as a JSON string on some paths. */
+function coerceCfg(raw: unknown): Record<string, unknown> {
+  try {
+    const v = typeof raw === 'string' ? JSON.parse(raw) : (raw ?? {});
+    return (v && typeof v === 'object') ? v as Record<string, unknown> : {};
+  } catch { return {}; }
+}
+
+/**
+ * One agent's operations. Holds the credentials; never returns them.
+ *
+ * `api` is built once per profile and kept, because `AgentVaultAPI` caches the unwrapped
+ * vault key after the first `ensureVaultKey()`. That cache lives in the broker's memory,
+ * which is the whole point of the phase — but it also means a repair (which retires the
+ * vault key) must invalidate it, so `reset()` exists and `registerProfile` calls it.
+ */
+export class BrokerOps {
+  private api: AgentVaultAPI;
+  private ssh = new Map<string, { handle: AgentHandle; timer: NodeJS.Timeout; entryId: string }>();
+
+  constructor(
+    public readonly agentName: string,
+    apiKey: string,
+    encKeyB64: string,
+    vaultUrl: string,
+  ) {
+    this.api = new AgentVaultAPI(apiKey, loadEncryptionKey(encKeyB64), vaultUrl);
+  }
+
+  /**
+   * How many signing sessions one agent may hold at once.
+   *
+   * Each open session is a listener, a timer, a directory under /run and a private key
+   * held in memory, and the caller chooses when to close them. Without a ceiling an
+   * authenticated agent can call `ssh_agent_open` in a loop and leave every session alive
+   * for its full lifetime. Small, because a legitimate caller runs one command at a time.
+   */
+  private static readonly MAX_SSH_SESSIONS = 4;
+
+  /** Close every ssh session this agent holds. Called on re-enrolment and on shutdown. */
+  reset(): void {
+    for (const id of [...this.ssh.keys()]) this.closeSsh(id);
+  }
+
+  // ── list_entries ───────────────────────────────────────────────────────────
+  async listEntries(): Promise<{ entries: VaultEntry[] } | OpError> {
+    const data = await this.api.listSecrets();
+    return { entries: data.entries ?? [] };
+  }
+
+  // ── profile_flags ──────────────────────────────────────────────────────────
+  /**
+   * Account-level flags the agent needs before it does local work.
+   *
+   * Separate from get_entry because `vault_entry_inject_env` has to know the account
+   * forbids it BEFORE a secret is fetched and burned — refusing after the fetch would
+   * spend a use of the secret to deliver a refusal.
+   */
+  async profileFlags(): Promise<{ allow_env_inject: boolean }> {
+    const p = await this.api.getProfile();
+    return { allow_env_inject: p.allow_env_inject ?? false };
+  }
+
+  // ── get_entry ──────────────────────────────────────────────────────────────
+  /**
+   * The one operation that returns a plaintext, and the one the mode gate exists for.
+   *
+   * The mode check happens HERE. It used to happen in the MCP server, which is the
+   * agent's own process — `types.ts` said "enforced client-side" and meant it. An agent
+   * that did not want to be gated simply did not run the check, or never used the MCP
+   * server at all and read the credentials off the socket directly.
+   */
+  async getEntry(entryId: string, purpose: string, includePlaintext = true): Promise<{
+    plaintext?: string; name: string; integrity: 'valid' | 'invalid' | 'unsigned';
+    exec_config: ExecConfig | undefined; entry_mode: string; access_tier: string;
+  } | OpError> {
+    const s = await this.api.getSecret(entryId, purpose.slice(0, 200));
+    if (!modeAllowsLegacyExec(s.entry_mode)) {
+      return err(wrongModeMessage(s.entry_mode, 'exec'), 'WRONG_MODE');
+    }
+    const vaultKey = await this.api.ensureVaultKey();
+    const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
+    try {
+      const directive = s.directive || DIRECTIVE;
+      let integrity: 'valid' | 'invalid' | 'unsigned' = 'unsigned';
+      if (s.directive_signature) {
+        integrity = verifyDirectiveSignature(directive, s.directive_signature, bytes)
+          ? 'valid' : 'invalid';
+      }
+      // An invalid signature is reported, not thrown, and the plaintext is NOT included.
+      // The caller aborts on it; sending the secret alongside a warning would make the
+      // warning advisory.
+      if (integrity === 'invalid') {
+        return err(
+          `Security warning: directive signature is invalid for '${s.name ?? entryId}'. Aborting.`,
+          'BAD_SIGNATURE',
+        );
+      }
+      return {
+        // Omitted when the caller says it does not need one. `vault_entry_get` verifies a
+        // signature and reports a verdict; it never shows the secret. Sending a plaintext
+        // that is going to be thrown away puts it on a socket for no reason.
+        ...(includePlaintext ? { plaintext: new TextDecoder().decode(bytes) } : {}),
+        name: s.name ?? entryId,
+        integrity,
+        exec_config: (typeof s.exec_config === 'string'
+          ? JSON.parse(s.exec_config) : s.exec_config) as ExecConfig | undefined,
+        entry_mode: (s.entry_mode || 'LEGACY_EXEC'),
+        access_tier: String(s.access_tier ?? '1'),
+      };
+    } finally {
+      bytes.fill(0);
+    }
+  }
+
+  // ── call ───────────────────────────────────────────────────────────────────
+  /**
+   * Perform a typed HTTP request with the credential, and return the response.
+   *
+   * Moved here whole from the MCP server. `SPEC-tiered-broker.md` said of tier 1 that
+   * "the key never reaches the agent" — which was written about this code and was not
+   * true of it, because `performOperation` was imported into the agent's own process.
+   * It is true now.
+   */
+  async call(args: {
+    entryId: string; purpose: string; operationId?: string;
+    callArgs?: Record<string, unknown>; request?: AgentRequest;
+  }): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
+    const { entryId, purpose } = args;
+    const operationId = args.operationId || '';
+    const callArgs = args.callArgs ?? {};
+    const agentReq = args.request;
+
+    const s = await this.api.getSecret(entryId, purpose.slice(0, 200));
+    if (!modeAllowsHttpBroker(s.entry_mode)) {
+      return err(wrongModeMessage(s.entry_mode, 'http'), 'WRONG_MODE');
+    }
+
+    const vaultKey = await this.api.ensureVaultKey();
+    const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
+    try {
+      const secret = new TextDecoder().decode(bytes);
+
+      // The credential binding always comes from the ENTRY. An agent may choose where a
+      // request goes; it never chooses how the secret is framed on the way out.
+      let binding: { in: 'header' | 'query'; name: string; template: string } = {
+        in: 'header', name: 'authorization', template: 'Bearer {secret}',
+      };
+      const cfg = coerceCfg(s.exec_config) as { credential_binding?: typeof binding };
+      if (cfg?.credential_binding?.name && cfg.credential_binding.template?.includes('{secret}')) {
+        binding = cfg.credential_binding;
+      }
+
+      let def;
+      let label: string;
+      if (operationId) {
+        let catalogue: Record<string, { definition: unknown; signature?: string }> = {};
+        try {
+          const raw = s.operations as unknown;
+          catalogue = (typeof raw === 'string' ? JSON.parse(raw) : (raw ?? {})) as typeof catalogue;
+        } catch { return err("This entry's operation catalogue is not readable."); }
+        const slot = catalogue?.[operationId];
+        if (!slot) {
+          const known = Object.keys(catalogue || {});
+          return err(`Entry has no operation "${operationId}".`
+            + (known.length ? ` Available: ${known.join(', ')}.` : ' It defines none.'));
+        }
+        const verified = verifyOperationDefinition(entryId, slot.definition, slot.signature, bytes, operationId);
+        if (!verified.ok || !verified.definition) return err(`Refused: ${verified.reason}`);
+        const argCheck = validateArguments(verified.definition, callArgs);
+        if (!argCheck.ok) return err(`Refused: ${argCheck.reason}`);
+        def = verified.definition;
+        label = operationId;
+      } else {
+        const r = agentReq!;
+        if (!r?.origin?.host || !r.origin.scheme || !r.origin.port) {
+          return err('request.origin needs scheme, host and port.');
+        }
+        def = definitionFromAgentRequest(r, binding);
+        label = `${def.route.method} ${originString(r.origin)}${r.path || '/'}`;
+      }
+
+      const bodyHash = agentReq?.body !== undefined
+        ? createHash('sha256').update(JSON.stringify(agentReq.body)).digest('hex')
+        : undefined;
+
+      // Recorded here, in the broker, which is the first time this has actually worked.
+      // The call site used to be in the MCP server — the agent's uid — writing to
+      // /var/lib/wundervault/network.json, a directory that uid cannot open. D3 of the
+      // uid-split spec calls this store an integrity control because the audited party
+      // no longer owns the evidence; until now the audited party was still the writer.
+      const originStr = originString(def.origin);
+      const { isNew } = recordDestination(entryId, originStr, undefined, purpose);
+
+      const isTier2 = String(s.access_tier ?? '1') === '2';
+      const destination = isTier2
+        ? { origin: originStr, method: def.route.method, path: def.route.path, body_sha256: bodyHash }
+        : {};
+
+      const verdict = await this.api.checkOperation({
+        entry_id: entryId, purpose: purpose.slice(0, 200), first_sighting: isNew, ...destination,
+      });
+
+      if (!verdict.allowed) {
+        const approved = verdict.request_id
+          ? await this.api.waitForTier2Approval(verdict.request_id)
+          : false;
+        if (!approved) {
+          return err(`${verdict.message ?? 'This call needs owner approval.'}\n\n`
+            + `Nothing was sent. The owner sees exactly: ${def.route.method} `
+            + `${originString(def.origin)}${def.route.path}`);
+        }
+        const second = await this.api.checkOperation({
+          entry_id: entryId, purpose: purpose.slice(0, 200), origin: originStr,
+          method: def.route.method, path: def.route.path, body_sha256: bodyHash,
+        });
+        if (!second.allowed) {
+          return err(`${second.message ?? 'This call needs owner approval.'}\n\n`
+            + `Nothing was sent. The owner sees exactly: ${def.route.method} `
+            + `${originString(def.origin)}${def.route.path}`);
+        }
+        verdict.tier = second.tier;
+      }
+
+      let approvedOrigins: string[] = [];
+      try {
+        const raw = s.allowed_private_origins as unknown;
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (Array.isArray(parsed)) approvedOrigins = parsed.filter((x): x is string => typeof x === 'string');
+      } catch { approvedOrigins = []; }
+
+      let noticeForAgent = '';
+      if (isNew) {
+        const notice = newDestinationNotice(
+          s.name ?? entryId, originStr, def.route.method, def.route.path, verdict.tier,
+          !operationId, verdict.emailed === true,
+        );
+        emitToStderr(notice);
+        noticeForAgent = notice.toolNote;
+      }
+
+      const result = await performOperation(
+        def, operationId ? callArgs : ((agentReq?.body ?? {}) as Record<string, unknown>),
+        secret, approvedOrigins,
+      );
+      if (!result.ok && /internal or reserved address/.test(result.error ?? '')
+          && !isApprovedPrivateOrigin(def.origin, approvedOrigins)) {
+        return err(`${result.error}\n\nIf you host that service yourself, the owner can approve `
+          + `exactly ${originString(def.origin)} for this entry in the dashboard. `
+          + `Approval is per entry and per exact host and port — it does not open a range, `
+          + `and cloud metadata endpoints cannot be approved at all.`);
+      }
+      if (!result.ok) {
+        return err(`${label} failed${result.status ? ` (HTTP ${result.status})` : ''}: ${result.error ?? 'unknown error'}`);
+      }
+      return {
+        status: result.status ?? 0, body: result.body, tier: verdict.tier, label,
+        ...(noticeForAgent ? { notice: noticeForAgent } : {}),
+      };
+    } finally {
+      bytes.fill(0);
+    }
+  }
+
+  // ── ssh_agent_open / ssh_agent_close ───────────────────────────────────────
+  /**
+   * Hold the private key and answer signature requests on a socket.
+   *
+   * This is the shape that lets a brokered key be USED without being handed over, and it
+   * is the only reason `vault_ssh_exec` can keep running in the agent's process: ssh
+   * itself never sees a private key, it asks an agent to sign.
+   *
+   * THE SOCKET CANNOT LIVE IN /tmp. `startAgent`'s default is `mkdtempSync(os.tmpdir())`,
+   * and the unit sets `PrivateTmp=yes`, so that directory exists only inside the broker's
+   * mount namespace — the agent would not find the socket at all. It goes under the
+   * RuntimeDirectory instead, in a per-session directory with a random name.
+   *
+   * WHAT THIS DOES NOT FIX. The socket has to be connectable by the agent's uid, and all
+   * seven agents share that uid, so any agent that learns the path can ask for a
+   * signature while the session is open. The random path and the short life bound that;
+   * they do not close it. It is still strictly better than the status quo, where the
+   * agent holds the private key itself and can sign with it for ever.
+   */
+  async sshAgentOpen(args: {
+    entryId: string; purpose: string; op: BrokeredOp; ttlSeconds?: number;
+  }): Promise<{
+    session_id: string; socket_path: string; public_key_path: string; fingerprint: string;
+    audited_host: string;
+  } | OpError> {
+    const { entryId, purpose, op } = args;
+    const ttlSeconds = args.ttlSeconds ?? 300;
+
+    // Checked BEFORE the entry is fetched, so hitting the ceiling does not spend an
+    // access-log row or a tier-2 gate on a request that was never going to open.
+    if (this.ssh.size >= BrokerOps.MAX_SSH_SESSIONS) {
+      return err(
+        `This agent already has ${this.ssh.size} signing sessions open, which is the limit. `
+        + `Close one with ssh_agent_close, or wait for it to expire.`,
+        'TOO_MANY_SESSIONS',
+      );
+    }
+
+    const s = await this.api.getSecret(entryId, purpose.slice(0, 200));
+    if (!modeAllowsSshBroker(s.entry_mode)) {
+      return err(wrongModeMessage(s.entry_mode, 'ssh'), 'WRONG_MODE');
+    }
+
+    // THE ALLOWLIST IS CHECKED HERE, BEFORE A SESSION EXISTS.
+    //
+    // It used to be checked in the MCP server, which is the agent's own process — so the
+    // entry's list of permitted hosts was advice the caller gave itself, and an agent
+    // that skipped the check had the private key in hand anyway. The broker refuses to
+    // OPEN a signing session for a destination the entry does not authorise, which is
+    // the first time this list has been a control rather than a convention.
+    //
+    // The honest limit is unchanged and stated in the class header: once a session is
+    // open, any same-uid process that learns the socket path can ask it to sign for some
+    // other host. Closing that needs OpenSSH's session-bind extension.
+    let allowedHosts: string[] = [];
+    const execCfg = coerceCfg(s.exec_config);
+    if (Array.isArray((execCfg as { ssh_hosts?: unknown }).ssh_hosts)) {
+      allowedHosts = ((execCfg as { ssh_hosts: unknown[] }).ssh_hosts).map(String);
+    }
+    const check = checkSshDestination(op, allowedHosts);
+    if (!check.ok) return err(check.error, 'HOST_NOT_ALLOWED');
+    const vaultKey = await this.api.ensureVaultKey();
+    const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
+    let identity;
+    try {
+      identity = loadOpenSshEd25519(new TextDecoder().decode(bytes));
+    } catch (e) {
+      return err(`That entry is not an unencrypted OpenSSH ed25519 private key: ${(e as Error).message}`);
+    } finally {
+      bytes.fill(0);
+    }
+
+    const sessionId = randomId();
+    const dir = path.join(runtimeDir(), 'ssh', sessionId);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    // 0755 on the directory and 0666 on the socket, for the same reason every broker
+    // socket is world-connectable: the broker is a different uid from the agent, so a
+    // mode that excluded other local users would exclude the agent too. The path is the
+    // unguessable part.
+    fs.chmodSync(dir, 0o755);
+
+    const handle = startAgent(identity, undefined, check.auditedHost, {
+      dir, socketMode: 0o666, publicKeyMode: 0o644,
+    });
+
+    const timer = setTimeout(() => this.closeSsh(sessionId), ttlSeconds * 1000);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.ssh.set(sessionId, { handle, timer, entryId });
+
+    return {
+      session_id: sessionId,
+      socket_path: handle.socketPath,
+      public_key_path: handle.publicKeyPath,
+      fingerprint: identity.fingerprint,
+      audited_host: check.auditedHost,
+    };
+  }
+
+  closeSsh(sessionId: string): { closed: boolean; signs: number } {
+    const rec = this.ssh.get(sessionId);
+    if (!rec) return { closed: false, signs: 0 };
+    const signs = rec.handle.signCount();
+    clearTimeout(rec.timer);
+    try { rec.handle.close(); } catch { /* already gone */ }
+    this.ssh.delete(sessionId);
+    return { closed: true, signs };
+  }
+
+  // ── settings ───────────────────────────────────────────────────────────────
+  async settings(): Promise<Record<string, unknown>> {
+    return this.api.getMcpSettings() as unknown as Record<string, unknown>;
+  }
+}
+
+function randomId(): string {
+  return randomBytes(16).toString('hex');
+}

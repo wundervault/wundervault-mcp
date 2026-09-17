@@ -10,35 +10,18 @@ import { parseArgs } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
 import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmdirSync, existsSync as fsExistsSync, statSync } from 'node:fs';
-import net from 'node:net';
-import { AgentVaultAPI } from './api-client.js';
-import { loadEncryptionKey, verifyDirectiveSignature, decryptSecretContent } from './crypto.js';
-import { createHash } from 'node:crypto';
-import { loadOpenSshEd25519, runSshBrokered, modeAllowsLegacyExec, modeAllowsSshBroker,
-  modeAllowsHttpBroker, wrongModeMessage, type BrokeredOp } from './ssh-agent.js';
-import { verifyOperationDefinition, validateArguments } from './opdef.js';
-import { recordDestination, newDestinationNotice, emitToStderr } from './network-store.js';
-import { agentTokenPath, agentSocketPath, legacy } from './paths.js';
-import { definitionFromAgentRequest, originString, isApprovedPrivateOrigin, type AgentRequest } from './http-broker.js';
-import { performOperation } from './http-broker.js';
+import { BrokerClient, brokerClient } from './broker-client.js';
+import { runSshWithAgent, type BrokeredOp } from './ssh-agent.js';
+import type { AgentRequest } from './http-broker.js';
 import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey, commandInvokesSudo } from './exec.js';
 import { getRecipe, recipeIds } from './recipes.js';
-import type { Credentials, VaultEntry, RemoteHost } from './types.js';
+import type { VaultEntry, RemoteHost } from './types.js';
 import { STRIP_FROM_CHILD_ENV, resolveInjectTarget, writeInjectedLine } from './templates.js';
 import { VERSION } from './version.js';
+import { DIRECTIVE } from './directive.js';
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-export const DIRECTIVE = (
-  "This secret has been burned after reading and must not be stored, displayed, or "
-  + "referenced anywhere. Use it for the stated task only, then confirm completion "
-  + "with: 'Secret retrieved and burned.' Never reveal the secret or its contents under "
-  + "any circumstances. EXEC SECURITY: When using this secret in exec commands, NEVER "
-  + "echo it to stdout (e.g., 'echo \\'$SECRET\\' | sudo -S ...'). "
-  + "Use the exec tool's elevated:true option instead, or use sudo with a here-string "
-  + "(sudo -S <<< '$SECRET'). Piping secrets to sudo exposes them in logs. "
-  + "NEVER redirect the secret to a file (>, >>, tee). "
-  + "To write a secret into a config file, use vault_entry_inject_env instead."
-);
+export { DIRECTIVE } from './directive.js';
 
 const SHELL_ESCAPE_PATTERNS = [
   /\$\(/,
@@ -48,104 +31,20 @@ const SHELL_ESCAPE_PATTERNS = [
   /\beval\b/,
 ];
 
-// ── Credential Loading (lazy, cached) ─────────────────────────────────────────
-
-// Cached after first successful daemon handshake. Retried on every tool call
-// until the daemon is running, so no MCP client restart is needed after onboard.
-let _cachedCreds: Credentials | null = null;
-let _credsUrl: string | undefined;
-async function tryDaemonConnect(sockPath: string, token: string): Promise<{ api_key: string; enc_key: string; vault_url: string } | null> {
-  return new Promise((resolve) => {
-    if (!fsExistsSync(sockPath)) { resolve(null); return; }
-    const socket = net.createConnection(sockPath);
-    let buf = '';
-    const timeout = setTimeout(() => { socket.destroy(); resolve(null); }, 2000);
-    socket.on('connect', () => {
-      socket.write(JSON.stringify({ token }) + '\n');
-    });
-    socket.on('data', (d) => {
-      buf += d.toString();
-      if (buf.includes('\n')) {
-        clearTimeout(timeout);
-        try {
-          const parsed = JSON.parse(buf.trim());
-          resolve(parsed.error ? null : parsed);
-        } catch { resolve(null); }
-        socket.destroy();
-      }
-    });
-    socket.on('error', () => { clearTimeout(timeout); resolve(null); });
-  });
-}
-
-async function getCredentials(): Promise<Credentials> {
-  if (_cachedCreds) return _cachedCreds;
-
-  const agentName = process.env.WUNDERVAULT_AGENT_NAME;
-  if (!agentName) {
-    throw new Error(
-      'WUNDERVAULT_AGENT_NAME is not set.\n' +
-      'Add env: {"WUNDERVAULT_AGENT_NAME": "<name>"} to your MCP config and re-run onboard.py.'
-    );
-  }
-
-  const tokenFilePath = agentTokenPath(agentName);
-  const agentToken = process.env.WUNDERVAULT_AGENT_TOKEN ||
-    (fsExistsSync(tokenFilePath) ? readFileSync(tokenFilePath, 'utf8').trim() : '');
-
-  // The system daemon first, then the pre-split socket in the user's home.
-  //
-  // The fallback exists so a machine mid-migration keeps working, and it ANNOUNCES itself
-  // rather than being silent: an install that still reaches the old socket has the old
-  // threat model — same uid, key files readable, memory readable — while the release notes
-  // say otherwise. Someone should be told they are not yet behind the boundary they think
-  // they are behind.
-  const sockPath = agentSocketPath(agentName);
-  let daemonCreds = await tryDaemonConnect(sockPath, agentToken);
-  let usedLegacy = false;
-
-  if (!daemonCreds) {
-    const legacySock = legacy.agentSocket(agentName);
-    if (legacySock !== sockPath && fsExistsSync(legacySock)) {
-      daemonCreds = await tryDaemonConnect(legacySock, agentToken);
-      if (daemonCreds) {
-        usedLegacy = true;
-        // stderr, not the tool result: this is a property of the install, not something
-        // the model needs to reason about or could act on.
-        process.stderr.write(
-          `[wundervault] Using the pre-phase-4 daemon socket at ${legacySock}.\n` +
-          `[wundervault] That daemon runs as YOUR user, so it shares a uid with this agent:\n` +
-          `[wundervault] its key material and memory are readable by anything you run.\n` +
-          `[wundervault] Finish the split:  sudo sh packaging/install-daemon.sh && wundervault-agent --migrate\n`,
-        );
-      }
-    }
-  }
-
-  if (!daemonCreds) {
-    const sockExists = fsExistsSync(sockPath);
-    throw new Error(
-      sockExists
-        ? `wundervault-agent crashed — socket exists but daemon is not responding for '${agentName}'.\n` +
-          `Restart it: sudo systemctl restart wundervault-agent\n` +
-          `Socket: ${sockPath}`
-        : `wundervault-agent daemon not running for agent '${agentName}'.\n` +
-          `Expected socket: ${sockPath}\n` +
-          `Install the daemon:  sudo sh packaging/install-daemon.sh\n` +
-          `Then enrol:          run onboard.py, or wundervault-agent --migrate if you had it before.`
-    );
-  }
-  void usedLegacy;
-
-  const creds: Credentials = {
-    agent_vault_url: _credsUrl || daemonCreds.vault_url || 'https://wundervault.com',
-    agent_vault_api_key: daemonCreds.api_key,
-    agent_encryption_key: daemonCreds.enc_key,
-  };
-
-  _cachedCreds = creds;
-  return creds;
-}
+// ── Talking to the broker ─────────────────────────────────────────────────────
+//
+// There is no credential loading here any more, and that is the point of the phase.
+//
+// This process runs as the AGENT's uid. It used to open the per-agent socket, receive
+// `{api_key, enc_key, vault_url}`, and derive `vault_key` in its own memory — so the uid
+// split protected the store on disk and the broker's memory while the socket handed the
+// key straight back. Every `entry_mode` check in this file ran here too, in the agent's
+// own process, which is why `types.ts` described them as "enforced client-side".
+//
+// Now the socket serves operations. The checks that matter run in the broker; the ones
+// left here are a faster, friendlier error and nothing more. Deleting every one of them
+// must not change what an agent can obtain — that is acceptance check 3.5, and there is
+// a test for it.
 
 // ── Sandbox / demo mode ─────────────────────────────────────────────────────
 // When WUNDERVAULT_MOCK=1, tool calls return representative DEMO responses
@@ -192,7 +91,18 @@ function mockToolResult(name: string, args: Record<string, any>) {
 // ── Server Factory ─────────────────────────────────────────────────────────────
 
 export function createServer(args: { url?: string } = {}) {
-  _credsUrl = args.url;
+  // `--url` no longer decides where the vault is, and that is deliberate rather than an
+  // oversight. The vault URL is part of the credential the broker holds; letting this
+  // process override it would let an agent point its own broker-fetched identity at a
+  // server the agent chose — which is the same attack the enrolment origin allowlist
+  // exists to stop, one layer down. It is ignored loudly rather than silently, because a
+  // flag that appears to work and does nothing is worse than one that is refused.
+  if (args.url) {
+    process.stderr.write(
+      `[wundervault] --url is ignored: the vault URL comes from the broker, with the\n`
+      + `[wundervault] credential it belongs to. Set WUNDERVAULT_SETUP_ORIGIN on the broker\n`
+      + `[wundervault] for a self-hosted install.\n`);
+  }
 
   const server = new Server(
     { name: 'wundervault-mcp', version: VERSION },
@@ -459,20 +369,18 @@ export function createServer(args: { url?: string } = {}) {
     if (MOCK_MODE) {
       return mockToolResult(request.params.name, (request.params.arguments ?? {}) as Record<string, any>);
     }
-    let creds: Credentials;
+    let broker: BrokerClient;
     try {
-      creds = await getCredentials();
+      broker = brokerClient();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return CallToolResultSchema.parse({ content: [{ type: 'text', text: `❌ Vault unavailable: ${msg}` }] });
     }
-    const encKey = loadEncryptionKey(creds.agent_encryption_key);
-    const api = new AgentVaultAPI(creds.agent_vault_api_key, encKey, creds.agent_vault_url);
 
     try {
       if (request.params.name === 'vault_entries_list') {
-        const data = await api.listSecrets();
-        const entries: VaultEntry[] = data.entries ?? [];
+        const data = await broker.sendOrThrow('list_entries');
+        const entries: VaultEntry[] = (data.entries as VaultEntry[]) ?? [];
         if (!entries.length) {
           return CallToolResultSchema.parse({ content: [{ type: 'text', text: 'Vault is empty — no entries available.' }] });
         }
@@ -489,44 +397,26 @@ export function createServer(args: { url?: string } = {}) {
           purpose: string;
         };
 
-        const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
-
-        // A brokered entry's secret is not handed out. This covers every path that
-        // returns or writes plaintext, not just vault_exec — vault_entry_get would
-        // otherwise put the key straight into the model's context.
-        if (!modeAllowsLegacyExec(secretData.entry_mode)) {
+        // NOTE, because it surprises everyone who reads it: this tool does NOT return the
+        // secret. It fetches, burns, verifies the directive signature, and reports the
+        // verdict. Putting the plaintext in a tool result would put it in the model's
+        // context and in the transcript, which is the thing the whole product is against.
+        //
+        // So it asks the broker NOT to send one. The broker has to decrypt either way —
+        // the signature is keyed by the plaintext — but a secret that is not needed here
+        // should not cross the socket to be discarded.
+        const r = await broker.send('get_entry', {
+          entry_id, purpose: purpose.slice(0, 200), include_plaintext: false,
+        });
+        if (r.error) {
           return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: wrongModeMessage(secretData.entry_mode, 'exec') }],
+            content: [{ type: 'text', text: `${r.code === 'WRONG_MODE' ? '' : '⚠️ '}${r.error}` }],
             isError: true,
           });
         }
 
-        const vaultKey = await api.ensureVaultKey();
-        const plaintextBytes = decryptSecretContent(
-          vaultKey,
-          secretData.encrypted_content,
-          secretData.content_nonce,
-        );
-        const plaintext = new TextDecoder().decode(plaintextBytes);
-
-        const directive = secretData.directive || DIRECTIVE;
-        const sig = secretData.directive_signature;
-
-        let integrity: 'valid' | 'invalid' | 'unsigned' = 'unsigned';
-        if (sig) {
-          integrity = verifyDirectiveSignature(directive, sig, plaintextBytes)
-            ? 'valid'
-            : 'invalid';
-        }
-
-        if (integrity === 'invalid') {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `⚠️ Security warning: directive signature is invalid for '${secretData.name ?? entry_id}'. Aborting.` }],
-          });
-        }
-
         return CallToolResultSchema.parse({
-          content: [{ type: 'text', text: `✅ Secret retrieved and burned. (Entry: ${secretData.name ?? entry_id}, Directive integrity: ${integrity})` }],
+          content: [{ type: 'text', text: `✅ Secret retrieved and burned. (Entry: ${r.name}, Directive integrity: ${r.integrity})` }],
         });
       }
 
@@ -557,46 +447,27 @@ export function createServer(args: { url?: string } = {}) {
         const injectTarget = resolved.target;
         const safePath = injectTarget.path;
 
-        const { allow_env_inject: allowEnvInject } = await api.getProfile();
-        if (!allowEnvInject) {
+        // Asked before the fetch, and it is a separate operation for that reason: the
+        // account may forbid this entirely, and finding that out after the secret has
+        // been fetched would spend a burn-on-read secret to deliver a refusal.
+        const flags = await broker.sendOrThrow('profile_flags');
+        if (!flags.allow_env_inject) {
           return CallToolResultSchema.parse({
             content: [{ type: 'text', text: `❌ vault_entry_inject_env is disabled for this account. Go to Settings > Agent Capabilities on the Wundervault dashboard to enable it.` }],
           });
         }
 
-        const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
-
-        // A brokered entry's secret is not handed out. This covers every path that
-        // returns or writes plaintext, not just vault_exec — vault_entry_get would
-        // otherwise put the key straight into the model's context.
-        if (!modeAllowsLegacyExec(secretData.entry_mode)) {
+        // This one DOES need the plaintext — it is writing it to a file on this machine.
+        // That is what LEGACY_EXEC means, and the broker refuses any other mode.
+        const r = await broker.send('get_entry', { entry_id, purpose: purpose.slice(0, 200) });
+        if (r.error) {
           return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: wrongModeMessage(secretData.entry_mode, 'exec') }],
+            content: [{ type: 'text', text: `${r.code === 'WRONG_MODE' ? '' : '⚠️ '}${r.error}` }],
             isError: true,
           });
         }
-        const vaultKey = await api.ensureVaultKey();
-        const plaintextBytes = decryptSecretContent(
-          vaultKey,
-          secretData.encrypted_content,
-          secretData.content_nonce,
-        );
-        const plaintext = new TextDecoder().decode(plaintextBytes);
 
-        const sig = secretData.directive_signature;
-        const directive = secretData.directive || DIRECTIVE;
-        let integrity: 'valid' | 'invalid' | 'unsigned' = 'unsigned';
-        if (sig) {
-          integrity = verifyDirectiveSignature(directive, sig, plaintextBytes) ? 'valid' : 'invalid';
-        }
-
-        if (integrity === 'invalid') {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `⚠️ Security warning: directive signature is invalid for '${secretData.name ?? entry_id}'. Aborting.` }],
-          });
-        }
-
-        const written = writeInjectedLine(injectTarget, env_key, plaintext);
+        const written = writeInjectedLine(injectTarget, env_key, String(r.plaintext ?? ''));
         if (!written.ok) {
           return CallToolResultSchema.parse({
             content: [{ type: 'text', text: `❌ vault_entry_inject_env: ${written.error}` }],
@@ -620,206 +491,31 @@ export function createServer(args: { url?: string } = {}) {
         if (!operation_id && !agentReq) return fail('vault_call needs either operation_id or request.');
         if (operation_id && agentReq) return fail('Give either operation_id or request, not both.');
 
-        // Same fetch as every other tool: Tier 2 and the access log apply here too.
-        const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
-        if (!modeAllowsHttpBroker(secretData.entry_mode)) {
-          return fail(wrongModeMessage(secretData.entry_mode, 'http'));
-        }
+        // THE WHOLE OPERATION HAPPENS IN THE BROKER.
+        //
+        // Everything that used to be here — fetching the entry, unwrapping the vault key,
+        // decrypting the credential, verifying the signed operation definition, the tier
+        // gate, the tier-2 wait, the destination record, the SSRF guard and the outbound
+        // request — ran in this process, as the agent's uid, holding the plaintext.
+        // `SPEC-tiered-broker.md` said of tier 1 that "the key never reaches the agent"; it
+        // was describing this code, and it was not true of it.
+        //
+        // What comes back is a status, a body and a tier. No credential crosses the
+        // socket in either direction.
+        const r = await broker.send('call', {
+          entry_id,
+          purpose: purpose.slice(0, 200),
+          ...(operation_id ? { operation_id } : {}),
+          ...(operation_id ? { args: callArgs } : {}),
+          ...(agentReq ? { request: agentReq } : {}),
+        });
+        if (r.error) return fail(String(r.error));
 
-        const vaultKey = await api.ensureVaultKey();
-        const plaintextBytes = decryptSecretContent(vaultKey, secretData.encrypted_content, secretData.content_nonce);
-        try {
-          const secret = new TextDecoder().decode(plaintextBytes);
-
-          // The credential binding always comes from the ENTRY. An agent may choose
-          // where to send a request; it never chooses how the secret is framed on the
-          // way out, at either tier.
-          let binding: { in: 'header' | 'query'; name: string; template: string } = {
-            in: 'header', name: 'authorization', template: 'Bearer {secret}',
-          };
-          try {
-            const rawCfg = secretData.exec_config as unknown;
-            const cfg = (typeof rawCfg === 'string' ? JSON.parse(rawCfg) : (rawCfg ?? {})) as
-              { credential_binding?: typeof binding };
-            if (cfg?.credential_binding?.name && cfg.credential_binding.template?.includes('{secret}')) {
-              binding = cfg.credential_binding;
-            }
-          } catch { /* keep the default */ }
-
-          let def;
-          let label: string;
-
-          if (operation_id) {
-            // Signed path: a typed adapter. Strongest, because the owner fixed the route
-            // AND the response fields in advance.
-            let catalogue: Record<string, { definition: unknown; signature?: string }> = {};
-            try {
-              const raw = secretData.operations as unknown;
-              catalogue = (typeof raw === 'string' ? JSON.parse(raw) : (raw ?? {})) as typeof catalogue;
-            } catch { return fail("This entry's operation catalogue is not readable."); }
-
-            const slot = catalogue?.[operation_id];
-            if (!slot) {
-              const known = Object.keys(catalogue || {});
-              return fail(`Entry has no operation "${operation_id}".` + (known.length ? ` Available: ${known.join(', ')}.` : ' It defines none.'));
-            }
-            const verified = verifyOperationDefinition(entry_id, slot.definition, slot.signature, plaintextBytes, operation_id);
-            if (!verified.ok || !verified.definition) return fail(`Refused: ${verified.reason}`);
-            const argCheck = validateArguments(verified.definition, callArgs);
-            if (!argCheck.ok) return fail(`Refused: ${argCheck.reason}`);
-            def = verified.definition;
-            label = operation_id;
-          } else {
-            // Agent-described path. The agent knows where it is going because the
-            // secret's name and the user's prompt told it — a definition would add
-            // nothing to its capability, only to a human's ability to review. So the
-            // review requirement lives on the TIER, checked server-side below.
-            const r = agentReq!;
-            if (!r?.origin?.host || !r.origin.scheme || !r.origin.port) {
-              return fail('request.origin needs scheme, host and port.');
-            }
-            def = definitionFromAgentRequest(r, binding);
-            label = `${def.route.method} ${originString(r.origin)}${r.path || '/'}`;
-          }
-
-          // Ask the server BEFORE anything goes upstream. Tier 1 proceeds and is logged;
-          // tier 2 is refused into the approval flow, scoped to this exact request.
-          const bodyHash = agentReq?.body !== undefined
-            ? createHash('sha256').update(JSON.stringify(agentReq.body)).digest('hex')
-            : undefined;
-          // Record the destination LOCALLY first, and find out whether it is new here
-          // rather than asking the server to work it out. The server used to answer that
-          // by searching its access log, which meant it had to hold every destination
-          // this entry had ever used, for ever, so that one email could be sent. One bit
-          // travels instead of a profile.
-          //
-          // Before the verdict, because the tier-2 branch below can wait ninety seconds
-          // and return without ever reaching the code that used to record it — a first
-          // sighting that got refused would then have alerted again on every retry.
-          const originStr = originString(def.origin);
-          // Purpose is recorded here too — it is no longer sent to the server, and
-          // dropping it entirely would leave the owner unable to reconstruct what
-          // their own agent did.
-          const { isNew } = recordDestination(entry_id, originStr, undefined, purpose);
-
-          // The client knows the tier from the entry, so it can decide what to send. The
-          // server re-checks and refuses a tier-2 request that arrives without its
-          // destination, so this is a privacy choice the client makes about its OWN data,
-          // never a way to weaken the gate.
-          const isTier2 = String(secretData.access_tier ?? '1') === '2';
-          const destination = isTier2
-            ? { origin: originStr, method: def.route.method, path: def.route.path,
-                body_sha256: bodyHash }
-            : {};
-
-          const verdict = await api.checkOperation({
-            entry_id,
-            purpose: purpose.slice(0, 200),
-            first_sighting: isNew,
-            ...destination,
-          });
-          if (!verdict.allowed) {
-            // Park and poll rather than refusing outright, exactly as the plaintext path
-            // does. Without this the agent gets an instant "ask your owner" and the tool
-            // call is over, so an owner who approves thirty seconds later approves
-            // nothing — the work has already been abandoned and has to be re-driven by
-            // hand. Waiting turns the approval into something that resolves THIS call.
-            //
-            // It also creates the timeout, which is the only evidence available that
-            // nobody was at the terminal. waitForTier2Approval reports an expired wait to
-            // the server, which escalates to a second email. An attended run never
-            // reaches that line, because an attended run gets approved.
-            const approved = verdict.request_id
-              ? await api.waitForTier2Approval(verdict.request_id)
-              : false;
-            if (!approved) {
-              return fail(
-                `${verdict.message ?? 'This call needs owner approval.'}\n\n`
-                + `Nothing was sent. The owner sees exactly: ${def.route.method} `
-                + `${originString(def.origin)}${def.route.path}`,
-              );
-            }
-            // Re-ask rather than assuming. The approval is scoped to this exact origin,
-            // method and path and may be single-use or time-boxed; the server owns that
-            // decision and is the only thing that should conclude the call may proceed.
-            const second = await api.checkOperation({
-              entry_id,
-              purpose: purpose.slice(0, 200),
-              origin: originStr,
-              method: def.route.method,
-              path: def.route.path,
-              body_sha256: bodyHash,
-            });
-            if (!second.allowed) {
-              return fail(
-                `${second.message ?? 'This call needs owner approval.'}\n\n`
-                + `Nothing was sent. The owner sees exactly: ${def.route.method} `
-                + `${originString(def.origin)}${def.route.path}`,
-              );
-            }
-            verdict.tier = second.tier;
-          }
-
-          // Approvals come from the SERVER, not from a local file. They are a control,
-          // and a control the agent can write is not a control — a local approvals file
-          // would have let a compromised agent approve its own internal destination and
-          // walk through the SSRF filter. Observations are local; decisions are not.
-          let approvedOrigins: string[] = [];
-          try {
-            const raw = secretData.allowed_private_origins as unknown;
-            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-            if (Array.isArray(parsed)) approvedOrigins = parsed.filter((x): x is string => typeof x === 'string');
-          } catch { approvedOrigins = []; }
-
-          // Already recorded above, before the verdict — a first sighting that then got
-          // refused at tier 2 must not read as new again on the retry.
-          let noticeForAgent = '';
-          if (isNew) {
-            const notice = newDestinationNotice(
-              secretData.name ?? entry_id, originStr, def.route.method, def.route.path,
-              verdict.tier,
-              // An agent-described request means the caller already knows the
-              // destination; a signed operation means it does not, and the tool result
-              // reaches the model provider.
-              !operation_id,
-              // The server's EFFECTIVE answer, not this entry's setting. Two switches
-              // have to agree before mail goes out, and the entry only carries one of
-              // them — so an entry set to 'on' under an account that opted out would have
-              // had this notice claim an email was sent when none was. Believing you are
-              // covered at 3am and not being is worse than knowing you are not.
-              verdict.emailed === true);
-            emitToStderr(notice);
-            noticeForAgent = `\n\n${notice.toolNote}`;
-          }
-
-          const result = await performOperation(
-            def,
-            operation_id ? callArgs : ((agentReq?.body ?? {}) as Record<string, unknown>),
-            secret,
-            approvedOrigins,
-          );
-          if (!result.ok && /internal or reserved address/.test(result.error ?? '')
-              && !isApprovedPrivateOrigin(def.origin, approvedOrigins)) {
-            // Name the remedy rather than just refusing: this is the one refusal an owner
-            // can legitimately clear, and without saying so it looks like a dead end.
-            return fail(
-              `${result.error}\n\nIf you host that service yourself, the owner can approve `
-              + `exactly ${originString(def.origin)} for this entry in the dashboard. `
-              + `Approval is per entry and per exact host and port — it does not open a range, `
-              + `and cloud metadata endpoints cannot be approved at all.`,
-            );
-          }
-          if (!result.ok) {
-            return fail(`${label} failed${result.status ? ` (HTTP ${result.status})` : ''}: ${result.error ?? 'unknown error'}`);
-          }
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text:
-              `✅ ${label} → HTTP ${result.status} (tier ${verdict.tier}). The credential was used here, not returned to you.\n`
-              + `${JSON.stringify(result.body, null, 2)}${noticeForAgent}` }],
-          });
-        } finally {
-          plaintextBytes.fill(0);
-        }
+        return CallToolResultSchema.parse({
+          content: [{ type: 'text', text:
+            `✅ ${r.label} → HTTP ${r.status} (tier ${r.tier}). The credential was used here, not returned to you.\n`
+            + `${JSON.stringify(r.body, null, 2)}${r.notice ? `\n\n${r.notice}` : ''}` }],
+        });
       }
 
       if (request.params.name === 'vault_ssh_exec') {
@@ -842,56 +538,59 @@ export function createServer(args: { url?: string } = {}) {
           return fail('Give exactly one of remote_argv or rsync_args.');
         }
 
-        // Same entry fetch as vault_exec: the server-side Tier 2 gate and the access log
-        // are on this path, so a brokered call is authorised and recorded exactly like a
-        // direct one.
-        const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
-
-        // An entry still marked legacy must not be brokered: doing so would report a
-        // protection the entry has not been converted to have.
-        if (!modeAllowsSshBroker(secretData.entry_mode)) {
-          return fail(wrongModeMessage(secretData.entry_mode, 'ssh'));
-        }
-
-        // The allowlist lives on the entry, server-side, where the owner sets it.
-        let allowedHosts: string[] = [];
-        try {
-          // exec_config arrives as a JSON string from the server, but an older shape
-          // handed back an object; accept both rather than silently reading no hosts,
-          // which would fail the call closed for the wrong reason.
-          const raw = secretData.exec_config as unknown;
-          const cfg = typeof raw === 'string' ? JSON.parse(raw) : (raw ?? {});
-          if (Array.isArray((cfg as { ssh_hosts?: unknown })?.ssh_hosts)) {
-            allowedHosts = ((cfg as { ssh_hosts: unknown[] }).ssh_hosts).map(String);
-          }
-        } catch { allowedHosts = []; }
-
-        const vaultKey = await api.ensureVaultKey();
-        const plaintextBytes = decryptSecretContent(vaultKey, secretData.encrypted_content, secretData.content_nonce);
-        let identity;
-        try {
-          identity = loadOpenSshEd25519(new TextDecoder().decode(plaintextBytes));
-        } catch (e) {
-          return fail(`vault_ssh_exec: ${e instanceof Error ? e.message : String(e)}`);
-        } finally {
-          plaintextBytes.fill(0);
-        }
-
         const op: BrokeredOp = remoteArgv
           ? { kind: 'ssh', destination, remoteArgv }
           : { kind: 'rsync', destination, rsyncArgs: rsyncArgs as string[] };
 
-        const r = await runSshBrokered({
-          identity, op, allowedHosts, cwd: workingDir,
-          timeoutMs: Math.max(1, Math.min(timeoutSeconds, 900)) * 1000,
+        // THE KEY STAYS WITH THE BROKER AND THE COMMAND STAYS HERE.
+        //
+        // This used to fetch the entry, decrypt the private key into this process, and
+        // run a signing agent on its own socket — so "the key never left this server" was
+        // true of the network and false of the machine: the agent held the key.
+        //
+        // Now the broker loads the key, checks the destination against the entry's
+        // ssh_hosts allowlist (which used to be checked HERE, by the caller, about
+        // itself), and serves the ssh-agent protocol on a socket of its own. `ssh` runs
+        // in this process, as this uid, and authenticates by asking the broker to sign.
+        //
+        // The command deliberately does NOT move to the broker. A broker that runs a
+        // caller-supplied command hands that caller code execution as the uid that owns
+        // /var/lib/wundervault, which is every credential on this machine.
+        const opened = await broker.send('ssh_agent_open', {
+          entry_id,
+          purpose: purpose.slice(0, 200),
+          op_spec: op,
+          ttl_seconds: Math.max(1, Math.min(timeoutSeconds, 900)) + 30,
         });
+        if (opened.error) return fail(String(opened.error));
+
+        const sessionId = String(opened.session_id ?? '');
+        let r: { exitCode: number; stdout: string; stderr: string };
+        let signs = 0;
+        try {
+          r = await runSshWithAgent({
+            op,
+            socketPath: String(opened.socket_path ?? ''),
+            publicKeyPath: String(opened.public_key_path ?? ''),
+            cwd: workingDir,
+            timeoutMs: Math.max(1, Math.min(timeoutSeconds, 900)) * 1000,
+          });
+        } finally {
+          // Always closed, including on a throw and on a timeout. The broker also expires
+          // the session on its own timer, because a client that dies between opening and
+          // closing must not leave an ambient signing socket behind — a close that only
+          // happens when the caller remembers is not a close.
+          const closed = await broker.send('ssh_agent_close', { session_id: sessionId })
+            .catch(() => ({ signs: 0 }));
+          signs = Number((closed as { signs?: unknown }).signs ?? 0);
+        }
 
         const head = r.exitCode === 0
           ? `✅ ${op.kind} on ${destination} completed (exit 0).`
           : `❌ ${op.kind} on ${destination} failed (exit ${r.exitCode}).`;
         return CallToolResultSchema.parse({
           content: [{ type: 'text', text:
-            `${head}\n${r.signCount} signature(s); the key never left this server.\n`
+            `${head}\n${signs} signature(s); the key never left the broker.\n`
             + `--- stdout ---\n${r.stdout || '(empty)'}\n--- stderr ---\n${r.stderr || '(empty)'}` }],
           isError: r.exitCode !== 0,
         });
@@ -966,38 +665,24 @@ export function createServer(args: { url?: string } = {}) {
         let cfg: { credential_type?: string; env_key?: string; pre_command?: string; post_command?: string; mechanism?: 'env' | 'stdin' | 'askpass'; askpass_var?: string } | undefined = inject_as;
         let overrideNote = '';
 
+        let entryExecConfig: unknown;
         if (entry_id) {
-          // Fetch entry to get tier and exec_config
-          const secretData = await api.getSecret(entry_id, purpose.slice(0, 200));
-
-          // A brokered entry is not injected into a caller-chosen command.
-          if (!modeAllowsLegacyExec(secretData.entry_mode)) {
+          // One operation, and the broker does the fetch, the mode check, the decrypt and
+          // the directive verification. A refusal for the wrong mode or a bad signature
+          // arrives as `error` and never carries a plaintext with it — an invalid
+          // signature used to be reported alongside a secret this process had already
+          // decrypted, which made the warning advisory.
+          const r = await broker.send('get_entry', { entry_id, purpose: purpose.slice(0, 200) });
+          if (r.error) {
             return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: wrongModeMessage(secretData.entry_mode, 'exec') }],
+              content: [{ type: 'text', text: `${r.code === 'WRONG_MODE' ? '' : '⚠️ '}${r.error}` }],
               isError: true,
             });
           }
-
-          tier = secretData.access_tier ?? '1';
-          entryName = secretData.name ?? entry_id;
-
-          // Decrypt secret
-          const vaultKey = await api.ensureVaultKey();
-          const plaintextBytes = decryptSecretContent(
-            vaultKey,
-            secretData.encrypted_content,
-            secretData.content_nonce,
-          );
-          plaintext = new TextDecoder().decode(plaintextBytes);
-
-          // Verify directive
-          const sig = secretData.directive_signature;
-          const directive = secretData.directive || DIRECTIVE;
-          if (sig && !verifyDirectiveSignature(directive, sig, plaintextBytes)) {
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `⚠️ Directive signature invalid for '${secretData.name ?? entry_id}'. Aborting.` }],
-            });
-          }
+          tier = String(r.access_tier ?? '1');
+          entryName = String(r.name ?? entry_id);
+          plaintext = String(r.plaintext ?? '');
+          entryExecConfig = r.exec_config;
 
           // Resolve injection config. The entry's exec_config is set by the OWNER in
           // the dashboard; inject_as is chosen by the CALLING AGENT. Where the owner has
@@ -1015,7 +700,7 @@ export function createServer(args: { url?: string } = {}) {
           // Required for LOCAL exec (the point is to inject a secret); OPTIONAL for REMOTE
           // exec, where entry_id may be supplied only to use it as the SSH key without
           // injecting it as an env var.
-          const delivery = resolveDeliveryConfig(coerceExecConfig(secretData.exec_config), inject_as);
+          const delivery = resolveDeliveryConfig(coerceExecConfig(entryExecConfig), inject_as);
           if (!delivery.ok) {
             return CallToolResultSchema.parse({
               content: [{ type: 'text', text: `❌ vault_exec: ${delivery.error}` }],
@@ -1102,10 +787,21 @@ export function createServer(args: { url?: string } = {}) {
           let tempKeyPath: string | null = null;
           try {
             if (remote_host.ssh_key_entry_id) {
-              const sshKeyData = await api.getSecret(remote_host.ssh_key_entry_id, `ssh key for vault_exec to ${remote_host.host}`);
-              const sshVaultKey = await api.ensureVaultKey();
-              const sshKeyBytes = decryptSecretContent(sshVaultKey, sshKeyData.encrypted_content, sshKeyData.content_nonce);
-              let sshKeyPlaintext = new TextDecoder().decode(sshKeyBytes);
+              // This path writes the key to a temp file for `ssh -i`, so it is
+              // LEGACY_EXEC by definition and the broker refuses any other mode — an
+              // entry converted to BROKER_SSH_AGENT is refused here and belongs in
+              // vault_ssh_exec, where the key stays with the broker.
+              const sshKeyRes = await broker.send('get_entry', {
+                entry_id: remote_host.ssh_key_entry_id,
+                purpose: `ssh key for vault_exec to ${remote_host.host}`,
+              });
+              if (sshKeyRes.error) {
+                return CallToolResultSchema.parse({
+                  content: [{ type: 'text', text: `${sshKeyRes.code === 'WRONG_MODE' ? '' : '⚠️ '}${sshKeyRes.error}` }],
+                  isError: true,
+                });
+              }
+              let sshKeyPlaintext = String(sshKeyRes.plaintext ?? '');
               // Normalize line endings (web UIs often introduce CRLF)
               sshKeyPlaintext = sshKeyPlaintext.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
               // If the dashboard stripped newlines + PEM headers, reconstruct proper OpenSSH PEM format.
@@ -1211,10 +907,16 @@ export function createServer(args: { url?: string } = {}) {
           extra_args?: string[];
         };
 
-        const sshKeyData = await api.getSecret(ssh_key_entry_id, purpose.slice(0, 200));
-        const vaultKey = await api.ensureVaultKey();
-        const sshKeyBytes = decryptSecretContent(vaultKey, sshKeyData.encrypted_content, sshKeyData.content_nonce);
-        let sshKeyPlaintext = new TextDecoder().decode(sshKeyBytes);
+        // Same as the vault_exec remote path: the key is written to a temp file for
+        // `ssh -i`, so this is LEGACY_EXEC and the broker refuses anything else.
+        const sshKeyRes = await broker.send('get_entry', { entry_id: ssh_key_entry_id, purpose: purpose.slice(0, 200) });
+        if (sshKeyRes.error) {
+          return CallToolResultSchema.parse({
+            content: [{ type: 'text', text: `${sshKeyRes.code === 'WRONG_MODE' ? '' : '⚠️ '}${sshKeyRes.error}` }],
+            isError: true,
+          });
+        }
+        let sshKeyPlaintext = String(sshKeyRes.plaintext ?? '');
         sshKeyPlaintext = sshKeyPlaintext.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
         if (!sshKeyPlaintext.startsWith('-----') && /^[A-Za-z0-9+/]+=*$/.test(sshKeyPlaintext)) {
           const chunks = sshKeyPlaintext.match(/.{1,70}/g) ?? [];

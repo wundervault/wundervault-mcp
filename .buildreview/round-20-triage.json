@@ -1,0 +1,20 @@
+{"round": 20, "decisions": [
+  {"id": "F1", "action": "fixed",
+   "claim": "The 180s absolute deadline violates the spec's required 120s and acceptance check 25",
+   "reason": "CONFIRMED, and the divergence was mine: round 19's triage said I had amended the spec and I had only amended the TEST. The code is right — 90s of tier-2 wait plus a 30s upstream call does not fit in 120s — so the SPEC was corrected, in 3.3 and in check 25, with the reason recorded rather than the number quietly swapped. Exactly the kind of thing a second round is for: I asserted a fix in writing and the reviewer checked the writing against the code."},
+  {"id": "F2", "action": "rejected",
+   "claim": "server.ts still sends the old {token} request, so every agent breaks against the new broker",
+   "reason": "Wrong in fact, and correctly hedged by the reviewer ('if src/server.ts remains as described'). server.ts WAS rewritten: getCredentials and tryDaemonConnect are gone, every tool handler calls src/broker-client.ts, which sends {token, op, ...}. Evidence: grep shows zero occurrences of decryptVaultKey/decryptSecretContent/loadEncryptionKey and zero of AgentVaultAPI in server.ts, and test/key-custody.test.ts asserts the whole tool surface over the new protocol. The diff was withheld from this package for the payload cap and the notes said so — this is the blind-spot-shaped finding that arrives when you withhold a file, which is why the notes ask for exactly that flagging."},
+  {"id": "F3", "action": "fixed",
+   "claim": "Buffer.concat on every data event makes pre-auth framing quadratic in the number of chunks",
+   "reason": "CONFIRMED. A sub-1-MiB line in thousands of paced writes made the broker copy everything received so far on each one, burning CPU in front of a legitimate agent before any token was checked — the cap and the deadline both eventually apply and neither stops that. Now searches the incoming CHUNK for the newline and concatenates only once, when a line is actually complete."},
+  {"id": "B1", "action": "fixed",
+   "claim": "No ceiling on concurrent ssh_agent_open sessions",
+   "reason": "CONFIRMED and cheap. A token holder could loop ssh_agent_open and leave each session alive for its full lifetime, accumulating listeners, timers, directories and private keys in memory. Capped at 4 per agent, checked BEFORE the entry is fetched so hitting the ceiling costs no access-log row and cannot trip a tier-2 gate."},
+  {"id": "B2", "action": "noted",
+   "claim": "No coordinated rollout plan; installing the broker first is an immediate outage for old agents",
+   "reason": "Correct, and it is the project's existing standing decision rather than an oversight: everything ships in one cutover (project_wundervault_v2_cutover_plan), the npm package and the broker go together, and all seven agents are repaired and re-enrolled as part of it. The rejection of the old protocol is deliberate — a deprecation path here is a downgrade path. Recorded in the handoff's deploy order, which is where an operator will look."},
+  {"id": "B3", "action": "fixed",
+   "claim": "A request-size cap exists with no matching bound on the reply",
+   "reason": "CONFIRMED. The MCP client capped its side at 8 MiB; the broker would serialise whatever an upstream body or a large entry list produced. Bounding one end leaves the other holding what the first will produce. The broker now refuses to send an oversized reply with REPLY_TOO_LARGE rather than building it."}
+]}

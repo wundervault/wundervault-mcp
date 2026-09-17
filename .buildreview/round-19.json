@@ -1,0 +1,137 @@
+{
+  "verdict": "revise",
+  "summary": "The broker now serves mode-gated operations instead of returning vault credentials, and the credential-dispensing path has been removed in the shown code. However, the socket lifecycle breaks legitimate long-running calls, the advertised byte cap is not actually byte-based, UTF-8 bodies can be corrupted at chunk boundaries, and malformed scalar JSON may crash the daemon depending on the omitted token-check code.",
+  "spec_check": [
+    {
+      "requirement": "17. The per-agent socket never emits `api_key` or `enc_key`. A test asserts the reply to every operation, and to a malformed one, contains neither field.",
+      "status": "partial",
+      "evidence": "The old credential reply is removed and `serve` exposes only operations; reported raw-byte tests cover named operations and failure paths. However, valid scalar JSON such as `null` is not root-shape-validated in the shown parser, and whether it receives a reply rather than crashing depends on the omitted token-check code."
+    },
+    {
+      "requirement": "18. An old-shape `{token}` request returns an upgrade error, not credentials.",
+      "status": "met",
+      "evidence": "`serve` treats a missing `op` as an old client and returns `UPGRADE_REQUIRED`, `upgrade: true`, and the broker version without returning credentials."
+    },
+    {
+      "requirement": "19. `get_entry` on a BROKER_SSH_AGENT or BROKER_HTTP entry is refused BY THE BROKER, with every client-side mode check deleted in the test build.",
+      "status": "met",
+      "evidence": "`BrokerOps.getEntry` calls `modeAllowsLegacyExec` immediately after `getSecret` and returns `WRONG_MODE` before decrypting. The package reports a raw-socket test for both brokered modes; deletion of client-side checks is in the withheld `server.ts` diff."
+    },
+    {
+      "requirement": "19a. Each RPC causes exactly one `getSecret` against the vault API \u2014 the access log and the tier-2 gate behave identically to today. Asserted against a recording fake.",
+      "status": "met",
+      "evidence": "Each secret-bearing operation shown\u2014`getEntry`, `call`, and `sshAgentOpen`\u2014contains one `getSecret` invocation, and the package reports recording-fake coverage. Non-secret operations use their dedicated profile, listing, or settings endpoints."
+    },
+    {
+      "requirement": "20. `call` performs the HTTP operation with the plaintext never appearing in any socket reply, verified by asserting on the raw bytes written to the socket.",
+      "status": "met",
+      "evidence": "`BrokerOps.call` decrypts locally, passes the secret to `performOperation`, wipes the mutable byte buffer in `finally`, and returns only the operation result and metadata. The package reports raw-socket assertions that plaintext is absent."
+    },
+    {
+      "requirement": "21. `ssh_agent_open` lets `ssh` authenticate without the private key crossing the socket, and the session is closed on `ssh_agent_close` and on a timeout.",
+      "status": "partial",
+      "evidence": "`sshAgentOpen` returns only an agent socket, public-key path, fingerprint, and session identifier; `closeSsh` and the TTL timer both close the handle. The reported new tests cover host refusal, but no successful broker/client SSH authentication or timeout test is described."
+    },
+    {
+      "requirement": "22. No file under `src/` other than the broker's own modules imports `decryptVaultKey`, `decryptSecretContent` or `loadEncryptionKey`. Grep test.",
+      "status": "met",
+      "evidence": "The package reports a grep test allowing only `api-client.ts` and `broker-ops.ts`; the shown MCP-facing socket code does not import the decryption helpers."
+    },
+    {
+      "requirement": "23. The SSRF guard, the pinned lookup, the private-origin allowlist and the scrubbing behave identically after the move \u2014 the existing `http-broker` tests pass unchanged against the broker-hosted path.",
+      "status": "partial",
+      "evidence": "`BrokerOps.call` invokes the unchanged `performOperation` and passes entry-derived private-origin approvals, but the package explicitly states that the broker-hosted HTTPS seam is stubbed and has no in-process end-to-end HTTPS round trip."
+    },
+    {
+      "requirement": "24. `recordDestination` writes `/var/lib/wundervault/network.json` as the broker, and an agent cannot write that file.",
+      "status": "partial",
+      "evidence": "`recordDestination` now executes inside `BrokerOps.call`, hence in the broker process. The file ownership and a two-UID test proving the agent cannot write it are outside the shown excerpt and are not listed among this round's tests."
+    },
+    {
+      "requirement": "25. A request larger than 1 MiB is refused, and a connection held open past 120s is closed, while a legitimate 30s upstream call completes.",
+      "status": "unmet",
+      "evidence": "The 120-second absolute timer exists, but the limit compares JavaScript string length rather than raw byte count, allowing multi-byte requests larger than 1 MiB. In addition, the 30-second inactivity timer remains active while an authenticated request is awaiting the upstream operation, so it can destroy the socket before a legitimate 30-second call returns."
+    },
+    {
+      "requirement": "26. A wrong token still costs the failing caller the exponential penalty, and a valid token is still served during another caller's flood.",
+      "status": "partial",
+      "evidence": "The comments and unchanged section indicate that token validation remains before penalty lookup and successful validation clears the agent's penalty. The actual comparison, penalty code, flood behavior, and corresponding tests are omitted, while scalar JSON handling may fail before normal wrong-token processing."
+    },
+    {
+      "requirement": "27. The seven live agents' flow \u2014 repair, pair, claim, enrol, then every tool \u2014 works end to end in the rehearsal container.",
+      "status": "partial",
+      "evidence": "The package reports 436 passing tests but explicitly scopes this round to the broker side; no seven-agent end-to-end rehearsal result is supplied."
+    },
+    {
+      "requirement": "28. `SPEC-tiered-broker.md`'s \"the key never reaches the agent\" is true for tier 1 after this change, or the sentence is corrected.",
+      "status": "partial",
+      "evidence": "The shown broker path keeps decryption and HTTP execution in `BrokerOps`, and the old credential response is gone. Confirmation that every MCP tool uses the new client and that the documentation was updated depends on withheld `server.ts`, `broker-client.ts`, and specification files."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/agent.ts",
+      "line": 590,
+      "claim": "If the omitted unchanged token-check dereferences `msg.token` directly, as the typed parser implies, the lack of runtime root-shape validation lets unauthenticated scalar JSON crash the broker before token validation.",
+      "failure_scenario": "Any local process connects to the world-accessible per-agent socket and sends `null\\n`; `JSON.parse` assigns `null` to `msg`, and a subsequent `msg.token` access throws synchronously in the socket data callback, terminating the broker instead of returning a penalized authentication error.",
+      "suggested_direction": "Validate that parsed input is a non-null, non-array object before reading any field, and route every other JSON root through the normal malformed-request or wrong-token response without throwing."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/agent.ts",
+      "line": 575,
+      "claim": "The 30-second inactivity timeout remains armed while `serve` waits for broker and upstream work, so it defeats the required support for legitimate 30-second operations.",
+      "failure_scenario": "A valid `call` request spends one second fetching and decrypting the entry and then waits 29.5 seconds for an HTTPS response; because no bytes cross the agent socket during that work, the inactivity timer destroys the socket at 30 seconds, the caller receives no result, and the broker may continue the upstream operation after disconnection.",
+      "suggested_direction": "Use the inactivity timer only while receiving the request, then disable or separately manage it once a complete authenticated request is accepted; retain the 120-second absolute deadline for the full operation."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": 584,
+      "claim": "The 1 MiB request cap measures UTF-16 string units rather than raw socket bytes, so multi-byte UTF-8 requests can exceed the specified cap and still be processed.",
+      "failure_scenario": "A caller sends a JSON request containing 700,000 three-byte UTF-8 characters in its body; the wire request is over 2 MiB, but `buf.length` is roughly 700,000 plus JSON overhead, so it remains below `MAX_REQUEST_BYTES` and is accepted instead of refused.",
+      "suggested_direction": "Track the cumulative byte length from incoming buffers and enforce the cap before decoding or appending text."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": 584,
+      "claim": "Decoding each socket chunk independently with `d.toString()` corrupts valid UTF-8 request content when a multi-byte character is split across chunks.",
+      "failure_scenario": "A valid `call` body contains `\u00e9`, and the two UTF-8 bytes arrive in separate `data` events; each partial byte is decoded as a replacement character, so the broker forwards a body containing `\ufffd\ufffd` rather than the caller's original `\u00e9`.",
+      "suggested_direction": "Use an incremental UTF-8 decoder that preserves incomplete character sequences across chunks, or buffer raw bytes until the complete newline-delimited frame has been received."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "`listEntries` and `settings` forward API response objects without an explicit output-field allowlist.",
+      "why_it_matters": "A future backend response expansion could silently expose encrypted content, internal account metadata, or credential-adjacent fields over the agent socket even though the current API contract and tests contain no such fields."
+    },
+    {
+      "id": "B2",
+      "concern": "The excerpt shows no cancellation propagation or per-agent operation queue after a client disconnects; if no omitted server-level control supplies one, authenticated callers can leave many expensive operations running.",
+      "why_it_matters": "An agent can submit calls or tier-2 waits and immediately disconnect, consuming broker memory, vault API capacity, approval requests, and outbound connections while opening fresh requests that affect every agent sharing the broker."
+    },
+    {
+      "id": "B3",
+      "concern": "`recordDestination` runs before tier approval, SSRF validation, and the actual HTTP attempt.",
+      "why_it_matters": "A request denied by the owner or rejected before sending any secret is still recorded as a destination, so an incident report described as showing where secrets were sent can contain false positives and obscure actual exfiltration."
+    },
+    {
+      "id": "B4",
+      "concern": "Decrypted HTTP credentials are converted into immutable JavaScript strings, while only the temporary byte buffers are wiped.",
+      "why_it_matters": "Secrets may remain in broker heap snapshots, core dumps, or freed process memory until garbage collection; operational controls for core dumps and diagnostic capture therefore become part of key custody even though they are not specified here."
+    }
+  ],
+  "_meta": {
+    "round": 19,
+    "at": "2026-09-17T16:46:54+00:00",
+    "package_bytes": 91424,
+    "schema_problems": []
+  }
+}

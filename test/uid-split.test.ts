@@ -91,6 +91,30 @@ function speak(sockPath: string, payload: unknown, timeoutMs = 3000): Promise<an
   });
 }
 
+/**
+ * The same conversation, returning the RAW reply bytes.
+ *
+ * `speak` parses, and a parsed object is the wrong thing to assert "no credential here"
+ * against: `res.api_key` is undefined for a field nested one level down, or spelled
+ * differently, or embedded in an error string. The bytes are what actually crossed the
+ * socket.
+ */
+function speakRaw(sockPath: string, payload: unknown, timeoutMs = 3000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const s = net.createConnection(sockPath);
+    let buf = '';
+    const t = setTimeout(() => { s.destroy(); reject(new Error('timeout')); }, timeoutMs);
+    const fin = (fn: () => void) => { clearTimeout(t); s.destroy(); fn(); };
+    s.on('connect', () => s.write(JSON.stringify(payload) + '\n'));
+    s.on('data', (d) => {
+      buf += d.toString();
+      if (!buf.includes('\n')) return;
+      fin(() => resolve(buf));
+    });
+    s.on('error', (e) => fin(() => reject(e)));
+  });
+}
+
 beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wv-uid-')); });
 afterEach(() => {
   try { daemon?.shutdown(); } catch { /* already down */ }
@@ -139,12 +163,65 @@ describe('the state directory is the boundary', () => {
 });
 
 describe('the token is the identity now', () => {
-  it('serves credentials to the right token', async () => {
+  it('serves an operation to the right token, and NEVER a credential', async () => {
+    // This test used to assert the opposite — `expect(res.api_key).toBe(p.api_key)` —
+    // and it passed, because that is what the socket did. The uid split protected the
+    // store on disk and the broker's memory and then handed the key back over the
+    // socket to a process running as the agent. The assertion is inverted deliberately:
+    // a valid token now buys an ANSWER, not the means to answer yourself.
+    const p = profile('A');
+    const { d } = await freshDaemon({ profiles: [p] }); daemon = d;
+    const res = await speak(path.join(dir, 'run', 'A.sock'), { token: p.socket_token, op: 'ping' });
+    expect(res.ok).toBe(true);
+    expect(res.agent).toBe('A');
+    expect(res.api_key).toBeUndefined();
+    expect(res.enc_key).toBeUndefined();
+  });
+
+  it('answers the pre-custody request shape with an upgrade error, not credentials', async () => {
+    // An old MCP server sends `{token}` and nothing else. It must not be served, and it
+    // must not be left guessing: the reply names the version and the fix. There is no
+    // flag, env var or legacy mode that brings the old reply back — a deprecation path
+    // here is a downgrade path for anything that can read the token file.
     const p = profile('A');
     const { d } = await freshDaemon({ profiles: [p] }); daemon = d;
     const res = await speak(path.join(dir, 'run', 'A.sock'), { token: p.socket_token });
-    expect(res.api_key).toBe(p.api_key);
-    expect(res.vault_url).toBe('https://v.test');
+    expect(res.code).toBe('UPGRADE_REQUIRED');
+    expect(res.api_key).toBeUndefined();
+    expect(res.enc_key).toBeUndefined();
+    expect(res.vault_url).toBeUndefined();
+  });
+
+  it('leaks no credential field from ANY operation, including the failures', async () => {
+    // The property, asserted over the surface rather than one call. Every operation is
+    // driven with a valid token and an unusable profile, so each one fails somewhere
+    // different — and the thing being checked is what the failures carry, because a
+    // handler that returns `{...profile, error}` on the way out is exactly the mistake
+    // this phase exists to prevent.
+    const p = profile('A');
+    const { d } = await freshDaemon({ profiles: [p] }); daemon = d;
+    const sock = path.join(dir, 'run', 'A.sock');
+    const ops = [
+      { op: 'ping' },
+      { op: 'list_entries' },
+      { op: 'profile_flags' },
+      { op: 'get_entry', entry_id: 'e1', purpose: 'p' },
+      { op: 'get_entry' },
+      { op: 'call', entry_id: 'e1', purpose: 'p', request: { origin: { scheme: 'https', host: 'x.test', port: 443 }, method: 'GET', path: '/' } },
+      { op: 'ssh_agent_open', entry_id: 'e1', purpose: 'p', op_spec: { kind: 'ssh', destination: 'h', remoteArgv: ['true'] } },
+      { op: 'ssh_agent_close', session_id: 'nope' },
+      { op: 'settings' },
+      { op: 'no_such_operation' },
+      {},
+    ];
+    for (const payload of ops) {
+      const raw = await speakRaw(sock, { token: p.socket_token, ...payload });
+      // On the RAW BYTES, not the parsed object: a field nested anywhere in a reply is
+      // still a credential on the wire, and `res.api_key === undefined` would miss it.
+      expect(raw, `operation ${JSON.stringify(payload)}`).not.toContain('api_key');
+      expect(raw, `operation ${JSON.stringify(payload)}`).not.toContain('enc_key');
+      expect(raw, `operation ${JSON.stringify(payload)}`).not.toContain(p.api_key);
+    }
   });
 
   it('refuses a wrong token', async () => {
@@ -203,8 +280,8 @@ describe('the token is the identity now', () => {
     const sock = path.join(dir, 'run', 'A.sock');
     for (let i = 0; i < 12; i++) await speak(sock, { token: 'aa'.repeat(32) });
 
-    const res = await speak(sock, { token: p.socket_token });
-    expect(res.api_key).toBe(p.api_key);
+    const res = await speak(sock, { token: p.socket_token, op: 'ping' });
+    expect(res.ok).toBe(true);
   });
 
   it('makes the guesser wait, and the delay grows', async () => {
@@ -235,8 +312,8 @@ describe('the token is the identity now', () => {
     for (let i = 0; i < 12; i++) await speak(sock, { token: 'aa'.repeat(32) });
 
     const t = Date.now();
-    const res = await speak(sock, { token: p.socket_token });
-    expect(res.api_key).toBe(p.api_key);
+    const res = await speak(sock, { token: p.socket_token, op: 'ping' });
+    expect(res.ok).toBe(true);
     // Served promptly, not after the penalty the guesser earned.
     expect(Date.now() - t).toBeLessThan(200);
   });
@@ -247,8 +324,8 @@ describe('the token is the identity now', () => {
     const sock = path.join(dir, 'run', 'A.sock');
     for (let i = 0; i < 12; i++) await speak(sock, { token: 'aa'.repeat(32) });
     d.registerProfile(p);
-    const res = await speak(path.join(dir, 'run', 'A.sock'), { token: p.socket_token });
-    expect(res.api_key).toBe(p.api_key);
+    const res = await speak(path.join(dir, 'run', 'A.sock'), { token: p.socket_token, op: 'ping' });
+    expect(res.ok).toBe(true);
   });
 });
 
@@ -360,8 +437,13 @@ describe('persistence', () => {
     first.d.shutdown();
 
     const second = await freshDaemon(); daemon = second.d;
-    const creds = await speak(path.join(dir, 'run', 'Persist.sock'), { token: p.socket_token });
-    expect(creds.api_key).toBe(p.api_key);
+    // The profile survived the restart — proved by the socket answering for that agent
+    // at all, since a daemon that failed to load the store serves nobody. The credential
+    // itself is deliberately not observable from here any more, which is the point; it
+    // is checked on disk by the store test instead.
+    const alive = await speak(path.join(dir, 'run', 'Persist.sock'), { token: p.socket_token, op: 'ping' });
+    expect(alive.ok).toBe(true);
+    expect(alive.agent).toBe('Persist');
   });
 
   it('does not leave a half-written store after a crash', async () => {
@@ -442,9 +524,9 @@ describe('a held connection must not exclude the real agent', () => {
     }
     await new Promise((r) => setTimeout(r, 150));
 
-    const res = await speak(sock, { token: p.socket_token });
+    const res = await speak(sock, { token: p.socket_token, op: 'ping' });
     for (const c of held) c.destroy();
-    expect(res.api_key).toBe(p.api_key);
+    expect(res.ok).toBe(true);
   });
 });
 

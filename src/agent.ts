@@ -40,6 +40,39 @@ import {
   splitAvailable, systemdCredential, sealedWithTpm,
 } from './paths.js';
 import { load as loadNetworkShape } from './network-store.js';
+import { BrokerOps } from './broker-ops.js';
+import type { BrokeredOp } from './ssh-agent.js';
+
+/**
+ * The per-agent socket request cap.
+ *
+ * Enforced before parsing, on the raw buffer, so it bounds an unauthenticated caller.
+ */
+const MAX_REQUEST_BYTES = 1024 * 1024;
+
+/**
+ * The largest reply the broker will serialise.
+ *
+ * Generous — an upstream JSON body is the big case — and still a bound. The MCP client
+ * caps its side at the same figure; bounding only one end leaves the other holding
+ * whatever the first will produce.
+ */
+const MAX_REPLY_BYTES = 8 * 1024 * 1024;
+
+/** Everything a caller may ask the per-agent socket for. */
+interface SocketRequest {
+  token?: string;
+  op?: string;
+  entry_id?: string;
+  purpose?: string;
+  operation_id?: string;
+  args?: Record<string, unknown>;
+  request?: unknown;
+  session_id?: string;
+  include_plaintext?: boolean;
+  op_spec?: unknown;
+  ttl_seconds?: number;
+}
 
 interface AgentProfile {
   agent_name: string;
@@ -253,6 +286,16 @@ class AgentDaemon {
   private agentServers: Map<string, net.Server> = new Map();
   private mgmtServer: net.Server | null = null;
   private knocks = new Knocks();
+  /**
+   * One operations object per agent, built on first use and kept.
+   *
+   * Kept rather than rebuilt per connection because `AgentVaultAPI` caches the unwrapped
+   * vault key after the first call, and that cache is exactly what we want: it lives in
+   * the broker's memory and nowhere else. The consequence is that a repair — which
+   * retires the vault key — must drop it, so `registerProfile` and `removeProfile` both
+   * discard the entry rather than leaving a stale key to fail every subsequent call.
+   */
+  private ops: Map<string, BrokerOps> = new Map();
 
   constructor() {
     ensureSystemRoot();
@@ -369,6 +412,10 @@ class AgentDaemon {
     const idx = this.profiles.findIndex(p => p.agent_name === profile.agent_name);
     if (idx >= 0) {
       this.profiles[idx] = profile;
+      // A re-enrolment follows a repair, and a repair retires the vault key. The cached
+      // operations object holds the OLD one; keeping it would make every call after a
+      // repair fail to decrypt, which reads as a broken vault rather than a stale cache.
+      this.dropOps(profile.agent_name);
       const old = this.agentServers.get(profile.agent_name);
       if (old) {
         // Not unlinked in the close callback: startAgentSocket unlinks and rebinds
@@ -396,9 +443,124 @@ class AgentDaemon {
     const srv = this.agentServers.get(safe);
     if (srv) { try { srv.close(); } catch { /* already gone */ } }
     this.agentServers.delete(safe);
+    this.dropOps(safe);
     try { fs.unlinkSync(agentSocketPath(safe)); } catch { /* already gone */ }
     this.saveProfiles();
     return true;
+  }
+
+  /**
+   * Answer one operation for one agent.
+   *
+   * The token has already been checked by the caller. Everything here runs as the
+   * broker's uid, and NOTHING here may return `api_key` or `enc_key` — that is the
+   * property the whole phase rests on, and it is asserted by a test that inspects the
+   * bytes written to the socket for every operation, including the failures.
+   */
+  private async serve(profile: AgentProfile, msg: SocketRequest): Promise<Record<string, unknown>> {
+    const op = typeof msg.op === 'string' ? msg.op : '';
+
+    // No `op` at all is the pre-custody client asking for credentials. Answering it with
+    // a generic "unknown operation" would send someone hunting through their config; say
+    // what actually happened and what fixes it.
+    if (!op) {
+      return {
+        error:
+          'This broker no longer hands out vault credentials. The MCP server on this '
+          + `machine is older than the broker (broker ${VERSION}). Update it: `
+          + 'npm install -g @wundervault/mcp-server, then reload your MCP connection.',
+        code: 'UPGRADE_REQUIRED',
+        upgrade: true,
+        broker_version: VERSION,
+      };
+    }
+
+    // `ping` is answered BEFORE any credential is touched. Building the operations
+    // object parses the encryption key, so a profile with an unusable one would make the
+    // liveness check fail in the same way a dead broker does — and "is the broker there"
+    // is exactly the question you ask when something is already wrong.
+    if (op === 'ping') {
+      // Deliberately says nothing about the vault. It exists so a client can tell a
+      // broker that is running from one that is not, before it has an entry to ask for.
+      return { ok: true, agent: profile.agent_name, broker_version: VERSION };
+    }
+
+    const ops = this.opsFor(profile);
+    const entry = () => String(msg.entry_id ?? '');
+    const purpose = () => String(msg.purpose ?? '');
+
+    switch (op) {
+      case 'list_entries':
+        return await ops.listEntries() as unknown as Record<string, unknown>;
+
+      case 'profile_flags':
+        return await ops.profileFlags() as unknown as Record<string, unknown>;
+
+      case 'get_entry': {
+        if (!entry() || !purpose()) return { error: 'get_entry needs entry_id and purpose.' };
+        // Defaults to sending one: a caller that omits the field is an older client whose
+        // tools all expect a plaintext. Only an explicit `false` withholds it.
+        const include = msg.include_plaintext !== false;
+        return await ops.getEntry(entry(), purpose(), include) as unknown as Record<string, unknown>;
+      }
+
+      case 'call': {
+        if (!entry() || !purpose()) return { error: 'call needs entry_id and purpose.' };
+        return await ops.call({
+          entryId: entry(),
+          purpose: purpose(),
+          operationId: typeof msg.operation_id === 'string' ? msg.operation_id : undefined,
+          callArgs: (msg.args ?? {}) as Record<string, unknown>,
+          request: msg.request as never,
+        }) as unknown as Record<string, unknown>;
+      }
+
+      case 'ssh_agent_open': {
+        if (!entry() || !purpose()) return { error: 'ssh_agent_open needs entry_id and purpose.' };
+        const ttl = Number.isFinite(msg.ttl_seconds) ? Number(msg.ttl_seconds) : 300;
+        const op = msg.op_spec as BrokeredOp | undefined;
+        if (!op || (op.kind !== 'ssh' && op.kind !== 'rsync') || typeof op.destination !== 'string') {
+          return { error: 'ssh_agent_open needs op_spec {kind, destination, remoteArgv|rsyncArgs}.' };
+        }
+        return await ops.sshAgentOpen({
+          entryId: entry(),
+          purpose: purpose(),
+          op,
+          // Clamped rather than trusted: the caller is the party the session is a
+          // capability for, so an unbounded ttl from it would be a request to leave the
+          // signing socket open for ever.
+          ttlSeconds: Math.max(10, Math.min(900, ttl)),
+        }) as unknown as Record<string, unknown>;
+      }
+
+      case 'ssh_agent_close':
+        return ops.closeSsh(String(msg.session_id ?? '')) as unknown as Record<string, unknown>;
+
+      case 'settings':
+        return await ops.settings();
+
+      default:
+        return { error: `Unknown operation "${op}".`, code: 'UNKNOWN_OP' };
+    }
+  }
+
+  /** The operations object for one agent, built on first use. */
+  private opsFor(profile: AgentProfile): BrokerOps {
+    const existing = this.ops.get(profile.agent_name);
+    if (existing) return existing;
+    const fresh = new BrokerOps(
+      profile.agent_name, profile.api_key, profile.enc_key, profile.vault_url,
+    );
+    this.ops.set(profile.agent_name, fresh);
+    return fresh;
+  }
+
+  /** Drop an agent's cached operations — and its cached vault key — and close its sessions. */
+  private dropOps(name: string): void {
+    const existing = this.ops.get(name);
+    if (!existing) return;
+    try { existing.reset(); } catch { /* closing a dead session is not an event */ }
+    this.ops.delete(name);
   }
 
   startAgentSocket(profile: AgentProfile): void {
@@ -406,22 +568,82 @@ class AgentDaemon {
     try { fs.unlinkSync(sockPath); } catch { /* nothing to clear */ }
 
     const srv = net.createServer((socket) => {
-      let buf = '';
-      // A caller that never sends a newline would otherwise hold a connection open for
-      // ever, and a caller that streams without one would grow this buffer without bound.
-      // Inactivity timeout AND an absolute one. The inactivity timer alone is resettable
-      // by any traffic, which is what let a connection be held open indefinitely.
-      socket.setTimeout(5_000, () => socket.destroy());
-      const deadline = setTimeout(() => socket.destroy(), 10_000);
+      // BUFFERS, not a string, and the reasons are two separate bugs.
+      //
+      // 1. `buf.length` on a string counts UTF-16 code units, not bytes. A request of
+      //    700,000 three-byte UTF-8 characters is over 2 MiB on the wire and about
+      //    700,000 "long" as a string, so a byte cap enforced on a string is not a byte
+      //    cap. It was harmless when the only payload was `{"token":"<hex>"}`; a `call`
+      //    carries an arbitrary HTTP body.
+      // 2. `chunk.toString()` decodes each chunk independently, so a multi-byte character
+      //    split across two TCP reads becomes two replacement characters. The broker would
+      //    then forward a body that is not the one the caller sent — silently, and only
+      //    for non-ASCII content.
+      //
+      // Concatenating Buffers and decoding once, at the end, fixes both.
+      let chunks: Buffer[] = [];
+      let size = 0;
+      let consumed = false;
+
+      // TWO TIMERS, WITH DIFFERENT JOBS.
+      //
+      // The inactivity timer bounds a caller who never finishes sending — the slow-loris
+      // shape the original 5s timeout was written for. The absolute deadline bounds the
+      // connection whatever it does.
+      //
+      // The inactivity timer is DISARMED the moment a complete request has been read,
+      // because from then on there is legitimately no traffic: the broker is fetching an
+      // entry, waiting on a 30s upstream call, or parked on a tier-2 approval for up to
+      // 90s. Leaving it armed destroyed the socket mid-operation and returned nothing,
+      // while the broker carried on working for a caller that was no longer there.
+      socket.setTimeout(30_000, () => socket.destroy());
+      // 180s, not 120s: a tier-2 call waits up to 90s for a human, then re-asks the
+      // server and performs a request with its own 30s timeout. A 120s ceiling would cut
+      // off the one path that exists to survive a human taking their time.
+      const deadline = setTimeout(() => socket.destroy(), 180_000);
       (deadline as unknown as { unref?: () => void }).unref?.();
       socket.on('close', () => clearTimeout(deadline));
       socket.on('data', (d) => {
-        buf += d.toString();
-        if (buf.length > 4096) { socket.destroy(); return; }
-        if (!buf.includes('\n')) return;
+        if (consumed) return;
+        chunks.push(d);
+        size += d.length;
+        // Enforced on RAW BYTES, before parsing, which is what stops an unauthenticated
+        // caller growing this buffer. 4096 was right for a token lookup; a `call`
+        // operation carries an HTTP body, so the cap is 1 MiB.
+        if (size > MAX_REQUEST_BYTES) { socket.destroy(); return; }
 
-        let msg: { token?: string } = {};
-        try { msg = JSON.parse(buf.trim()); } catch { /* treated as no token */ }
+        // Search the CHUNK, not the accumulation. `Buffer.concat` on every data event
+        // copies everything received so far, so a caller sending a sub-1-MiB line in
+        // thousands of small paced writes made the broker do quadratic work BEFORE
+        // authenticating — the byte cap and the deadline both eventually apply, and
+        // neither stops it burning CPU in front of a legitimate agent in the meantime.
+        if (d.indexOf(0x0a) < 0) return;
+        const joined = Buffer.concat(chunks);
+        const nl = joined.indexOf(0x0a);
+        if (nl < 0) return;
+        consumed = true;
+        // Decoded ONCE, over the whole line, so a multi-byte character spanning chunks
+        // survives.
+        const line = joined.subarray(0, nl).toString('utf8').trim();
+
+        // The request has arrived in full; the inactivity timer has done its job and
+        // would now be measuring the broker's own work.
+        socket.setTimeout(0);
+
+        let msg: SocketRequest | null = null;
+        try {
+          const parsed = JSON.parse(line) as unknown;
+          // `JSON.parse("null")` returns null, and `null.token` throws — synchronously,
+          // inside a socket data callback, which takes the whole broker down. Any local
+          // process could send `null\n` to a world-connectable socket and kill the
+          // process holding every credential on the machine. A scalar (`5`, `"x"`) does
+          // not throw but is not a request either, so the shape is checked rather than
+          // the failure mode patched.
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            msg = parsed as SocketRequest;
+          }
+        } catch { /* treated as no token, exactly as an unparseable body always was */ }
+        if (msg === null) msg = {};
 
         // The token is checked FIRST, before any penalty is consulted. The previous order
         // let a stranger's wrong guesses decide what the real agent got back.
@@ -449,12 +671,53 @@ class AgentDaemon {
         }
 
         this.knocks.clear(profile.agent_name);
-        socket.write(JSON.stringify({
-          api_key: profile.api_key,
-          enc_key: profile.enc_key,
-          vault_url: profile.vault_url,
-        }) + '\n');
-        socket.end();
+
+        // ── THE CHANGE THIS PHASE EXISTS FOR ────────────────────────────────
+        //
+        // This used to be:
+        //
+        //     socket.write(JSON.stringify({ api_key, enc_key, vault_url }))
+        //
+        // A valid token got the credentials, and the MCP server — which runs as the
+        // AGENT's uid — used `enc_key` to unwrap `vault_key_for_agent` and decrypt the
+        // whole vault in its own memory. The uid split protected the store on disk and
+        // the broker's memory, and then the socket handed the key over anyway. The token
+        // that authorises this lives in the agent's own home at 0600, readable by the
+        // agent because that is how the MCP server authenticates, so obtaining the whole
+        // vault needed no exploit at all.
+        //
+        // The socket now serves OPERATIONS. Nothing below can return api_key or enc_key,
+        // and there is no flag, env var or legacy mode that brings the old reply back:
+        // an old client gets an upgrade error, because a deprecation path here is a
+        // downgrade path for an attacker.
+        this.serve(profile, msg as SocketRequest)
+          .then((reply) => {
+            try {
+              const body = JSON.stringify(reply);
+              // A reply the broker cannot serialise within a bound is REFUSED rather than
+              // sent. Not a confidentiality control — it is what stops an authenticated
+              // caller turning one legitimate operation (a huge upstream body, a vault
+              // with thousands of entries) into memory this process has to hold and the
+              // client has to buffer. The client caps its side too; both ends bounding it
+              // is deliberate, because either one alone leaves the other exposed.
+              if (body.length > MAX_REPLY_BYTES) {
+                socket.write(JSON.stringify({
+                  error: `That operation produced a reply larger than `
+                    + `${Math.round(MAX_REPLY_BYTES / (1024 * 1024))} MiB, so it was not sent. `
+                    + `Narrow the request.`,
+                  code: 'REPLY_TOO_LARGE',
+                }) + '\n');
+                socket.end();
+                return;
+              }
+              socket.write(body + '\n');
+              socket.end();
+            } catch { /* the caller hung up while we worked */ }
+          })
+          .catch((e: Error) => {
+            try { socket.write(JSON.stringify({ error: e.message }) + '\n'); socket.end(); }
+            catch { /* as above */ }
+          });
       });
       socket.on('error', () => { /* a client that hangs up is not an event */ });
     });
@@ -536,6 +799,79 @@ class AgentDaemon {
 
         try {
           const msg = JSON.parse(buf.slice(0, nl));
+          if (msg.action === 'enrol_claim' && msg.claim_code) {
+            // The claim path. What the caller hands over here is NOT a credential: it
+            // names a blob sealed to this broker's public key, and only this broker's
+            // private key opens it. So the code can cross a terminal, a chat log or a
+            // command line without mattering — which is the whole difference from the
+            // setup link, where the same journey hands over the vault key.
+            void (async () => {
+              try {
+                if (!msg.socket_token || String(msg.socket_token).length < 32) {
+                  throw new Error('An enrolment must carry a socket_token of at least 32 characters.');
+                }
+                const { claim, burnClaim } = await import('./pair.js');
+                const c = await claim(String(msg.claim_code));
+                this.registerProfile({
+                  agent_name: c.agent_name,
+                  api_key: c.api_key,
+                  enc_key: c.enc_key,
+                  vault_url: c.vault_url,
+                  socket_token: String(msg.socket_token),
+                } as AgentProfile);
+                // Burned only after the profile is stored, for the same reason the link
+                // path defers its burn: a disk error must not consume a single-use claim.
+                // The burn carries api_key_hmac from inside the blob as proof — without
+                // it, anyone who read the claim code could spend it first.
+                const burned = await burnClaim(String(msg.claim_code), c.api_key_hmac ?? '');
+                reply({ ok: true, agent_name: c.agent_name, agent_id: c.agent_id, link_burned: burned });
+              } catch (e) {
+                reply({ error: (e as Error).message });
+              } finally {
+                socket.end();
+              }
+            })();
+            return;
+          }
+
+          if (msg.action === 'whose_claim' && msg.claim_code) {
+            // Reading a claim does not spend it, so this costs one round trip and lets
+            // the caller reuse an existing socket token rather than locking out a running
+            // agent. The blob is not opened here and nothing from it is returned.
+            void (async () => {
+              try {
+                const { whoseClaim } = await import('./pair.js');
+                reply(await whoseClaim(String(msg.claim_code)));
+              } catch (e) {
+                reply({ error: (e as Error).message });
+              } finally {
+                socket.end();
+              }
+            })();
+            return;
+          }
+
+          if (msg.action === 'paired') {
+            // So a client can find out whether this machine has a broker identity bound
+            // to an account, and refuse the weaker path itself with a useful message
+            // rather than discovering it two round trips later.
+            void (async () => {
+              try {
+                const { readPaired } = await import('./pair.js');
+                const rec = readPaired();
+                reply(rec
+                  ? { paired: true, fingerprint: rec.fingerprint, origin: rec.origin,
+                      account_label: rec.account_label ?? null, paired_at: rec.paired_at }
+                  : { paired: false });
+              } catch (e) {
+                reply({ error: (e as Error).message });
+              } finally {
+                socket.end();
+              }
+            })();
+            return;
+          }
+
           if (msg.action === 'enrol' && msg.setup_url) {
             // The ONLY way a profile gets in. `register_profile` used to live here and
             // took whatever it was handed: any local process — every agent on this
@@ -556,6 +892,25 @@ class AgentDaemon {
                 // the link spent, the agent absent, and another trip to the dashboard.
                 if (!msg.socket_token || String(msg.socket_token).length < 32) {
                   throw new Error('An enrolment must carry a socket_token of at least 32 characters.');
+                }
+                // ACCEPTANCE CHECK 14. On a paired machine the link path is refused.
+                //
+                // Leaving it available would make every hardening above optional: an
+                // attacker who wanted the credential in bearer form would simply ask for
+                // the path that still produces one. A downgrade that remains reachable is
+                // not a fallback, it is the attack.
+                //
+                // Refused BEFORE redeeming, so a link offered to a paired broker is not
+                // spent on its way to being rejected.
+                const { readPaired: _paired } = await import('./pair.js');
+                const pairedRec = _paired();
+                if (pairedRec) {
+                  throw new Error(
+                    `This machine is paired with a broker (${pairedRec.fingerprint}), so setup `
+                    + `links are not accepted here — they are bearer credentials and the pairing `
+                    + `exists to stop one being carried.\n`
+                    + `Repair the agent in the dashboard, choose this broker, and paste the CLAIM `
+                    + `CODE instead. Nothing was redeemed, so the link you have is still valid.`);
                 }
                 // The burn is deferred: the link is marked used only once the profile is
                 // actually stored, so a disk error cannot consume it either.
@@ -742,10 +1097,42 @@ export type { AgentProfile, ProfileStore };
  * so an agent that copied it would have had time to redeem it first. Piping still works, so
  * this stays scriptable; nothing that reaches here lands in argv.
  */
+/**
+ * A yes/no question on the terminal.
+ *
+ * Defaults to NO. The two questions this asks — "is that fingerprint right" and "is that
+ * your account" — are the whole of the pairing ceremony's security, and a default of yes
+ * would turn either into a keystroke somebody taps through.
+ */
+function askYesNo(prompt: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!process.stdin.isTTY) {
+      // Non-interactive: refuse rather than assume. A pairing confirmed by a script is a
+      // pairing nobody looked at, which is the thing being defended against.
+      process.stderr.write(
+        '\nRefusing to confirm a pairing without a terminal — this step exists to be read by a person.\n');
+      resolve(false);
+      return;
+    }
+    process.stdout.write(prompt);
+    let answered = false;
+    const onData = (d: Buffer | string) => {
+      if (answered) return;
+      answered = true;
+      process.stdin.removeListener('data', onData);
+      process.stdin.pause();
+      resolve(/^\s*y(es)?\s*$/i.test(String(d)));
+    };
+    process.stdin.setEncoding('utf8');
+    process.stdin.resume();
+    process.stdin.on('data', onData);
+  });
+}
+
 function readLinkFromStdin(): Promise<string> {
   return new Promise((resolve) => {
     if (process.stdin.isTTY) {
-      process.stderr.write('Paste the setup link from the dashboard (it ends in #…): ');
+      process.stderr.write('Paste the claim code, or the setup link, from the dashboard: ');
     }
     let buf = '';
     process.stdin.setEncoding('utf8');
@@ -769,16 +1156,23 @@ if (invokedDirectly && !process.env.WUNDERVAULT_AGENT_NO_AUTOSTART) {
     console.log(`
 Wundervault secret broker ${VERSION}
 
-Usage: wundervault-agent [--enrol] [--migrate [--finish]] [--destinations]
+Usage: wundervault-agent [--pair] [--unpair] [--enrol] [--migrate [--finish]] [--destinations]
 
 With no arguments it runs as the secret broker: the process that holds your agents'
 credentials so the agents cannot read them. It is normally started by systemd as the
 '${SYSTEM_ACCOUNT}' account, not by hand.
 
-  --enrol       Add an agent using a setup link from the dashboard. Prompts for the link
-                rather than taking it as an argument: a command line is readable by every
-                process on this machine. The broker redeems the link itself, so the
-                credentials never pass through this process.
+  --pair        Bind this machine's broker to your account, once. Needs sudo: it writes
+                the broker's private key. Prints a code and a fingerprint, neither of
+                which is a secret, and waits for you to confirm in the dashboard.
+  --unpair      Forget this machine's pairing, so setup links are accepted here again.
+                Revokes no agent and does not delete the broker's key. Unpair in the
+                dashboard too — that is the half this cannot reach.
+  --enrol       Add an agent. Prompts for a CLAIM CODE (on a paired machine) or a setup
+                link (on an unpaired one), rather than taking either as an argument: a
+                command line is readable by every process on this machine. The broker
+                fetches and decrypts the credentials itself, so they never pass through
+                this process. A claim code is not a credential; a setup link is.
   --migrate     Show which agents still need moving to the broker, and how.
   --finish      With --migrate: delete the old store, once every agent is across.
   --destinations  Show where your agents have sent secrets. Needs sudo: the record
@@ -873,6 +1267,78 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
         setTimeout(() => { cleanup(); process.exit(0); }, 10 * 60 * 1000);
       })
       .catch((e: Error) => { console.error(e.message); process.exit(1); });
+  } else if (argv.includes('--pair')) {
+    // Runs as ROOT (via sudo), because it writes the broker's private key into
+    // /var/lib/wundervault. Nothing secret leaves this command: it uploads a PUBLIC key
+    // and prints a fingerprint and a code, both of which an onlooker may read.
+    void (async () => {
+      const { startPairing, awaitConfirmation } = await import('./pair.js');
+      try {
+        const start = await startPairing();
+        console.log('');
+        console.log('  Pairing code : ' + start.code);
+        console.log('  Fingerprint  : ' + start.identity.fingerprint);
+        console.log('');
+        console.log('  In the dashboard: Settings > Agents > Pair a broker, enter the code above,');
+        console.log('  and check the fingerprint it shows matches this one EXACTLY before you');
+        console.log('  confirm. That comparison is the whole ceremony — everything after it is');
+        console.log('  sealed to the key you just approved.');
+        console.log('');
+        console.log('  Neither of those two values is a secret. Anyone reading this screen learns');
+        console.log('  a public key and a code that opens nothing.');
+        console.log('');
+        process.stdout.write('  Waiting for you to confirm...');
+        let dots = 0;
+        const rec = await awaitConfirmation(start, {
+          onTick: () => { dots += 1; if (dots % 4 === 0) process.stdout.write('.'); },
+          // The second half of the ceremony. The fingerprint check proves the key is
+          // this machine's; it cannot prove the ACCOUNT is yours, because a pairing code
+          // is printed here and typed into a browser and anyone who reads it can confirm
+          // it under their own account. So the person at the terminal reads the account
+          // back and says whether it is theirs.
+          confirmAccount: async (hint) => {
+            console.log('');
+            console.log('');
+            console.log(`  Confirmed by: ${hint || '(the server did not name an account)'}`);
+            console.log('');
+            return askYesNo('  Is that your account? [y/N] ');
+          },
+        });
+        console.log('');
+        console.log('');
+        console.log(`  Paired. This broker is ${rec.fingerprint}`
+          + (rec.account_label ? ` (${rec.account_label})` : ''));
+        console.log('');
+        console.log('  Setup links are no longer accepted on this machine. Repair an agent in the');
+        console.log('  dashboard, choose this broker, and paste the CLAIM CODE into --enrol.');
+        process.exit(0);
+      } catch (e) {
+        console.log('');
+        console.error((e as Error).message);
+        process.exit(1);
+      }
+    })();
+  } else if (argv.includes('--unpair')) {
+    // The local half of unpairing. The dashboard revokes the server row; this forgets
+    // the marker here. Both are needed: the setup-link refusal is keyed to the local
+    // file, so without this an owner who unpaired in the browser would be offered a link
+    // and have it refused by their own broker with nothing explaining why.
+    void (async () => {
+      const { readPaired, forgetPairing } = await import('./pair.js');
+      const rec = readPaired();
+      if (!rec) {
+        console.log('This machine is not paired. Nothing to do.');
+        process.exit(0);
+      }
+      const gone = forgetPairing();
+      console.log(gone
+        ? `Forgot the pairing with ${rec.fingerprint}. Setup links are accepted here again.\n`
+          + `The broker's KEY is untouched and no agent was revoked — anything already enrolled\n`
+          + `keeps working. Unpair it in the dashboard too, or it will still be offered as a\n`
+          + `delivery target there.`
+        : `Could not remove ${''}the pairing marker. Check permissions on the state directory.`);
+      process.exit(gone ? 0 : 1);
+    })();
   } else if (argv.includes('--enrol')) {
     // Runs as the USER. It hands over a URL and gets back a name — the credentials are
     // fetched, decrypted and filed by the daemon, and never enter this process.
@@ -883,25 +1349,40 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
     // for as long as the command ran. And because fetching and burning are separate steps,
     // an agent that copied it had time to redeem it first. Prompting costs one paste and
     // keeps the link out of argv and out of shell history.
-    const url = await readLinkFromStdin();
-    if (!url) {
-      console.error('No setup link given.');
+    const input = await readLinkFromStdin();
+    if (!input) {
+      console.error('Nothing given. Paste a claim code, or a setup link on an unpaired machine.');
       process.exit(2);
     }
-    const { enrol } = await import('./migrate.js');
-    enrol(url)
-      .then((r) => {
-        console.log(`Enrolled ${r.agent_name}. Its credentials are held by the broker in ${systemRoot()}, ` +
-                    `which your agents cannot read.`);
+    void (async () => {
+      const { enrol, enrolClaim } = await import('./migrate.js');
+      const { looksLikeClaimCode } = await import('./pair.js');
+      try {
+        // A claim code and a setup link are told apart by SHAPE, not by asking the user
+        // which they have. They look nothing alike, and a wrong guess here would send a
+        // bearer credential down the path that does not expect one.
+        const isClaim = looksLikeClaimCode(input);
+        const r = isClaim ? await enrolClaim(input) : await enrol(input);
+        console.log(`Enrolled ${r.agent_name}. Its credentials are held by the broker in ${systemRoot()}, `
+                    + `which your agents cannot read.`);
         if (!r.linkBurned) {
           console.log('');
-          console.log('WARNING: the server did not confirm the setup link as used, so it stays');
-          console.log('valid until it expires and could be replayed to re-point this agent.');
-          console.log('Repair the agent again in the dashboard if that matters to you.');
+          console.log(isClaim
+            ? 'WARNING: the server did not confirm the claim as used, so it stays valid until it'
+            : 'WARNING: the server did not confirm the setup link as used, so it stays');
+          console.log(isClaim
+            ? 'expires. It opens nothing without this broker\u2019s key, but repair the agent again'
+            : 'valid until it expires and could be replayed to re-point this agent.');
+          console.log(isClaim
+            ? 'if you would rather it were dead.'
+            : 'Repair the agent again in the dashboard if that matters to you.');
         }
         process.exit(0);
-      })
-      .catch((e: Error) => { console.error(e.message); process.exit(1); });
+      } catch (e) {
+        console.error((e as Error).message);
+        process.exit(1);
+      }
+    })();
   } else if (argv.includes('--migrate')) {
     // Runs as the USER, not the daemon: it reads the old store from a home directory the
     // daemon deliberately cannot reach.

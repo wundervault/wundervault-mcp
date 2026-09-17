@@ -79,14 +79,33 @@ approval per use, with biometric unlock, and the agent is blocked until you answ
 
 > *Some keys should need a human. Those ones do.*
 
+### 8. Repairing an agent replaces the lock, not just the key
+Repairing an agent gives it a brand-new vault key and re-encrypts everything it holds under
+that key, in one step that either completes or changes nothing. A credential that was ever
+exposed stops being able to open what you send next.
+
+And we tell you what that does **not** fix. A secret an agent has already read is out — no
+amount of re-encryption calls it back — so the dashboard lists exactly which credentials to
+replace at their providers, and which ones are handed over in full every time they are used.
+
+> *A new key is only half the job. We show you the other half rather than letting it read
+> as done.*
+
 ---
 
 ## Not yet true — do NOT put these on a page
 
-- **Hardware-sealed local storage.** The broker's own store is protected by file permissions,
-  not by a key you cannot recompute. TPM / Secure Enclave sealing is phase 5.
-- **Argon2id.** Implemented in `app/crypto.py` and not called by anything. PBKDF2 is what runs.
-- **Post-quantum anything.** No hybrid key exchange, no PQ signatures.
+- **Argon2id.** Vendored, verified against the reference implementation, and switched OFF.
+  `NEW_ACCOUNT_KDF` still says PBKDF2, so PBKDF2 is what runs. Do not claim it until the
+  parameters have been measured on a real phone and the constant has been flipped.
+- **"We rotated your exposed credentials."** We cannot. We can only name them; replacing them
+  at the provider is the owner's action and we have no way to verify it happened.
+- **"Sealed" on a machine with no TPM.** Where there is no TPM the key is sealed to systemd's
+  host key, which lives on the same disk — an offline copy plus root DOES open it. Say which
+  kind of sealing the machine actually got.
+- **Post-quantum signatures.** The TRANSPORT is already hybrid post-quantum
+  (X25519MLKEM768, verified) and the vault is symmetric end to end, so both of those are
+  claimable. PQ *signatures* are not — we do not have them.
 - **macOS and Windows brokers.** Linux only. On other platforms the credentials are held by a
   process running as the same user as the agents — say so, do not imply otherwise.
 - **"Hardened encryption" as a phase-4 claim.** Phase 4 added an access boundary. The

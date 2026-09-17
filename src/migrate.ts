@@ -242,6 +242,82 @@ export async function enrol(setupUrl: string): Promise<EnrolResult & { linkBurne
   };
 }
 
+/**
+ * Enrol from a CLAIM CODE rather than a setup link.
+ *
+ * The difference is what the owner carries. A setup link is a bearer credential: read it
+ * within fifteen minutes and you hold the agent's vault key. A claim code names a blob
+ * sealed to this machine's broker key, so reading it gets you ciphertext.
+ *
+ * The flow is otherwise identical to `enrol`, including reusing an existing socket token,
+ * because a repair rotates the VAULT credentials and the socket token is a separate local
+ * identity — replacing it would have a running agent refused by the broker that just
+ * enrolled it, with 'unauthorized' as the only clue.
+ */
+export async function enrolClaim(claimCode: string): Promise<EnrolResult & { linkBurned: boolean }> {
+  const { agentTokenPath } = await import('./paths.js');
+  const path = await import('node:path');
+  const code = claimCode.trim().toUpperCase();
+
+  // Ask WHOSE claim this is first. Reading a claim does not spend it, so this costs one
+  // round trip and removes the same race the link path removes: without it the caller
+  // must mint a token, enrol, learn the name from the reply, and reconcile the file
+  // afterwards — and a running agent whose token was replaced is refused by the broker
+  // that just re-enrolled it, with 'unauthorized' as the only clue.
+  const who = await ask({ action: 'whose_claim', claim_code: code });
+  if (who?.error) throw new Error(who.error);
+  const agentName = String(who?.agent_name ?? '');
+  if (!agentName) throw new Error('The server did not say which agent that claim is for.');
+
+  // Reuse the existing token when there is one. A repair rotates the VAULT credentials;
+  // the socket token is a separate local identity read once at startup by any agent
+  // already running.
+  const tp = agentTokenPath(agentName);
+  let socketToken = '';
+  if (fs.existsSync(tp)) {
+    try {
+      const existing = fs.readFileSync(tp, 'utf8').trim();
+      if (existing.length >= 32) socketToken = existing;
+    } catch { /* unreadable: mint a new one below */ }
+  }
+  const reusedToken = Boolean(socketToken);
+  if (!socketToken) socketToken = crypto.randomBytes(32).toString('hex');
+
+  const reply = await ask({ action: 'enrol_claim', claim_code: code, socket_token: socketToken });
+  if (reply?.error) throw new Error(reply.error);
+  if (!reply?.ok || !reply.agent_name) throw new Error('The broker did not confirm the enrolment.');
+
+  // Written only after the broker has confirmed, and skipped entirely when the value did
+  // not change. Writing first would leave a token file for an agent that does not exist,
+  // which reads as a working setup and is not.
+  if (!reusedToken) {
+    const dir = path.dirname(tp);
+    // chmod unconditionally: mkdir's mode is masked by umask and ignored on a directory
+    // that already exists, and writeFileSync's mode applies only when it creates the file.
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dir, 0o700);
+    fs.writeFileSync(tp, socketToken, { mode: 0o600 });
+  }
+  fs.chmodSync(tp, 0o600);
+
+  return {
+    agent_name: String(reply.agent_name),
+    agent_id: String(reply.agent_id ?? ''),
+    linkBurned: reply.link_burned !== false,
+  };
+}
+
+/** Ask the broker whether this machine is paired, so a caller can pick the right path. */
+export async function pairedStatus(): Promise<{ paired: boolean; fingerprint?: string; account_label?: string }> {
+  const reply = await ask({ action: 'paired' });
+  if (reply?.error) throw new Error(reply.error);
+  return {
+    paired: Boolean(reply?.paired),
+    fingerprint: reply?.fingerprint ? String(reply.fingerprint) : undefined,
+    account_label: reply?.account_label ? String(reply.account_label) : undefined,
+  };
+}
+
 export interface CleanupResult { deleted: boolean; oldUnitStopped: boolean; pending: string[]; }
 
 /**

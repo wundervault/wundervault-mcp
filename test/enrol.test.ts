@@ -129,10 +129,18 @@ describe('the setup link is the authorisation', () => {
     expect(res.agent_name).toBe('Byte');
     expect(burned).toEqual(['tok1']);
 
-    // And the agent can now collect them with its token — the daemon really filed them.
-    const got = await speak(path.join(dir, 'run', 'Byte.sock'), { token: socketToken });
-    expect(got.api_key).toBe('wv_agent_A|secret');
-    expect(got.enc_key).toBe('enc_A');
+    // The daemon really filed them — checked in the BROKER's own state, because that is
+    // where they now live and stay. This used to be proved by asking the socket to hand
+    // the credentials back, which proved the filing and the leak at the same time.
+    const filed = (daemon as any).profiles.find((x: any) => x.agent_name === 'Byte');
+    expect(filed.api_key).toBe('wv_agent_A|secret');
+    expect(filed.enc_key).toBe('enc_A');
+
+    // And the agent, holding the very token that authorises it, cannot get them back.
+    const got = await speak(path.join(dir, 'run', 'Byte.sock'), { token: socketToken, op: 'ping' });
+    expect(got.ok).toBe(true);
+    expect(got.api_key).toBeUndefined();
+    expect(got.enc_key).toBeUndefined();
   });
 
   it('refuses without a setup link — there is no other way in', async () => {
@@ -258,8 +266,9 @@ describe('the token an agent already has survives the move', () => {
 
     // Unchanged on disk, and the daemon answers to it.
     expect(fs.readFileSync(tokenFile, 'utf8').trim()).toBe(existing);
-    const got = await speak(path.join(dir, 'run', 'Byte.sock'), { token: existing });
-    expect(got.api_key).toBe('k2');
+    const got = await speak(path.join(dir, 'run', 'Byte.sock'), { token: existing, op: 'ping' });
+    expect(got.ok).toBe(true);
+    expect((daemon as any).profiles.find((x: any) => x.agent_name === 'Byte').api_key).toBe('k2');
   }, 20_000);
 
   it('mints one when the agent has none, and writes it 0600', async () => {
@@ -273,8 +282,9 @@ describe('the token an agent already has survives the move', () => {
     const tokenFile = path.join(dir, 'home', '.wundervault', 'agents', 'Codex.token');
     expect(fs.statSync(tokenFile).mode & 0o777).toBe(0o600);
     const got = await speak(path.join(dir, 'run', 'Codex.sock'),
-      { token: fs.readFileSync(tokenFile, 'utf8').trim() });
-    expect(got.api_key).toBe('k3');
+      { token: fs.readFileSync(tokenFile, 'utf8').trim(), op: 'ping' });
+    expect(got.ok).toBe(true);
+    expect((daemon as any).profiles.find((x: any) => x.agent_name === 'Codex').api_key).toBe('k3');
   }, 20_000);
 
   it('tells the caller when the link was not burned', async () => {

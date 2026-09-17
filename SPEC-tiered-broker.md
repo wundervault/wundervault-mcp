@@ -19,6 +19,15 @@ So the effort goes where the value is, using the tier that already exists:
 - **Tier 2** — brokered, and the first attempt is refused into the existing approval
   flow. The owner's approval *becomes* the definition.
 
+> **Correction, key custody.** "The key never reaches the agent" was written about this
+> design and was NOT true of the build until key custody shipped. `performOperation` was
+> imported into `src/server.ts` — the MCP server, which runs as the agent's own uid — and
+> the agent held `enc_key`, so it could decrypt any entry itself whatever tier said. The
+> sentence is true now because the operation runs inside the broker
+> (`src/broker-ops.ts`), and `SPEC-key-custody.md` is the change that made it so. It is
+> recorded here rather than quietly fixed, because a spec that silently becomes true is
+> indistinguishable from one that was always being believed.
+
 There is no key-shape detection anywhere: the server cannot read plaintext, and doing it
 in the browser would put "this is an OpenAI key" on the server as metadata for no gain.
 The agent supplies the destination because it is the party that knows it.
