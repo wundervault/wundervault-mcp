@@ -104,8 +104,15 @@ describe('the shape override reaches the macOS layout', () => {
 });
 
 describe('the override cannot manufacture a boundary', () => {
-  it('is false on a platform that has no second uid to offer, whatever the shape says', () => {
-    // The shape relocates state. It does not conjure an account the OS cannot give us.
+  it('is false on a platform that cannot host the layout it was told to use', () => {
+    // The shape relocates state. It does not conjure a layout the OS cannot host.
+    //
+    // These three read `win32` because that is what phase 8 changed and why. Windows CAN
+    // now hold a boundary — its own, an ACL — so the blanket "win32 is never capable"
+    // this replaced is no longer true. What is still true, and is what these assert, is
+    // that the POSIX layouts put sockets at filesystem paths and `listen()` on a
+    // filesystem path is EACCES on Windows. Told to use them, a Windows daemon binds
+    // nothing, so there is nothing to claim.
     expect(paths.splitAvailableFor('win32', 'linux')).toBe(false);
     expect(paths.splitAvailableFor('win32', 'darwin')).toBe(false);
     expect(paths.splitAvailableFor('win32', 'none')).toBe(false);
@@ -114,9 +121,14 @@ describe('the override cannot manufacture a boundary', () => {
   it('is true only where the real platform can actually do it', () => {
     expect(paths.splitAvailableFor('linux', 'linux')).toBe(true);
     expect(paths.splitAvailableFor('darwin', 'darwin')).toBe(true);
+    expect(paths.splitAvailableFor('win32', 'windows')).toBe(true);
     // A capable platform told to use the pre-split layout still has no boundary.
     expect(paths.splitAvailableFor('linux', 'none')).toBe(false);
     expect(paths.splitAvailableFor('darwin', 'none')).toBe(false);
+    expect(paths.splitAvailableFor('win32', 'none')).toBe(false);
+    // And a platform that has neither mechanism is false under every shape.
+    expect(paths.splitAvailableFor('freebsd', 'linux')).toBe(false);
+    expect(paths.splitAvailableFor('freebsd', 'windows')).toBe(false);
   });
 });
 

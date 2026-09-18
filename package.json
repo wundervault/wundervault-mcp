@@ -12,8 +12,7 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
-    "prepublishOnly": "npm run build && npm test",
-    "postinstall": "chmod +x dist/agent.js dist/index.js 2>/dev/null || true"
+    "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
     "mcp",

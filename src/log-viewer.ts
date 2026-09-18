@@ -33,10 +33,9 @@ import { writeFileSync, readFileSync, mkdirSync, chmodSync, accessSync, existsSy
          openSync, closeSync, renameSync, unlinkSync, statSync, constants } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
-import * as net from 'node:net';
 import * as path from 'node:path';
 import { load, defaultStorePath, type NetworkShape } from './network-store.js';
-import { mgmtSocketPath, viewerPath } from './paths.js';
+import { viewerPath } from './paths.js';
 
 /** Escape for embedding inside an HTML text node or attribute. */
 function esc(s: string): string {

@@ -110,11 +110,21 @@ export function loadOrCreateIdentity(): BrokerIdentity {
     if (!st.isFile()) {
       throw new Error(`${p} is not a regular file.`);
     }
-    if ((st.mode & 0o077) !== 0) {
+    // A MODE CHECK, ON THE PLATFORMS THAT HAVE MODES.
+    //
+    // Windows does not. chmod there is a no-op and stat reports 666 for every file on the
+    // volume, so this check fired on every Windows machine -- correctly installed or not --
+    // and refused to start with advice to run `sudo chmod 600`, on an operating system with
+    // neither command. Observed on Windows 10, running as the service account, inside a
+    // directory whose ACL was exactly right.
+    //
+    // What guards this file on Windows is the state directory's ACL, which boundaryIsReal()
+    // checks and verify-windows.ps1 proves from a second account.
+    if (process.platform !== 'win32' && (st.mode & 0o077) !== 0) {
       throw new Error(
         `${p} is mode ${(st.mode & 0o777).toString(8)}, which is readable beyond its owner. `
         + `That key is what every sealed credential on this machine depends on. `
-        + `Fix it with: sudo chmod 600 ${p}`);
+        + `Fix it with: chmod 600 ${p}`);
     }
     privateKeyPem = fs.readFileSync(p, 'utf8');
   } else {

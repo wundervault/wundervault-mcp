@@ -13,9 +13,12 @@
  * "fix" a future bug here is to fetch the ciphertext and open it locally, which would
  * quietly reinstate the thing the phase removed.
  */
-import net from 'node:net';
 import { existsSync, readFileSync } from 'node:fs';
 import { agentSocketPath, agentTokenPath, legacy } from './paths.js';
+import {
+  agentEndpoint, connectToEndpoint, endpointLabel, usesPortFiles,
+  BrokerNotAuthentic, type Endpoint,
+} from './endpoint.js';
 
 /** Long enough for a brokered HTTP call (30s upstream) and a tier-2 wait (~90s). */
 const RPC_TIMEOUT_MS = 150_000;
@@ -26,12 +29,29 @@ export class BrokerUpgradeRequired extends Error {}
 
 export interface BrokerReply { [k: string]: unknown; error?: string; code?: string }
 
-function socketCandidates(agentName: string): Array<{ path: string; legacy: boolean }> {
-  const primary = agentSocketPath(agentName);
-  const out = [{ path: primary, legacy: false }];
-  const old = legacy.agentSocket(agentName);
-  if (old !== primary) out.push({ path: old, legacy: true });
+/**
+ * Every address this agent's broker might be at, best first.
+ *
+ * The pre-split socket in the user's home is still tried, because a machine mid-migration
+ * has to keep working. On Windows there is no pre-split socket to try: `listen()` on a
+ * filesystem path has never worked there, so no Windows machine has ever had one, and
+ * offering it would be a candidate that cannot exist.
+ */
+function endpointCandidates(agentName: string): Array<{ ep: Endpoint; legacy: boolean }> {
+  const out: Array<{ ep: Endpoint; legacy: boolean }> = [
+    { ep: agentEndpoint(agentName), legacy: false },
+  ];
+  if (!usesPortFiles()) {
+    const primary = agentSocketPath(agentName);
+    const old = legacy.agentSocket(agentName);
+    if (old !== primary) out.push({ ep: { kind: 'path', address: old }, legacy: true });
+  }
   return out;
+}
+
+/** Is there anything at this address to try? */
+function endpointExists(ep: Endpoint): boolean {
+  return existsSync(ep.kind === 'path' ? ep.address : ep.file);
 }
 
 export class BrokerClient {
@@ -52,9 +72,14 @@ export class BrokerClient {
    * call costs a unix-socket connect and removes a whole class of "it worked until it
    * had been idle for two minutes" bug.
    */
-  private rpc(sockPath: string, payload: Record<string, unknown>): Promise<BrokerReply> {
+  private async rpc(ep: Endpoint, payload: Record<string, unknown>): Promise<BrokerReply> {
+    // CONNECT FIRST, AND ON WINDOWS DO NOT SPEAK UNTIL THE FAR END HAS PROVED ITSELF.
+    // connectToEndpoint resolves only after the hello is verified, so by the time this
+    // function writes a token it is writing it to something holding the broker's private
+    // key. On the unix-socket platforms it is a plain connect and nothing has changed.
+    const socket = await connectToEndpoint(ep, RPC_TIMEOUT_MS);
+    const label = endpointLabel(ep);
     return new Promise((resolve, reject) => {
-      const socket = net.createConnection(sockPath);
       let buf = '';
       let done = false;
       const finish = (fn: () => void) => {
@@ -69,9 +94,7 @@ export class BrokerClient {
           `The secret broker did not answer within ${Math.round(RPC_TIMEOUT_MS / 1000)}s.`))),
         RPC_TIMEOUT_MS,
       );
-      socket.on('connect', () => {
-        socket.write(JSON.stringify({ token: this.token, ...payload }) + '\n');
-      });
+      socket.write(JSON.stringify({ token: this.token, ...payload }) + '\n');
       socket.on('data', (d) => {
         buf += d.toString();
         // A reply is bounded so a broken or hostile socket cannot grow this without end.
@@ -88,7 +111,7 @@ export class BrokerClient {
         });
       });
       socket.on('error', (e) => finish(() => reject(new BrokerUnavailable(
-        `Could not reach the secret broker at ${sockPath}: ${(e as Error).message}`))));
+        `Could not reach the secret broker at ${label}: ${(e as Error).message}`))));
       socket.on('end', () => {
         if (!buf.includes('\n')) {
           finish(() => reject(new BrokerUnavailable('The broker closed the connection without replying.')));
@@ -111,14 +134,14 @@ export class BrokerClient {
         + `or WUNDERVAULT_AGENT_TOKEN. Re-run enrolment: wundervault-agent --enrol`);
     }
     let lastErr: Error | null = null;
-    for (const cand of socketCandidates(this.agentName)) {
-      if (!existsSync(cand.path)) continue;
+    for (const cand of endpointCandidates(this.agentName)) {
+      if (!endpointExists(cand.ep)) continue;
       try {
-        const reply = await this.rpc(cand.path, { op, ...payload });
+        const reply = await this.rpc(cand.ep, { op, ...payload });
         if (cand.legacy && !this.warnedLegacy) {
           this.warnedLegacy = true;
           process.stderr.write(
-            `[wundervault] Using the pre-split broker socket at ${cand.path}.\n`
+            `[wundervault] Using the pre-split broker socket at ${endpointLabel(cand.ep)}.\n`
             + `[wundervault] That process runs as YOUR user, so its key material and memory\n`
             + `[wundervault] are readable by anything you run, including your agents.\n`
             + `[wundervault] Finish the split: sudo sh packaging/install-daemon.sh\n`);
@@ -129,14 +152,18 @@ export class BrokerClient {
         return reply;
       } catch (e) {
         if (e instanceof BrokerUpgradeRequired) throw e;
+        // A far end that could not prove it is the broker is not a candidate that failed;
+        // it is a stranger holding the address. Stop, and say so — falling through to the
+        // next candidate would be the moment a token gets offered somewhere else.
+        if (e instanceof BrokerNotAuthentic) throw e;
         lastErr = e as Error;
       }
     }
     throw new BrokerUnavailable(
       lastErr?.message
       ?? `wundervault-agent is not running for agent '${this.agentName}'.\n`
-         + `Expected socket: ${agentSocketPath(this.agentName)}\n`
-         + `Install the broker: sudo sh packaging/install-daemon.sh\n`
+         + `Expected at: ${endpointLabel(agentEndpoint(this.agentName))}\n`
+         + `Install the broker: ${installerHint()}\n`
          + `Then enrol:        wundervault-agent --enrol`);
   }
 
@@ -174,3 +201,12 @@ export function brokerClient(): BrokerClient {
 
 /** Test seam. */
 export function _resetBrokerClient(): void { _client = null; }
+
+/** The install command for this platform, for a message someone has to act on. */
+function installerHint(): string {
+  if (process.platform === 'win32') {
+    return 'powershell -ExecutionPolicy Bypass -File packaging\\install-daemon-windows.ps1  (as Administrator)';
+  }
+  if (process.platform === 'darwin') return 'sudo sh packaging/install-daemon-macos.sh';
+  return 'sudo sh packaging/install-daemon.sh';
+}

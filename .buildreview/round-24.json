@@ -1,0 +1,320 @@
+{
+  "verdict": "revise",
+  "summary": "The build establishes the intended Windows account split, TCP transport, machine identity, scheduled task, and two-account verification on the measured Windows host. It does not yet hold up under reinstall, hostile pre-existing filesystem state, or verifier failure conditions: ACL repair is incomplete, reparse-point protection is raceable, the installer can report success for a dead task, and the verifier can hang or accept a merely plausible signature.",
+  "spec_check": [
+    {
+      "requirement": "1. `npm install -g <tarball>` on Windows exits 0, with no `chmod` and no `|| true`.",
+      "status": "met",
+      "evidence": "The package reports this was observed end to end on Windows 10 and exited 0."
+    },
+    {
+      "requirement": "2. The same install on Linux and macOS still sets the executable bit on `dist/agent.js` and `dist/index.js`.",
+      "status": "partial",
+      "evidence": "The package-install implementation is not included; only the unchanged Linux suite result is reported."
+    },
+    {
+      "requirement": "3. `wundervault-agent` on a fresh Windows box with no broker installed starts and serves, printing the pre-split warning.",
+      "status": "met",
+      "evidence": "The Windows identity branch is present and the package reports the fresh Windows startup passed."
+    },
+    {
+      "requirement": "4. `machineIdentity()` on Windows returns a stable non-null value across two runs.",
+      "status": "met",
+      "evidence": "`windowsMachineIdentity()` combines SMBIOS and MachineGuid, and the package reports the real-machine check passed."
+    },
+    {
+      "requirement": "5. `machineIdentityFromSources(smbios, machineGuid)` returns `null` when both sources are absent or degenerate, and drops a degenerate source while keeping a good one.",
+      "status": "met",
+      "evidence": "The pure function rejects malformed, all-zero, all-FF, and one named placeholder value while retaining a usable source."
+    },
+    {
+      "requirement": "`identity = sha256(\"wv-win:\" + <smbios uuid or \"\"> + \":\" + <MachineGuid or \"\">)`.",
+      "status": "unmet",
+      "evidence": "The implementation instead hashes labeled, conditionally omitted components such as `wv-win:smbios=<value>:machineguid=<value>`."
+    },
+    {
+      "requirement": "6. With no broker installed, an agent on Windows completes a real tool call against a daemon running as the same user.",
+      "status": "met",
+      "evidence": "The package reports this was observed on win199."
+    },
+    {
+      "requirement": "7. The daemon writes `<agent>.port` and `mgmt.port` containing the port it actually bound, and deletes them on clean exit.",
+      "status": "partial",
+      "evidence": "The daemon now uses endpoint publication and calls `releaseEndpoint()` during shutdown, but the endpoint implementation and an observed clean-exit deletion are not included."
+    },
+    {
+      "requirement": "8. A daemon that cannot bind, or cannot write a discovery file, refuses loudly and does not fall back to another port.",
+      "status": "unmet",
+      "evidence": "The shown per-agent failure callback logs the error, closes only that server, and leaves the daemon running unless the omitted `listenOn()` independently terminates the process."
+    },
+    {
+      "requirement": "9. An agent whose discovery file names a port answered by a process that cannot produce the broker's signature refuses without sending its token.",
+      "status": "partial",
+      "evidence": "`withHello()` is installed on Windows endpoints, but the client verification and fake-listener test are in omitted files; the verifier itself only checks for a signature-shaped field."
+    },
+    {
+      "requirement": "10. The handshake is Windows-only; Linux and Darwin retain the prior Unix-socket protocol.",
+      "status": "partial",
+      "evidence": "`helloSigner` remains null unless `usesPortFiles()` is true, but `usesPortFiles()` and `withHello()` are in omitted files."
+    },
+    {
+      "requirement": "11. A non-administrator that is not the service account is denied read and list on the state directory.",
+      "status": "met",
+      "evidence": "The package reports an observed two-account denial on win199, and the verifier performs both list and key-read attempts from its probe account."
+    },
+    {
+      "requirement": "12. That non-administrator can read the run directory, connect to the daemon, and complete a tool call with its own token.",
+      "status": "met",
+      "evidence": "The package reports this passed on win199; the verifier independently demonstrates run-directory listing and a management ping, although the supplied verifier does not exercise a per-agent tokenized tool call."
+    },
+    {
+      "requirement": "13. `boundaryIsReal()` returns false for the pre-split root, wrong account, outsider ACL, enabled inheritance, or outsider owner.",
+      "status": "partial",
+      "evidence": "The package states the round-23 owner and inheritance defects were fixed and covered by shape tests, but `paths.ts` is intentionally omitted."
+    },
+    {
+      "requirement": "14. `boundaryIsReal()` returns true only in the installed configuration.",
+      "status": "met",
+      "evidence": "The real Windows verifier reportedly received `boundary: true` from the installed broker."
+    },
+    {
+      "requirement": "15. Granting `Users:(R)` on the state root flips the boundary check to false at the next start.",
+      "status": "met",
+      "evidence": "The package reports this exact mutation was observed to flip the broker's answer to false."
+    },
+    {
+      "requirement": "31. A second broker refuses to start while one is already serving.",
+      "status": "partial",
+      "evidence": "`refuseIfAlreadyServing()` probes the existing management record before startup, but the shown preflight is not atomic with publication; any additional exclusion inside omitted endpoint code is unverified."
+    },
+    {
+      "requirement": "32. An unrecognised option does not start a broker.",
+      "status": "met",
+      "evidence": "Arguments beginning with `-` that are not handled earlier cause an error and exit status 2 before daemon construction."
+    },
+    {
+      "requirement": "33. The hello handshake decodes no partial UTF-8.",
+      "status": "partial",
+      "evidence": "The package states the round-23 chunk-decoding defect was fixed, but `withHello()` is omitted from this review."
+    },
+    {
+      "requirement": "34. A connection that never completes the handshake is closed on a deadline.",
+      "status": "partial",
+      "evidence": "The package states the deadline was added after round 23, but the implementation is in the omitted endpoint module."
+    },
+    {
+      "requirement": "16. The Windows installer is idempotent and does not rotate the store key.",
+      "status": "partial",
+      "evidence": "A clean second run was observed not to rotate the key, but the ACL operations do not repair pre-existing explicit ACEs, so reinstall does not always leave the specified ACLs."
+    },
+    {
+      "requirement": "17. It grants `SeBatchLogonRight`, sets deny-interactive and deny-network logon, and the task runs.",
+      "status": "partial",
+      "evidence": "The script configures all four rights and the task ran on win199, but SID matching is substring-based and the installer does not fail when the started task immediately exits."
+    },
+    {
+      "requirement": "18. It creates the account with a random password it never writes to disk and does not return.",
+      "status": "met",
+      "evidence": "The password is generated from 48 random bytes, passed as a SecureString to account creation and as an in-process cmdlet argument to task registration, then nulled; it is not placed in a native-process argument list or output."
+    },
+    {
+      "requirement": "19. It writes `state\\store.key` as 32 random bytes with the state ACL, reports `local-file`, and reports BitLocker status.",
+      "status": "partial",
+      "evidence": "The key generation and BitLocker report are present and `local-file` was observed, but existing explicit ACEs on the directory or key are not removed."
+    },
+    {
+      "requirement": "20. It refuses to run without administrator rights, naming the elevation it needs.",
+      "status": "met",
+      "evidence": "The initial WindowsPrincipal check exits with an Administrator-PowerShell instruction."
+    },
+    {
+      "requirement": "21. The installer must not follow a pre-existing reparse point at `store.key` or `broker-key.pem`.",
+      "status": "unmet",
+      "evidence": "`Assert-NotReparsePoint` is a separate check before later path use, and no reparse check is made for the parent Base, State, or Run directories."
+    },
+    {
+      "requirement": "22. `verify-windows.ps1` exits non-zero if any required check fails, and a skipped check is not counted as a pass.",
+      "status": "unmet",
+      "evidence": "The verifier counts explicit failures correctly, but its direct TCP verification has no connect/read deadline and can hang forever instead of exiting non-zero; its signature checks also do not verify the signature."
+    },
+    {
+      "requirement": "23. The verifier performs the two-account test itself, creating and removing its own unprivileged probe account.",
+      "status": "met",
+      "evidence": "The script creates a probe account, runs the checks as a limited scheduled task, removes the account, and the package reports the test passed on win199."
+    },
+    {
+      "requirement": "24. The full existing suite passes unchanged on Linux.",
+      "status": "met",
+      "evidence": "The package reports 554 unit tests passing on Linux."
+    },
+    {
+      "requirement": "25. `platformShape()` still throws on an unrecognised override, now accepting `windows`.",
+      "status": "partial",
+      "evidence": "The relevant implementation and tests are omitted, though the package reports 42 Windows-shape tests."
+    },
+    {
+      "requirement": "26. Windows cannot host Linux or Darwin layouts; Linux can take the Windows layout but does not thereby gain a real boundary.",
+      "status": "partial",
+      "evidence": "The relevant `splitAvailableFor()` and `boundaryIsReal()` implementation is omitted; the package says the shape suite covers the revised behavior."
+    },
+    {
+      "requirement": "27. Migration on Windows is permitted only when source and destination are genuinely different places.",
+      "status": "partial",
+      "evidence": "Migration code is not included in this review package."
+    },
+    {
+      "requirement": "28. Non-ASCII characters do not appear in daemon console output on Windows.",
+      "status": "unmet",
+      "evidence": "`consoleSafe()` replaces six punctuation classes but leaves all other non-ASCII characters unchanged and bypasses Buffer writes."
+    },
+    {
+      "requirement": "29. `/limitations` gains the Windows row and accurately describes ACL, administrator, sandboxing, and hardware-sealing limits.",
+      "status": "partial",
+      "evidence": "The documentation file is not included; the installer itself prints equivalent limitations."
+    },
+    {
+      "requirement": "30. No customer-facing copy calls Windows supported until the required real-machine checks have been observed.",
+      "status": "partial",
+      "evidence": "The package reports the named real-machine checks passed, but the customer-facing copy is not included."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "packaging/install-daemon-windows.ps1",
+      "line": null,
+      "claim": "`Set-ExplicitAcl` does not create an explicit allowlist because `/inheritance:r` removes only inherited ACEs and `/grant` leaves unrelated explicit ACEs in place.",
+      "failure_scenario": "After an existing broker account or administrator grants `Users:(RX)` explicitly on `%ProgramData%\\wundervault\\state`, rerunning the installer retains that ACE, starts the broker, and prints that the directory is the boundary even though every local user can still read it.",
+      "suggested_direction": "Replace each managed DACL with the exact intended owner and ACE set, including removal of all pre-existing explicit entries not in that set, and verify the resulting ACL before proceeding."
+    },
+    {
+      "id": "F2",
+      "severity": "major",
+      "file": "packaging/install-daemon-windows.ps1",
+      "line": null,
+      "claim": "The reparse-point defense is check-then-use and does not validate the Base, State, or Run path components, so an elevated reinstall can still follow an attacker-controlled junction or a leaf swapped after the check.",
+      "failure_scenario": "Before a reinstall, a compromised broker account uses its full access on `%ProgramData%\\wundervault` to replace `state` with a directory junction to another location; the installer accepts the parent path, then writes `store.key` through that junction with Administrator authority.",
+      "suggested_direction": "Validate every path component without following reparse points and perform key creation through a directory handle or another no-follow, atomic mechanism so the validated object cannot be swapped before the write."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "packaging/install-daemon-windows.ps1",
+      "line": null,
+      "claim": "The installer prints the task state and last result but never treats a stopped or failed broker task as an installation failure.",
+      "failure_scenario": "Pass an existing non-Node executable as `-NodePath` and an existing file as `-AgentPath`; registration and `Start-ScheduledTask` succeed, the process exits immediately with a nonzero result, and the installer still reaches `Done` and exits 0.",
+      "suggested_direction": "Require the task to remain running and require its broker endpoint to become available within a bounded startup period; otherwise fail the installation with the task result."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "packaging/install-daemon-windows.ps1",
+      "line": null,
+      "claim": "`RightWith` tests for an existing SID by substring rather than by comma-delimited SID equality.",
+      "failure_scenario": "If the broker SID ends in `-1001` and an existing right contains only another local SID ending in `-10010`, the regex finds `-1001` inside `-10010`, omits the broker SID from all four configured rights, and the scheduled task can lack `SeBatchLogonRight` despite the installer reporting it granted.",
+      "suggested_direction": "Parse each privilege-right value into complete principal tokens, normalize the optional leading `*`, and compare exact SID values before rebuilding the line."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "packaging/verify-windows.ps1",
+      "line": null,
+      "claim": "The verifier's direct TCP handshake has no connection or read deadline, so a failed required check can hang forever instead of producing a nonzero verdict.",
+      "failure_scenario": "A stale `mgmt.port` names a listener that accepts TCP but never sends a hello banner; the final verification blocks indefinitely in `$reader.ReadLine()` and never reaches its failure count or exit code.",
+      "suggested_direction": "Put bounded deadlines around connect, hello-banner read, and ping-response read, and convert every timeout into a failed required check."
+    },
+    {
+      "id": "F6",
+      "severity": "major",
+      "file": "packaging/verify-windows.ps1",
+      "line": null,
+      "claim": "The verifier labels the broker response signed without verifying the ECDSA signature against `broker.pub` or the nonce, port, and server ID.",
+      "failure_scenario": "A process squatting the stale published port returns a banner with the recorded `server_id` and an arbitrary string longer than 40 characters in `sig`; both `broker_signed=YES` and `the broker signs the handshake` pass even though no broker private key was used.",
+      "suggested_direction": "Import the published SPKI and cryptographically verify the signature over the exact protocol transcript used by agents before counting the handshake as signed."
+    },
+    {
+      "id": "F7",
+      "severity": "major",
+      "file": "packaging/verify-windows.ps1",
+      "line": null,
+      "claim": "The verifier takes over and then deletes any pre-existing account or scheduled task that uses its fixed probe names.",
+      "failure_scenario": "If a legitimate local account named `wv-verify-probe` already exists, the verifier resets its password, sets `$probeMade` true, and deletes the account in `finally`; an unrelated task named `wv-verify-probe` is likewise deleted before and after the test.",
+      "suggested_direction": "Refuse on name collisions or generate unique account and task names, and remove only objects that this invocation successfully created."
+    },
+    {
+      "id": "F8",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": 1113,
+      "claim": "Unless the omitted `listenOn()` independently terminates the process, a per-agent discovery publication failure closes only that agent server and leaves a partially serving daemon instead of refusing startup.",
+      "failure_scenario": "Give one existing `<agent>.port` file a DACL that denies the broker account deletion or replacement while leaving the management path writable; that agent's publication fails, its server is dropped, but management and other agents remain up, contrary to the required loud daemon refusal.",
+      "suggested_direction": "Treat failure to bind or publish any configured endpoint as a fatal startup failure, clean up all already-published endpoints, and exit nonzero."
+    },
+    {
+      "id": "F9",
+      "severity": "minor",
+      "file": "src/agent.ts",
+      "line": 316,
+      "claim": "`machineIdentityFromSources()` does not implement the specified identity derivation string.",
+      "failure_scenario": "For SMBIOS UUID `11111111-1111-1111-1111-111111111111` and MachineGuid `22222222-2222-2222-2222-222222222222`, the spec hashes `wv-win:111...:222...`, while the code hashes `wv-win:smbios=111...:machineguid=222...`, producing a different derived store key.",
+      "suggested_direction": "Choose and document one canonical byte sequence before release, then make the implementation and tests use that exact sequence so later conformance changes do not orphan derived stores."
+    },
+    {
+      "id": "F10",
+      "severity": "minor",
+      "file": "src/agent.ts",
+      "line": 124,
+      "claim": "`consoleSafe()` is punctuation transliteration rather than the specified guarantee that Windows daemon output contains no non-ASCII characters.",
+      "failure_scenario": "An agent named `Jos\u00e9` reaches the per-agent endpoint error path; `profile.agent_name` is written through `consoleSafe()`, which leaves `\u00e9` unchanged, so non-ASCII output still reaches the Windows console.",
+      "suggested_direction": "Either enforce ASCII for all Windows console text, including dynamic values and Buffer writes, or narrow the acceptance claim to the specific punctuation that is actually transliterated."
+    },
+    {
+      "id": "F11",
+      "severity": "minor",
+      "file": "src/agent.ts",
+      "line": 190,
+      "claim": "The boundary warning falsely says the daemon is running as the agents' user whenever an installed Windows ACL is weakened.",
+      "failure_scenario": "After a correct install, grant `Users:(R)` on the state directory and restart the scheduled task; `boundaryIsReal()` correctly returns false, but the warning says the daemon is running as the same user as the agents even though it is still running as `wundervault` and the actual defect is the ACL grant.",
+      "suggested_direction": "Describe the failed boundary without asserting a shared account unless the account check itself established that fact."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The combined machine identity is unstable when one source is transiently unavailable.",
+      "why_it_matters": "A pre-install daemon can create a derived-key store using both SMBIOS and MachineGuid, then fail to open it on a later boot where CIM times out and only MachineGuid is collected; a subsequent successful CIM run changes it back again."
+    },
+    {
+      "id": "B2",
+      "concern": "The installer resets an existing broker account password before ACL and task registration are known to succeed.",
+      "why_it_matters": "A failure during `secedit`, ACL setup, or key creation leaves the old scheduled task holding obsolete credentials, so a currently running broker may look healthy until reboot and then silently stop starting."
+    },
+    {
+      "id": "B3",
+      "concern": "The script grants `SeBatchLogonRight` but does not detect an effective `SeDenyBatchLogonRight` inherited through account membership or later Group Policy replacement.",
+      "why_it_matters": "Enterprise machines can register the task successfully yet never run it, and policy refresh can undo a once-working local grant after verification."
+    },
+    {
+      "id": "B4",
+      "concern": "New evidence in this Windows installer shows that `NodePath` and `AgentPath` are checked only for existence, not for owner-writable ACLs.",
+      "why_it_matters": "If either executable or package tree is writable by the human account that runs agents, an agent can replace the broker code and have Task Scheduler execute it as the dedicated account, completely bypassing the state-directory boundary."
+    },
+    {
+      "id": "B5",
+      "concern": "The verifier adds each temporary account SID to `SeBatchLogonRight` but never removes that SID from local security policy.",
+      "why_it_matters": "Repeated verification leaves an accumulating list of orphaned SIDs and makes the verifier materially modify machine policy beyond the lifetime of its claimed temporary account."
+    },
+    {
+      "id": "B6",
+      "concern": "Unless the omitted endpoint layer adds atomic exclusion, the second-broker check is a preflight race rather than a lock.",
+      "why_it_matters": "Two brokers launched before either publishes `mgmt.port` can both pass `anotherBrokerIsServing()`, bind different ephemeral ports, and race to publish discovery files, recreating the split-brain condition check 31 is intended to prevent."
+    }
+  ],
+  "_meta": {
+    "round": 24,
+    "at": "2026-09-18T20:47:09+00:00",
+    "package_bytes": 106297,
+    "schema_problems": []
+  }
+}

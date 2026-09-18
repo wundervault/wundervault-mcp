@@ -1,0 +1,226 @@
+{
+  "verdict": "revise",
+  "summary": "This round adds Windows loopback-TCP discovery, broker authentication, Windows principal handling, and ACL-based path selection while preserving the Unix-socket path on POSIX. The nonce handshake is cryptographically sound against stale-port replay, but the build does not yet hold up because Linux can incorrectly activate the Windows split, an attacker-created Windows state directory can capture credentials, and the ACL check can report a boundary while inheritance remains enabled.",
+  "spec_check": [
+    {
+      "requirement": "1. `npm install -g <tarball>` on Windows exits 0, with no `chmod` and no `|| true`.",
+      "status": "met",
+      "evidence": "The `postinstall` command was removed from package.json, and the package reports a successful real Windows installation."
+    },
+    {
+      "requirement": "2. The same install on Linux and macOS still sets the executable bit on `dist/agent.js` and `dist/index.js`.",
+      "status": "met",
+      "evidence": "The package reports testing installation from a tarball whose files began at mode 0644 and observing npm install them as 0755."
+    },
+    {
+      "requirement": "3. `wundervault-agent` on a fresh Windows box with no broker installed starts and serves, printing the pre-split warning.",
+      "status": "met",
+      "evidence": "The package reports this behavior was observed on win199, although the responsible src/agent.ts code is not included."
+    },
+    {
+      "requirement": "4. `machineIdentity()` on Windows returns a stable non-null value across two runs, and it is not the value any other machine would produce.",
+      "status": "partial",
+      "evidence": "The package reports successful Windows startup, but machineIdentity() is in withheld src/agent.ts and the stated test result does not provide the two-run and second-machine evidence."
+    },
+    {
+      "requirement": "5. `machineIdentityFromSources(smbios, machineGuid)` rejects absent or degenerate sources and retains a good source.",
+      "status": "partial",
+      "evidence": "The package says degenerate-UUID rejection was sabotage-tested, but neither the implementation nor its test matrix is included."
+    },
+    {
+      "requirement": "6. With no broker installed, an agent on Windows completes a real tool call against a daemon running as the same user.",
+      "status": "partial",
+      "evidence": "The endpoint code supports a user-root TCP endpoint, but src/agent.ts and src/server.ts are withheld and the reported installed two-account test is not this exact pre-split scenario."
+    },
+    {
+      "requirement": "7. The daemon writes `<agent>.port` and `mgmt.port` containing the bound port and deletes them on clean exit.",
+      "status": "partial",
+      "evidence": "listenOn() records server.address().port and releaseEndpoint() removes a record, but the unseen daemon code must call these helpers for every endpoint and on every clean-exit path."
+    },
+    {
+      "requirement": "8. A daemon that cannot bind, or cannot write a discovery file, refuses loudly and does not fall back.",
+      "status": "partial",
+      "evidence": "Discovery-write failure calls onError and closes the server without retrying; bind-error handling depends on the unseen src/agent.ts because listenOn() itself does not attach a server `error` handler."
+    },
+    {
+      "requirement": "9. A fake listener unable to produce the broker signature is rejected before the token is sent.",
+      "status": "met",
+      "evidence": "connectToEndpoint() sends only a fresh nonce, verifies the P-256 signature over the nonce, discovery port, and discovery server_id, and resolves the socket only after verification; the package also reports sabotage-testing this check."
+    },
+    {
+      "requirement": "10. The handshake is Windows-only and POSIX retains its Unix-socket path without a nonce.",
+      "status": "met",
+      "evidence": "usesPortFiles() is true only for the Windows shape, path endpoints bypass the handshake, and withHello() returns the original handler object for non-Windows shapes."
+    },
+    {
+      "requirement": "11. A second non-administrator account is denied read and list access to the Windows state directory.",
+      "status": "met",
+      "evidence": "The package reports this was observed from a third non-administrator account on win199."
+    },
+    {
+      "requirement": "12. That non-administrator can read the run directory, connect, and complete a tool call with its token.",
+      "status": "met",
+      "evidence": "The package reports the same third account reached the broker and received a signed answer."
+    },
+    {
+      "requirement": "13. `boundaryIsReal()` returns false when the location or account is wrong, an outside principal is allowed, or inheritance is enabled.",
+      "status": "partial",
+      "evidence": "The code checks the account, pre-split location, parsed allow principals, and inherited ACEs, but the ACL report omits the ACL protection flag and therefore cannot detect enabled inheritance when no inherited ACE currently exists; see F3."
+    },
+    {
+      "requirement": "14. `boundaryIsReal()` returns true only in the installed configuration.",
+      "status": "unmet",
+      "evidence": "An attacker-prepared state directory can be selected by windowsStateRoot(), and an unprotected ACL with only explicit allowed entries can pass windowsAclIsPrivate(); see F2 and F3."
+    },
+    {
+      "requirement": "15. Granting `Users:(R)` after installation flips the boundary result to false at the next start.",
+      "status": "met",
+      "evidence": "BROAD_SIDS includes the Users SID and the package reports observing the flip to false and back to true on win199."
+    },
+    {
+      "requirement": "16. The Windows installer is idempotent and does not rotate the store key.",
+      "status": "partial",
+      "evidence": "The package reports an installed verifier run, but the installer script is withheld until round 24, so idempotence and key preservation cannot be inspected."
+    },
+    {
+      "requirement": "17. The installer grants batch logon, denies interactive and network logon, and the task runs.",
+      "status": "partial",
+      "evidence": "The daemon reportedly ran under the dedicated account, but the withheld installer is the only evidence for the three account-right assignments."
+    },
+    {
+      "requirement": "18. The installer creates the account with a random password that is neither written to disk nor returned.",
+      "status": "partial",
+      "evidence": "The responsible PowerShell source is not included in this round."
+    },
+    {
+      "requirement": "19. The installer writes a 32-byte random `state\\store.key`, `sealKind()` reports `local-file`, and BitLocker status is reported honestly.",
+      "status": "partial",
+      "evidence": "paths.ts now reads the Windows state key and reports local-file when present, but key generation and manage-bde reporting are in the withheld installer."
+    },
+    {
+      "requirement": "20. The installer refuses to run without administrator rights and names the required elevation.",
+      "status": "partial",
+      "evidence": "The installer is not included for review."
+    },
+    {
+      "requirement": "21. The installer does not follow pre-existing reparse points at `store.key` or `broker-key.pem`.",
+      "status": "partial",
+      "evidence": "The relevant installer operations are not included for review."
+    },
+    {
+      "requirement": "22. The Windows verifier exits non-zero for any failure, and skipped checks are not counted as passes.",
+      "status": "partial",
+      "evidence": "A 24/24 verifier run is reported, but verify-windows.ps1 is withheld, so its failure and skip semantics cannot be checked."
+    },
+    {
+      "requirement": "23. The verifier creates and removes its own unprivileged probe account for the two-account test.",
+      "status": "partial",
+      "evidence": "A third-account test is reported, but the withheld verifier must be inspected to establish that it creates and removes that account itself."
+    },
+    {
+      "requirement": "24. The full existing suite passes unchanged on Linux.",
+      "status": "met",
+      "evidence": "The package reports 550 passing Linux tests."
+    },
+    {
+      "requirement": "25. `platformShape()` still throws on an unrecognised override, now accepting `windows`.",
+      "status": "met",
+      "evidence": "platformShape() explicitly accepts linux, darwin, windows, and none and throws for every other nonempty override."
+    },
+    {
+      "requirement": "26. `splitAvailableFor('linux', 'windows')` is false and `splitAvailableFor('win32', 'linux')` is false.",
+      "status": "unmet",
+      "evidence": "The second case is false, but the function deliberately returns true for the first case because every split-capable non-Windows real platform accepts every non-none shape; see F1."
+    },
+    {
+      "requirement": "27. Migration on Windows is permitted only when source and destination are genuinely different places.",
+      "status": "partial",
+      "evidence": "Only the management transport portion of migrate.ts is shown; the unchanged same-place refusal and its interaction with conditional windowsStateRoot() cannot be verified from the excerpt."
+    },
+    {
+      "requirement": "28. Non-ASCII characters do not appear in daemon console output on Windows.",
+      "status": "partial",
+      "evidence": "New endpoint error messages shown here are ASCII, but the daemon startup and warning output is in withheld src/agent.ts."
+    },
+    {
+      "requirement": "29. `/limitations` documents the Windows ACL boundary, administrator access, lack of sandboxing, and non-hardware-sealed key.",
+      "status": "partial",
+      "evidence": "No documentation files are included in this round."
+    },
+    {
+      "requirement": "30. No customer-facing copy calls Windows supported before all required real-machine checks are observed.",
+      "status": "partial",
+      "evidence": "The package reports the principal real-machine checks, but customer-facing copy and the verifier implementation are not included."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/paths.ts",
+      "line": null,
+      "claim": "`splitAvailableFor('linux', 'windows')` returns true, directly contradicting acceptance check 26 and allowing a Linux process to activate a Windows mechanism it cannot enforce.",
+      "failure_scenario": "Run on Linux with `WUNDERVAULT_PLATFORM_SHAPE=windows`: SPLIT_CAPABLE contains Linux, the shape is not `none`, and the non-win32 branch returns true, so systemRoot() enters windowsStateRoot(), uses Windows-shaped paths and ACL probing, and uses port endpoints instead of remaining pre-split as the spec requires.",
+      "suggested_direction": "Require the real platform and requested boundary mechanism to match for split availability; keep Windows-shape CI coverage through explicit pure-function seams rather than claiming that Linux can supply a Windows boundary."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/paths.ts",
+      "line": null,
+      "claim": "windowsStateRoot() treats any inheritance-free ACL without a broad-group allow as an installed state root, even when an unrelated local user owns and can read that directory.",
+      "failure_scenario": "Before installation, local user Mallory creates `C:\\ProgramData\\wundervault\\state`, disables inheritance, and grants only Mallory and victim Alice access; when Alice starts a fresh uninstalled daemon, `ours` is false but windowsAclIsRestricted() returns true because neither SID is in BROAD_SIDS, so Alice's credentials are written into Mallory's directory instead of Alice's profile.",
+      "suggested_direction": "For a non-service process, recognize the installed root only from an exact installed ACL tied to the independently resolved service-account SID and the permitted system principals; arbitrary narrow ACLs must fall back to the user's profile."
+    },
+    {
+      "id": "F3",
+      "severity": "blocker",
+      "file": "src/paths.ts",
+      "line": null,
+      "claim": "The ACL report contains only access entries, so boundaryIsReal() can return true while ACL inheritance is enabled.",
+      "failure_scenario": "Create a state directory whose DACL is not protected but whose parent currently contributes no inheritable ACEs, and add explicit allows only for the service account, SYSTEM, and Administrators; readAclReport() emits only those entries, every `inherited` field is false, and windowsAclIsPrivate() returns true despite acceptance check 13 requiring false whenever inheritance is enabled.",
+      "suggested_direction": "Report and validate the ACL's inheritance-protection property itself, rather than inferring protection from whether an inherited ACE happens to be present at that moment."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "src/paths.ts",
+      "line": null,
+      "claim": "On Windows, the public `WUNDERVAULT_PRINCIPAL_ID` environment variable overrides the current account SID, so principalId() is not actually an identity of the current account.",
+      "failure_scenario": "Local user Bob obtains Alice's enumerable SID, sets `WUNDERVAULT_PRINCIPAL_ID` to that SID, and starts the same agent name; lock.ts derives Alice's machine-global lock address, allowing Bob to occupy it and make Alice receive a false credential-in-use refusal, recreating the cross-account exclusion the SID change was meant to eliminate.",
+      "suggested_direction": "Do not accept a caller-controlled principal override in production Windows processes; provide test injection through a test-only seam that cannot affect spawned production commands."
+    },
+    {
+      "id": "F5",
+      "severity": "minor",
+      "file": "src/endpoint.ts",
+      "line": null,
+      "claim": "withHello() decodes each TCP chunk independently and re-encodes buffered bytes, so handing a non-hello or pipelined request to the real handler can corrupt valid UTF-8 split across chunks.",
+      "failure_scenario": "A client sends a newline-delimited JSON request whose purpose contains `\u00e9`, with the two UTF-8 bytes split between TCP data events; each `d.toString('utf8')` produces a replacement character, and handOff() emits altered bytes, so the real handler receives a different purpose string than the client sent.",
+      "suggested_direction": "Preserve unconsumed transport data as bytes, or use a streaming UTF-8 decoder that retains incomplete sequences, and hand the exact remaining bytes to the existing handler."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The ACL model checks allow entries but not the state directory's owner.",
+      "why_it_matters": "On Windows an owner can change the DACL even when no allow ACE names that owner; a directory owned by an unprivileged attacker could therefore pass the displayed allow-list check and later be reopened by that attacker. The installer and boundary check need an explicit ownership policy, which the current spec does not state."
+    },
+    {
+      "id": "B2",
+      "concern": "withHello() has no handshake deadline and does not invoke the existing connection handler until a newline or more than 4096 decoded characters arrive.",
+      "why_it_matters": "Any local process can open many loopback connections and send nothing, leaving sockets indefinitely outside the real handler's timeout and cleanup logic until the daemon exhausts descriptors or connection capacity."
+    },
+    {
+      "id": "B3",
+      "concern": "Because src/agent.ts is not shown, it is unverified whether a daemon-wide singleton prevents two broker processes from publishing the same discovery filenames.",
+      "why_it_matters": "Without such exclusion, two processes can bind different OS-assigned ports and overwrite the same `.port` file; the older process can then delete the newer process's record during clean shutdown, making a healthy broker undiscoverable."
+    }
+  ],
+  "_meta": {
+    "round": 23,
+    "at": "2026-09-18T20:36:08+00:00",
+    "package_bytes": 99416,
+    "schema_problems": []
+  }
+}

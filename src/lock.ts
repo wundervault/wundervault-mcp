@@ -75,6 +75,7 @@ import net from 'node:net';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
+import { principalId } from './paths.js';
 
 export interface Holder {
   pid: number | null;
@@ -140,8 +141,8 @@ function addressKey(): string {
   // The abstract namespace and the loopback port range are MACHINE-global, not
   // per-user, so the uid belongs in the key: without it two OS accounts on one
   // box exclude each other over credentials they do not share.
-  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
-  const digest = createHash('sha256').update(`${uid}:${agentName()}`).digest('hex').slice(0, 12);
+  const digest = createHash('sha256')
+    .update(`${principalId()}:${agentName()}`).digest('hex').slice(0, 12);
   return `${slug().slice(0, 32)}-${digest}`;
 }
 
@@ -169,8 +170,13 @@ function addressPort(): number {
   // The port range is MACHINE-global, not per-user, so the uid belongs in the digest:
   // without it two OS accounts on one box exclude each other over credentials they do not
   // share.
-  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
-  const digest = createHash('sha256').update(`wundervault-mcp:${uid}:${agentName()}`).digest();
+  // principalId(), not `getuid() : 0`. The comment two lines up is the specification and
+  // on Windows the code contradicted it: getuid is undefined there, so every account got
+  // principal 0, and two users running an agent of the same name derived the SAME PORT —
+  // each telling the other its credential was already in use, over credentials they do not
+  // share. Measured on Windows 10, 2026-09-18.
+  const digest = createHash('sha256')
+    .update(`wundervault-mcp:${principalId()}:${agentName()}`).digest();
   return 20000 + (digest.readUInt16BE(0) % 12768);
 }
 

@@ -32,6 +32,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 /** The packaged default. Overridable for tests and for a non-standard install. */
 export const DEFAULT_SYSTEM_ROOT = '/var/lib/wundervault';
@@ -61,6 +62,27 @@ export const SYSTEM_ACCOUNT = 'wundervault';
 export const DARWIN_BASE = '/var/lib/wundervault';
 export const DARWIN_SYSTEM_ROOT = `${DARWIN_BASE}/state`;
 export const DARWIN_ACCOUNT = '_wundervault';
+
+/**
+ * Windows, where the same shape is built out of a different mechanism.
+ *
+ *   %ProgramData%\wundervault        everyone may traverse; holds nothing readable
+ *   %ProgramData%\wundervault\state  THE BOUNDARY — an ACL, not a mode
+ *   %ProgramData%\wundervault\run    everyone reads; only the account writes
+ *
+ * Run is a SIBLING of state for the same reason as macOS and by a different route: on
+ * macOS 0700 denies search permission to the agents, on Windows the state ACL simply does
+ * not name them. Either way the agents must reach their endpoint, and the endpoint must
+ * not live behind the boundary.
+ *
+ * `%ProgramData%` rather than `/var/lib`, which on Windows silently becomes `C:\var\lib`
+ * — a directory the daemon would create successfully and then fail to use, which is the
+ * quiet version of this bug that `platformShape()` already warns about below.
+ */
+export const WINDOWS_BASE = (): string =>
+  path.join(process.env.ProgramData || 'C:\\ProgramData', 'wundervault');
+export const WINDOWS_SYSTEM_ROOT = (): string => path.join(WINDOWS_BASE(), 'state');
+export const WINDOWS_ACCOUNT = 'wundervault';
 
 /**
  * Daemon-owned state.
@@ -100,14 +122,15 @@ export const DARWIN_ACCOUNT = '_wundervault';
  * And neither of them is what we tell the user. That is `boundaryIsReal()`, below, which
  * looks at the directory rather than at the operating system.
  */
-export type PlatformShape = 'linux' | 'darwin' | 'none';
+export type PlatformShape = 'linux' | 'darwin' | 'windows' | 'none';
 
 /** Platforms on which a second uid is actually reachable. NOT overridable. */
-const SPLIT_CAPABLE = new Set(['linux', 'darwin']);
+const SPLIT_CAPABLE = new Set(['linux', 'darwin', 'win32']);
 
 function shapeFor(platform: string): PlatformShape {
   if (platform === 'linux') return 'linux';
   if (platform === 'darwin') return 'darwin';
+  if (platform === 'win32') return 'windows';
   return 'none';
 }
 
@@ -119,10 +142,11 @@ function shapeFor(platform: string): PlatformShape {
 export function platformShape(): PlatformShape {
   const override = process.env.WUNDERVAULT_PLATFORM_SHAPE;
   if (override) {
-    if (override !== 'linux' && override !== 'darwin' && override !== 'none') {
+    if (override !== 'linux' && override !== 'darwin' && override !== 'windows'
+        && override !== 'none') {
       throw new Error(
         `WUNDERVAULT_PLATFORM_SHAPE=${JSON.stringify(override)} is not one of ` +
-        `linux, darwin, none.`,
+        `linux, darwin, windows, none.`,
       );
     }
     return override;
@@ -137,7 +161,22 @@ export function platformShape(): PlatformShape {
  * relocates state, it does not conjure an account the operating system cannot give us.
  */
 export function splitAvailableFor(realPlatform: string, shape: PlatformShape): boolean {
-  return SPLIT_CAPABLE.has(realPlatform) && shape !== 'none';
+  if (shape === 'none') return false;
+  if (!SPLIT_CAPABLE.has(realPlatform)) return false;
+  // WINDOWS CANNOT HOST A POSIX LAYOUT, and this is not pedantry about tidiness. The
+  // linux and darwin shapes put unix domain sockets at filesystem paths, and `listen()`
+  // on a filesystem path returns EACCES on Windows — measured, Node 22 on Windows 10.
+  // Under either override a Windows daemon would bind nothing at all, so there is no
+  // boundary to claim and the pre-split layout is the right answer.
+  //
+  // The reverse is deliberately permitted: a Linux box may be told to use the darwin or
+  // windows layout, because exercising another platform's paths from CI is the only
+  // defence against the failure mode that put this project here twice — code on a path
+  // nobody can run until a customer runs it. What stops that becoming a false claim is
+  // boundaryIsReal(), which looks at the directory: under the windows shape it wants
+  // icacls, which a Linux box does not have, and answers false.
+  if (realPlatform === 'win32') return shape === 'windows';
+  return true;
 }
 
 /** True where the daemon CAN hold a real privilege boundary. Not that it does. */
@@ -150,8 +189,76 @@ export function systemRoot(): string {
   // Where there is no system account and no unit, the daemon is the user, as before.
   if (!splitAvailable()) return userRoot();
   if (platformShape() === 'darwin') return DARWIN_SYSTEM_ROOT;
+  if (platformShape() === 'windows') return windowsStateRoot();
   return DEFAULT_SYSTEM_ROOT;
 }
+
+/**
+ * The Windows state root, WHICH IS CONDITIONAL, and the condition is not fussiness.
+ *
+ * On Linux and macOS the system root is returned unconditionally and a daemon that has not
+ * been installed gets EACCES creating it — a loud, correct "run the installer". That does
+ * not work here, because `C:\ProgramData` grants Users the right to create subdirectories.
+ * An uninstalled Windows daemon would therefore SUCCEED in creating
+ * `%ProgramData%\wundervault\state`, inherit ProgramData's ACL, and store every
+ * credential on the machine in a directory the other accounts on that machine can read.
+ * Pre-split state in the owner's own profile is not a boundary either, but it is at least
+ * private to the owner — so the uninstalled case would be a REGRESSION dressed as progress.
+ *
+ * The rule: use the installed location only when it exists AND its ACL is actually
+ * private. A rogue process that pre-creates the directory to redirect the daemon gets
+ * inherited ACEs, fails the check, and the daemon quietly stays in the owner's profile and
+ * says it has no boundary — which is the truth in both cases.
+ *
+ * Cached, because it costs an `icacls` subprocess and the answer cannot change under a
+ * running daemon without the install changing under it too.
+ */
+let cachedWindowsRoot: string | null = null;
+
+function windowsStateRoot(): string {
+  if (cachedWindowsRoot) return cachedWindowsRoot;
+  const installed = WINDOWS_SYSTEM_ROOT();
+  let use = userRoot();
+  try {
+    if (fs.statSync(installed).isDirectory()) {
+      // WE ARE THE SERVICE ACCOUNT: this directory is ours, whatever its ACL says today.
+      //
+      // The first version fell back whenever the ACL was not private, and that is wrong
+      // for an INSTALLED machine. Widening the state ACL -- a bad group policy, a careless
+      // icacls, an attacker -- made the daemon quietly relocate to the service account's
+      // own profile, leave a stale discovery file pointing at a port it no longer held,
+      // and strand every credential in the store it had walked away from. Observed: after
+      // granting Users:(RX), every agent got "connection refused" and the broker was
+      // simply gone.
+      //
+      // Linux does not do that, and neither should this. A widened directory is a
+      // boundary that is GONE, not a store that is someone else's: boundaryIsReal() says
+      // so loudly, the startup warning prints, and the credentials keep working. Refusing
+      // to serve protects nothing and strands everything -- the same argument
+      // deriveMachineKey() makes about a store it cannot verify.
+      //
+      // The fallback still does its one job, which is the UNINSTALLED case: C:\ProgramData
+      // lets any account create a subdirectory, so a rogue could pre-create this path to
+      // capture credentials from a daemon that has never been installed. A rogue cannot be
+      // the service account -- that account exists only because the installer made it.
+      let ours = false;
+      try { ours = os.userInfo().username.toLowerCase() === expectedAccount().toLowerCase(); }
+      catch { ours = false; }
+
+      if (ours) {
+        use = installed;
+      } else {
+        const report = readAclReport(installed);
+        if (report !== null && windowsAclIsRestricted(report, principalId())) use = installed;
+      }
+    }
+  } catch { /* not installed, or unreadable: stay in the owner's profile */ }
+  cachedWindowsRoot = use;
+  return use;
+}
+
+/** Exported so a test can make the decision again after changing the world. */
+export function _resetWindowsRootCacheForTests(): void { cachedWindowsRoot = null; }
 
 /**
  * The agent's own directory: its token, and its view of things.
@@ -167,6 +274,53 @@ export function systemRoot(): string {
  * anything into a user's home (see `dropToSudoUser` in log-viewer.ts). A root process must
  * not follow paths that an unprivileged account can rearrange under it.
  */
+/**
+ * WHO WE ARE, for the purposes of keying something that is machine-global.
+ *
+ * Every derivation in this codebase that needs "this account, not another one on the same
+ * box" was written as `process.getuid?.() ?? 0`. On Windows `getuid` is undefined, so the
+ * fallback fires and EVERY ACCOUNT ON THE MACHINE IS PRINCIPAL 0. `lock.ts` says in a
+ * comment that the uid is in its port digest so that "two OS accounts on one box [do not]
+ * exclude each other over credentials they do not share" — and on Windows that is precisely
+ * what happened: two users, same agent name, same derived port, and one of them told its
+ * credential was already in use.
+ *
+ * On POSIX this returns the uid as a string, so the derived values are bit-for-bit what
+ * they were. On Windows it returns the account SID, which is the uid's actual counterpart:
+ * unique per account, stable across renames, and machine-local.
+ *
+ * The SID costs a subprocess, so it is read once and cached. If it cannot be read we fall
+ * back to the lowercased username — weaker (a renamed account changes principal) but still
+ * per-account, which is the property that was missing.
+ */
+let cachedPrincipal: string | null = null;
+
+export function principalId(): string {
+  const uid = (process as unknown as { getuid?: () => number }).getuid?.();
+  if (uid !== undefined) return String(uid);
+  if (cachedPrincipal) return cachedPrincipal;
+
+  // NO ENVIRONMENT OVERRIDE. There was one, for tests that turned out not to need it, and
+  // it was a hole: this value keys the lock port and the derived store key, so a variable
+  // an agent can set is a variable an agent can use to answer as a different principal.
+  // The other overrides in this file relocate state or choose a layout; none of them says
+  // WHO WE ARE, and this one must not either.
+  try {
+    const out = execFileSync('whoami', ['/user', '/fo', 'csv', '/nh'], {
+      encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const m = out.match(/"(S-1-[0-9-]+)"/);
+    if (m) { cachedPrincipal = m[1]; return cachedPrincipal; }
+  } catch { /* fall through to the username */ }
+
+  try { cachedPrincipal = os.userInfo().username.toLowerCase(); }
+  catch { cachedPrincipal = 'unknown-principal'; }
+  return cachedPrincipal;
+}
+
+/** Exported so a test can force the Windows path to be re-read. */
+export function _resetPrincipalCacheForTests(): void { cachedPrincipal = null; }
+
 export function userRoot(): string {
   return process.env.WUNDERVAULT_USER_ROOT || path.join(os.homedir(), '.wundervault');
 }
@@ -190,7 +344,13 @@ export function runtimeDir(): string {
   const run = `/run/${SYSTEM_ACCOUNT}`;
   let linuxRunExists = false;
   try { linuxRunExists = fs.existsSync(run); } catch { /* treat as absent */ }
-  return runtimeDirFor(platformShape(), systemRoot(), linuxRunExists);
+  const root = systemRoot();
+  // Is the state root a directory belonging to somebody the agent is not? That is the
+  // whole condition for putting the sockets beside it rather than inside it.
+  let rootIsSeparate = true;
+  try { rootIsSeparate = path.resolve(root) !== path.resolve(userRoot()); }
+  catch { rootIsSeparate = true; }
+  return runtimeDirFor(platformShape(), root, linuxRunExists, rootIsSeparate);
 }
 
 /**
@@ -210,10 +370,22 @@ export function runtimeDirFor(
   shape: PlatformShape,
   root: string,
   linuxRunExists: boolean,
+  rootIsSeparate = true,
 ): string {
-  // A SIBLING of the state directory, never a child. The state directory is 0700, which
-  // denies search permission to the agents that have to reach these sockets.
-  if (shape === 'darwin') return path.join(path.dirname(root), 'run');
+  // A SIBLING of the state directory, never a child. The state directory is 0700 on macOS
+  // and ACL'd to the account on Windows; either way the agents that have to reach these
+  // endpoints are shut out of it.
+  //
+  // ONLY WHEN THE STATE ROOT IS SOMEBODY ELSE'S, and that qualifier was missing for one
+  // run on Windows. Pre-split, the state root IS the agent's own `~/.wundervault`, so the
+  // sibling of it is `C:\Users\<you>\run` — a directory this daemon helpfully created in
+  // the root of the user's home profile, next to Documents. Observed on Windows 10.
+  //
+  // There is nothing to be outside of when there is no boundary: pre-split the run
+  // directory belongs INSIDE the root, exactly where the pre-split layout always put it.
+  if ((shape === 'darwin' || shape === 'windows') && rootIsSeparate) {
+    return path.join(path.dirname(root), 'run');
+  }
   if (linuxRunExists) return `/run/${SYSTEM_ACCOUNT}`;
   return path.join(root, 'run');
 }
@@ -238,11 +410,20 @@ export function systemdCredential(name = CREDENTIAL_NAME): Buffer | null {
   const dir = process.env.CREDENTIALS_DIRECTORY;
   if (dir) candidates.push(path.join(dir, name));
   candidates.push(path.join(runtimeDir(), 'store.key'));
-  // macOS has no systemd and nothing that unseals on our behalf, so the installer writes a
-  // RANDOM key into the state directory at 0600, owned by the daemon account. It is not
-  // sealed and the startup report must not say it is — but it is not DERIVED either, which
-  // is the difference that matters: nobody can recompute it from public inputs.
-  if (platformShape() === 'darwin') candidates.push(storeKeyPath());
+  // macOS and Windows have no systemd and nothing that unseals on our behalf, so the
+  // installer writes a RANDOM key into the state directory -- 0600 on macOS, and on Windows
+  // an ACL naming only the account, SYSTEM and Administrators. It is not sealed and the
+  // startup report must not say it is — but it is not DERIVED either, which is the
+  // difference that matters: nobody can recompute it from public inputs.
+  //
+  // WINDOWS WAS MISSING FROM THIS LIST for one run, and the symptom was quiet: the
+  // installer wrote a perfectly good random key, the daemon never looked at it, and
+  // reported key_mode=derived — a key recomputable by anyone who can read the directory —
+  // while a 32-byte secret sat unread beside the store. Caught by the verifier asking the
+  // daemon what key it was actually using, rather than by anyone reading this line.
+  if (platformShape() === 'darwin' || platformShape() === 'windows') {
+    candidates.push(storeKeyPath());
+  }
 
   for (const p of candidates) {
     try {
@@ -286,9 +467,14 @@ export type SealKind = 'tpm' | 'host' | 'local-file' | null;
 export function sealKind(): SealKind {
   const declared = process.env.WUNDERVAULT_SEAL_KIND;
   if (declared === 'tpm' || declared === 'host' || declared === 'local-file') return declared;
-  // Undeclared on darwin but the file is there: the installer wrote it and did not get to
-  // set the variable, or the daemon was started by hand. Report what is actually in use.
-  if (platformShape() === 'darwin') {
+  // Undeclared but the file is there: the installer wrote it and did not get to set the
+  // variable, or the daemon was started by hand. Report what is actually in use.
+  //
+  // This is the ONLY route on Windows, where a scheduled task carries no environment of
+  // its own the way a systemd unit or a launchd plist does -- so the file on disk is the
+  // whole of the evidence and there is nothing to declare it.
+  const shape = platformShape();
+  if (shape === 'darwin' || shape === 'windows') {
     try { if (fs.statSync(storeKeyPath()).size >= 32) return 'local-file'; } catch { /* none */ }
   }
   return null;
@@ -421,7 +607,9 @@ export function ensureSystemRoot(root = systemRoot()): void {
     if (code === 'EACCES' || code === 'EPERM') {
       const installer = process.platform === 'darwin'
         ? 'sudo sh packaging/install-daemon-macos.sh'
-        : 'sudo sh packaging/install-daemon.sh';
+        : process.platform === 'win32'
+          ? 'powershell -ExecutionPolicy Bypass -File packaging\\install-daemon-windows.ps1  (as Administrator)'
+          : 'sudo sh packaging/install-daemon.sh';
       throw new Error(
         `Cannot use ${root}: permission denied.\n` +
         `  The secret broker needs its own account, and the privileged install step has\n` +
@@ -432,11 +620,12 @@ export function ensureSystemRoot(root = systemRoot()): void {
     }
     throw err;
   }
-  // The mode check is the BOUNDARY on Linux and merely hygiene elsewhere, where the
-  // directory belongs to the same user the agents run as. Refusing to start over it off
-  // Linux would block a daemon on a platform that never claimed the boundary — Windows in
-  // particular reports modes that do not mean what they say.
-  if (!splitAvailable()) return;
+  // The mode check is the BOUNDARY on Linux and macOS. It is NOT one on Windows, and this
+  // guard is now load-bearing rather than cautious: measured on Windows 10, chmod(0o700)
+  // followed by stat() returns 666, every time, for every directory. Leaving the check in
+  // would refuse to start on a correctly installed Windows box. The Windows boundary is an
+  // ACL and is checked in boundaryIsReal(), against icacls, which reports what is real.
+  if (!splitAvailable() || platformShape() === 'windows') return;
   const mode = fs.statSync(root).mode & 0o777;
   if (mode !== 0o700) {
     throw new Error(
@@ -496,13 +685,248 @@ export function runningAsDaemonAccount(root = systemRoot()): boolean {
  * agent is not". When the state root IS the agent's own directory, there is nobody else.
  */
 export function expectedAccount(): string {
+  const shape = platformShape();
   return process.env.WUNDERVAULT_SYSTEM_ACCOUNT
-    || (platformShape() === 'darwin' ? DARWIN_ACCOUNT : SYSTEM_ACCOUNT);
+    || (shape === 'darwin' ? DARWIN_ACCOUNT : shape === 'windows' ? WINDOWS_ACCOUNT : SYSTEM_ACCOUNT);
+}
+
+/**
+ * The allowed holders of the Windows state directory.
+ *
+ * The service account, because it is the daemon. SYSTEM and Administrators, because they
+ * are outside every boundary on this operating system exactly as root is on Linux, and
+ * pretending otherwise would be the false claim this file exists to prevent.
+ * TrustedInstaller because Windows puts it on things and removing it fights the OS.
+ *
+ * `Users`, `Authenticated Users` and `Everyone` are the ones this is looking for. Any of
+ * them means the agents can read the store, which is the whole boundary gone.
+ */
+/**
+ * Well-known SIDs, because NAMES ARE LOCALISED AND SIDS ARE NOT.
+ *
+ * The first version of this read `icacls` output and compared the text against
+ * "administrators" and "system". On a German or Japanese Windows those strings are
+ * `Administratoren` and `SYSTEM`/`システム`, so the check would have failed closed on a
+ * perfectly installed machine and reported no boundary — or, with a looser comparison,
+ * failed OPEN. A security check that depends on the display language is not a check.
+ */
+const SID_SYSTEM = 'S-1-5-18';
+const SID_ADMINISTRATORS = 'S-1-5-32-544';
+const SID_TRUSTED_INSTALLER =
+  'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464';
+/** The ones this is actually looking for: anything that means "other people". */
+const SID_USERS = 'S-1-5-32-545';
+const SID_EVERYONE = 'S-1-1-0';
+const SID_AUTHENTICATED_USERS = 'S-1-5-11';
+const SID_INTERACTIVE = 'S-1-5-4';
+const BROAD_SIDS = new Set([
+  SID_USERS, SID_EVERYONE, SID_AUTHENTICATED_USERS, SID_INTERACTIVE,
+]);
+
+export interface AclEntry {
+  allow: boolean;
+  inherited: boolean;
+  sid: string;
+}
+
+/**
+ * Parse the ACL report the daemon asks PowerShell for.
+ *
+ * One entry per line, `Allow;False;S-1-5-32-544`. Generated rather than scraped: the
+ * report is produced by translating each IdentityReference to a SecurityIdentifier, so
+ * what arrives here is already language-independent.
+ *
+ * PURE. The thing that can silently return the wrong answer is the parsing, and the
+ * parsing has to be testable on a machine that is not Windows — phase 7 learned that twice
+ * and this file is where both lessons live.
+ */
+export interface AclReport {
+  /** Is inheritance switched OFF on this directory? */
+  protected: boolean;
+  /** Who owns it, which is a party the DACL need not mention. */
+  owner: string | null;
+  entries: AclEntry[];
+}
+
+export function parseAclReport(report: string): AclReport {
+  const out: AclEntry[] = [];
+  let isProtected = false;
+  let owner: string | null = null;
+
+  for (const raw of report.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const parts = line.split(';');
+
+    if (parts.length === 2 && /^PROTECTED$/i.test(parts[0].trim())) {
+      isProtected = /^true$/i.test(parts[1].trim());
+      continue;
+    }
+    if (parts.length === 2 && /^OWNER$/i.test(parts[0].trim())) {
+      const v = parts[1].trim().toUpperCase();
+      owner = /^S-1-[0-9-]+$/.test(v) ? v : null;
+      continue;
+    }
+
+    if (parts.length < 3) continue;
+    const sid = parts[2].trim().toUpperCase();
+    if (!/^S-1-[0-9-]+$/.test(sid)) continue;
+    out.push({
+      allow: /^allow$/i.test(parts[0].trim()),
+      inherited: /^true$/i.test(parts[1].trim()),
+      sid,
+    });
+  }
+  return { protected: isProtected, owner, entries: out };
+}
+
+/**
+ * Is this directory closed to the other accounts on the machine?
+ *
+ * The weaker of the two questions, and the one `windowsStateRoot()` asks before it agrees
+ * to store credentials somewhere. It does not care WHO owns the directory — only that
+ * `Users`, `Everyone` and friends are not on it, and that nothing is inherited.
+ *
+ * Inheritance is fatal on its own: an inherited ACE means access is whatever the parent
+ * says today and whatever it says tomorrow. `C:\ProgramData` grants Users the right to
+ * create subdirectories, so a directory created there and left with inherited permissions
+ * is readable by every account on the box.
+ */
+export function windowsAclIsRestricted(report: string, ourSid: string): boolean {
+  // PRIVATE TO US, not merely "no broad groups on it", and the difference is an attack.
+  //
+  // The weaker rule accepted any inheritance-free directory with no Users/Everyone grant.
+  // So a second local account could pre-create %ProgramData%\wundervault\state, remove
+  // inheritance, and grant exactly two principals -- itself and you. Nothing broad is on
+  // it, so the check passed, your daemon adopted the directory, and every credential it
+  // stored was readable by the account that laid the trap.
+  //
+  // The uninstalled case is the only one this governs, so "us" is whoever is running.
+  return windowsAclIsPrivate(report, ourSid);
+}
+
+/**
+ * Is this directory private to the broker's own account?
+ *
+ * The strong question, and the one the startup report is allowed to answer `true` to.
+ * Every ALLOW entry must name the service account, SYSTEM, Administrators or
+ * TrustedInstaller. Deny entries are ignored: a deny only ever narrows.
+ *
+ * SYSTEM and Administrators are inside the wall, and saying so is the point rather than an
+ * embarrassment — they are outside every boundary on this operating system exactly as root
+ * is on Linux, and `/limitations` says the same thing about both.
+ */
+export function windowsAclIsPrivate(report: string, accountSid: string): boolean {
+  const allowed = new Set([
+    SID_SYSTEM, SID_ADMINISTRATORS, SID_TRUSTED_INSTALLER, accountSid.toUpperCase(),
+  ]);
+  const parsed = parseAclReport(report);
+  if (parsed.entries.length === 0) return false;
+
+  // Inheritance must be switched OFF, not merely unused. See readAclReport.
+  if (!parsed.protected) return false;
+
+  // The owner is inside the wall whether the DACL says so or not.
+  if (!parsed.owner || !allowed.has(parsed.owner)) return false;
+
+  let sawAllow = false;
+  for (const e of parsed.entries) {
+    if (e.inherited) return false;
+    if (!e.allow) continue;
+    sawAllow = true;
+    if (!allowed.has(e.sid)) return false;
+  }
+  return sawAllow;
+}
+
+/**
+ * Ask Windows for the ACL, in SIDs.
+ *
+ * A PowerShell subprocess, once, at startup — and `-NonInteractive` and a timeout because
+ * a daemon must not be able to hang on a shell.
+ */
+export function readAclReport(target: string): string | null {
+  try {
+    // THE PATH TRAVELS IN THE ENVIRONMENT, and that is not a style choice.
+    //
+    // The first version passed it as a trailing argv element and read it as `$args[0]`.
+    // `powershell -Command` takes the REST OF THE LINE as the command, so the extra
+    // argument was never bound: `$args[0]` was empty, Get-Acl threw, the catch returned
+    // null, and every Windows daemon silently concluded it had no boundary and fell back
+    // to the pre-split layout. It failed identically on a perfectly installed machine and
+    // on one that had never run the installer, which is why it took running it to find.
+    //
+    // An environment variable also removes the quoting question entirely: nothing about
+    // the path is parsed by PowerShell, so a directory name containing a quote or a
+    // backtick is data rather than an injection site.
+    return execFileSync('powershell', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+      "$ErrorActionPreference='Stop';$a = Get-Acl -LiteralPath $env:WV_ACL_TARGET;" +
+      // WHETHER INHERITANCE IS SWITCHED OFF, which is NOT the same question as whether any
+      // entry happens to be inherited today. A directory can have inheritance enabled and
+      // show no inherited entries, simply because its parent has no inheritable ones yet --
+      // and the day the parent gains one, it flows straight in. AreAccessRulesProtected is
+      // the flag; the per-entry IsInherited is only its visible consequence.
+      '"PROTECTED;$($a.AreAccessRulesProtected)";' +
+      // AND THE OWNER, which on Windows is a party the DACL does not have to mention. An
+      // owner always holds READ_CONTROL and WRITE_DAC implicitly, so an account that owns
+      // this directory can grant itself access whenever it likes, and a DACL that excludes
+      // it excludes it only until it decides otherwise. A boundary whose owner is the
+      // agent's own account is not a boundary; it is a locked door with the key taped to it.
+      "$o = try { $a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } " +
+      "catch { 'UNKNOWN' }; " +
+      '"OWNER;$o";' +
+      "$a.Access | ForEach-Object { " +
+      "$s = try { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } " +
+      "catch { $_.IdentityReference.Value }; " +
+      '"$($_.AccessControlType);$($_.IsInherited);$s" }',
+    ], {
+      encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, WV_ACL_TARGET: target },
+    });
+  } catch { return null; }
+}
+
+/**
+ * The Windows half of boundaryIsReal(), separated because nothing it checks is a uid.
+ *
+ * There is no euid and no mode here — measured: chmod is a no-op and stat().uid is 0 for
+ * every file on the volume. What IS real is the ACL (a non-administrator was denied read
+ * and list on an ACL'd directory, observed on Windows 10 with two accounts), so the ACL is
+ * what gets checked.
+ */
+function windowsBoundaryIsReal(root: string): boolean {
+  // Same check as everywhere else, and the same reason: an owner who starts the daemon by
+  // hand gets a directory they own, and it is not a boundary against the agents they also
+  // run.
+  try {
+    if (os.userInfo().username.toLowerCase() !== expectedAccount().toLowerCase()) return false;
+  } catch { return false; }
+
+  // The pre-split location passes an ACL test trivially — it is the owner's own directory.
+  try {
+    if (fs.realpathSync(root) === fs.realpathSync(userRoot())) return false;
+  } catch {
+    if (path.resolve(root) === path.resolve(userRoot())) return false;
+  }
+
+  try { if (!fs.statSync(root).isDirectory()) return false; } catch { return false; }
+
+  // Our own SID. principalId() returns it on Windows; if it fell back to a username there
+  // is no SID to compare and we cannot vouch for the ACL.
+  const sid = principalId();
+  if (!/^S-1-[0-9-]+$/i.test(sid)) return false;
+
+  const report = readAclReport(root);
+  if (report === null) return false;   // cannot see the ACL, cannot promise it
+  return windowsAclIsPrivate(report, sid);
 }
 
 export function boundaryIsReal(root = systemRoot()): boolean {
+  if (platformShape() === 'windows') return windowsBoundaryIsReal(root);
+
   const geteuid = (process as unknown as { geteuid?: () => number }).geteuid;
-  if (typeof geteuid !== 'function') return false; // Windows: no uids, no boundary.
+  if (typeof geteuid !== 'function') return false; // no uids, no boundary.
   const euid = geteuid.call(process);
   if (euid === 0) return false;
 

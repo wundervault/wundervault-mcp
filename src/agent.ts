@@ -30,6 +30,7 @@
  */
 import net from 'node:net';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -38,9 +39,16 @@ import { redeemSetupLink, peekAgentName } from './enrol.js';
 import {
   systemRoot, profilesPath, saltPath, mgmtSocketPath, agentSocketPath,
   runtimeDir, ensureSystemRoot, safeName, SYSTEM_ACCOUNT, mgmtDir, networkStorePath,
-  splitAvailable, systemdCredential, sealKind, boundaryIsReal,
+  splitAvailable, systemdCredential, sealKind, boundaryIsReal, principalId, platformShape,
+  expectedAccount,
   type SealKind,
 } from './paths.js';
+import {
+  agentEndpoint, mgmtEndpoint, listenOn, withHello, releaseEndpoint, publishBrokerPublicKey,
+  helloSignerFrom, usesPortFiles, anotherBrokerIsServing, endpointLabel,
+  type Endpoint, type HelloSigner,
+} from './endpoint.js';
+import { loadOrCreateIdentity } from './broker-key.js';
 import { load as loadNetworkShape } from './network-store.js';
 import { BrokerOps } from './broker-ops.js';
 import type { BrokeredOp } from './ssh-agent.js';
@@ -106,12 +114,85 @@ interface ProfileStore {
  * "the key never reaches the agent", and on macOS today that is true only of an agent that
  * does not try.
  */
+/**
+ * The Windows console does not render what we write.
+ *
+ * Node writes UTF-8; `cmd.exe` and the default PowerShell host read the machine's OEM code
+ * page, so the em-dash in the startup warning came out as `?"` on Windows 10 — observed.
+ * A boundary warning that looks like a mis-decoded string is a boundary warning people
+ * stop reading.
+ *
+ * Transliteration rather than `chcp 65001`, because changing the console's code page is a
+ * side effect on the user's terminal that outlives the process, and this is six characters.
+ */
+export function consoleSafe(text: string): string {
+  if (process.platform !== 'win32') return text;
+  const pretty = text
+    .replace(/[\u2014\u2013]/g, '-')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201c\u201d]/g, '"')
+    .replace(/\u2026/g, '...')
+    .replace(/\u00a0/g, ' ');
+
+  // AND THEN EVERYTHING ELSE, because the promise is "no non-ASCII reaches the Windows
+  // console", not "the punctuation I happened to type is handled". Our own prose is not the
+  // only thing that gets printed here: agent names, file paths, and upstream error messages
+  // all flow through, and an agent called `José` put a raw non-ASCII byte straight back on
+  // the console the transliteration list was written to keep clear.
+  //
+  // Escaped rather than replaced with '?', so a name that needed mangling is still
+  // identifiable in the log rather than turned into a different name.
+  // eslint-disable-next-line no-control-regex
+  return pretty.replace(/[^\x00-\x7f]/g, (c) =>
+    `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
+/** Every daemon message goes through here, so the transliteration cannot be forgotten. */
+function say(text: string): void { console.error(consoleSafe(text)); }
+
+/**
+ * Apply it to EVERYTHING, once, at the stream.
+ *
+ * Routing each console.error through consoleSafe() by hand is the version of this fix that
+ * decays: there are twenty of them, new ones get added, and the one that matters is
+ * whichever message a person is reading when something has gone wrong. Wrapping the two
+ * streams catches those, the ones thrown from inside errors, and the ones written by code
+ * that has not been born yet.
+ *
+ * Windows only, and a no-op that returns false everywhere else — the streams on Linux and
+ * macOS are not touched at all.
+ */
+export function installConsoleTransliteration(): boolean {
+  if (process.platform !== 'win32') return false;
+  for (const stream of [process.stdout, process.stderr]) {
+    const original = stream.write.bind(stream);
+    (stream as unknown as { write: (...a: unknown[]) => boolean }).write =
+      (chunk: unknown, ...rest: unknown[]): boolean => {
+        if (typeof chunk === 'string') {
+          return (original as (...a: unknown[]) => boolean)(consoleSafe(chunk), ...rest);
+        }
+        return (original as (...a: unknown[]) => boolean)(chunk, ...rest);
+      };
+  }
+  return true;
+}
+
+/** The privileged install command for this platform. */
+export function installerCommand(platform: string = process.platform): string {
+  if (platform === 'darwin') return 'sudo sh packaging/install-daemon-macos.sh';
+  if (platform === 'win32') {
+    return 'powershell -ExecutionPolicy Bypass -File packaging\\install-daemon-windows.ps1'
+      + '   (in an Administrator prompt)';
+  }
+  return 'sudo sh packaging/install-daemon.sh';
+}
+
 function announceBoundary(): void {
   if (boundaryIsReal()) return;
 
   // Two different situations, and telling them apart is the whole value of the message.
   if (!splitAvailable()) {
-    console.error(
+    say(
       `[wundervault-agent] Running on ${process.platform}, where the secret broker cannot\n` +
       `[wundervault-agent] have its own account. State is in your own directory and it runs as\n` +
       `[wundervault-agent] YOU — so its key material and memory are readable by anything you\n` +
@@ -122,16 +203,37 @@ function announceBoundary(): void {
 
   // The platform CAN do this and the install has not been done — or has been undone. Said
   // separately because the fix is a command, not a wait for a future release.
-  const installer = process.platform === 'darwin'
-    ? 'sudo sh packaging/install-daemon-macos.sh'
-    : 'sudo sh packaging/install-daemon.sh';
-  console.error(
-    `[wundervault-agent] No privilege boundary: ${systemRoot()} is not a 0700 directory\n` +
-    `[wundervault-agent] owned by a separate account, so this daemon is running as the same\n` +
-    `[wundervault-agent] user as the agents it serves. Its key material and memory are\n` +
-    `[wundervault-agent] readable by anything you run.\n` +
-    `[wundervault-agent]   ${installer}`,
-  );
+  //
+  // The Windows sentence says ACL rather than 0700, because 0700 is meaningless there:
+  // chmod is a no-op and stat reports 666 for every file on the volume. Telling a Windows
+  // user to look for a mode would send them hunting something that cannot exist.
+  const shape = platformShape();
+  const what = shape === 'windows'
+    ? `is not a directory whose ACL is limited to the broker's own account`
+    : `is not a 0700 directory\n[wundervault-agent] owned by a separate account`;
+
+  // TWO DIFFERENT FAILURES, AND ONE SENTENCE WAS BEING USED FOR BOTH.
+  //
+  // "this daemon is running as the same user as the agents it serves" is the uninstalled
+  // case. On a machine where the install DID take and someone then widened the ACL, the
+  // daemon is still its own account -- the directory is simply open -- and saying it runs
+  // as you is false. This file's whole discipline is that a warning must not be the wrong
+  // warning, and a reader who is told the wrong thing goes looking in the wrong place.
+  let sameUser = true;
+  try { sameUser = os.userInfo().username.toLowerCase() !== expectedAccount().toLowerCase(); }
+  catch { sameUser = true; }
+
+  const consequence = sameUser
+    ? `[wundervault-agent] so this daemon is running as the same user as the agents it\n` +
+      `[wundervault-agent] serves. Its key material and memory are readable by anything you run.\n` +
+      `[wundervault-agent]   ${installerCommand()}`
+    : `[wundervault-agent] This daemon IS running as its own account (${expectedAccount()}),\n` +
+      `[wundervault-agent] but that directory is open to more than that account -- so the\n` +
+      `[wundervault-agent] separation is not doing anything. Its contents are readable by\n` +
+      `[wundervault-agent] whoever the directory lets in. Re-run the installer to reset it:\n` +
+      `[wundervault-agent]   ${installerCommand()}`;
+
+  say(`[wundervault-agent] No privilege boundary: ${systemRoot()} ${what}.\n${consequence}`);
 }
 
 /**
@@ -227,12 +329,105 @@ export function machineIdentity(): string | null {
     } catch { /* no ioreg, or it failed */ }
   }
 
+  // WINDOWS HAS NEITHER OF THE OTHER TWO, AND SAYING SO IS THE WHOLE POINT.
+  //
+  // Before this branch existed machineIdentity() returned null on every Windows machine,
+  // and phase 7's keyModeFor() turns a null identity with no existing store into `refuse`.
+  // So the daemon did not start at all on a fresh Windows box — observed on Windows 10
+  // 22H2, 2026-09-18. The comment above keyModeFor called that branch "unreachable on any
+  // machine that has /etc/machine-id or ioreg, which is all of them". Windows is not.
+  if (process.platform === 'win32') return windowsMachineIdentity();
+
   try {
     const id = fs.readFileSync('/etc/machine-id', 'utf8').trim();
     if (id) return id;
   } catch { /* not linux, or a container without one */ }
 
   return null;
+}
+
+/**
+ * TWO SOURCES, COMBINED, BECAUSE EACH ONE FAILS IN A DIFFERENT WAY.
+ *
+ * `MachineGuid` (HKLM\SOFTWARE\Microsoft\Cryptography) is generated when Windows is
+ * installed. It is the exact shape of thing the macOS bug was about: it travels with a
+ * disk image, so two machines cloned from one image share it.
+ *
+ * The SMBIOS UUID (`Win32_ComputerSystemProduct.UUID`) is hardware and does not travel —
+ * but on real boards it is often junk. win199, a Supermicro machine, reports
+ * `00000000-0000-0000-0000-AC1F6B1C4252`: twelve zero bytes and the NIC's MAC address.
+ * That one is still unique; all-zeros and all-FFs, which other vendors ship, are not, and
+ * trusting them blindly puts every such machine on one derived key. That IS the macOS bug.
+ *
+ * So: drop a source that is absent or degenerate, hash what is left, and return null only
+ * when NOTHING usable remains — at which point `refuse` is the correct answer rather than
+ * an accident.
+ *
+ * Pure, and separated from the two subprocesses that collect the values, because the part
+ * that can silently return the wrong thing is the part that has to be testable off
+ * Windows.
+ */
+export function machineIdentityFromSources(
+  smbiosUuid: string | null,
+  machineGuid: string | null,
+): string | null {
+  const parts: string[] = [];
+  const s = usableWindowsId(smbiosUuid);
+  const g = usableWindowsId(machineGuid);
+  if (s) parts.push(`smbios=${s}`);
+  if (g) parts.push(`machineguid=${g}`);
+  if (parts.length === 0) return null;
+  return crypto.createHash('sha256').update(`wv-win:${parts.join(':')}`).digest('hex');
+}
+
+/**
+ * Is this value actually per-machine?
+ *
+ * Rejects what is not a UUID at all, and the placeholder values that many machines share.
+ * Deliberately does NOT reject win199's mostly-zero UUID: it is ugly and it is unique,
+ * and a rule tight enough to exclude it would exclude a large slice of real hardware for
+ * no gain. The test is "could another machine produce this", not "does it look tidy".
+ */
+function usableWindowsId(raw: string | null): string | null {
+  const v = String(raw ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(v)) return null;
+  const hex = v.replace(/-/g, '');
+  if (/^0+$/.test(hex)) return null;                 // all zeros: the commonest placeholder
+  if (/^f+$/.test(hex)) return null;                 // all FFs: an unprogrammed field
+  // Known vendor placeholders, shipped identically on every unit of a model.
+  if (hex === '03000200040005000006000700080009') return null;
+  return v;
+}
+
+/**
+ * Collect the two Windows sources. Subprocesses, so kept away from the pure part above.
+ *
+ * `reg query` for MachineGuid because it is fast and always present. PowerShell for the
+ * SMBIOS UUID because `wmic` is deprecated and unreliable on current builds. Both are
+ * bounded by a timeout and both failures are survivable — losing one source is exactly the
+ * case machineIdentityFromSources is built for.
+ */
+function windowsMachineIdentity(): string | null {
+  let smbios: string | null = null;
+  let guid: string | null = null;
+
+  try {
+    const out = execFileSync('powershell', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      '(Get-CimInstance -ClassName Win32_ComputerSystemProduct).UUID',
+    ], { encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] });
+    smbios = out.trim() || null;
+  } catch { /* no PowerShell, or CIM is unwell */ }
+
+  try {
+    const out = execFileSync('reg', [
+      'query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid',
+    ], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const m = out.match(/MachineGuid\s+REG_SZ\s+(\S+)/i);
+    guid = m ? m[1] : null;
+  } catch { /* registry read failed */ }
+
+  return machineIdentityFromSources(smbios, guid);
 }
 
 /**
@@ -300,8 +495,11 @@ function readOrCreateSalt(): Buffer {
  * second salt would mean a second file to lose.
  */
 export function derivedKeyFor(identity: string): Buffer {
-  const uid = (process as unknown as { getuid?: () => number }).getuid?.() ?? 0;
-  const ikm = crypto.createHash('sha256').update(`${identity}:${uid}`).digest();
+  // principalId(), not `getuid() ?? 0`. On POSIX it returns the uid as a string, so this
+  // is bit-for-bit what it always was and no existing store moves. On Windows getuid is
+  // undefined and the old fallback made every account on the box principal 0 — one derived
+  // key shared by every user of the machine, which is the macOS bug in a second costume.
+  const ikm = crypto.createHash('sha256').update(`${identity}:${principalId()}`).digest();
   // Buffer.from, not a cast: hkdfSync returns an ArrayBuffer, and the `as unknown as
   // Buffer` this replaced made `.length` read undefined on a value the rest of the file
   // treats as a Buffer. It happened to work because nothing asked.
@@ -475,6 +673,14 @@ class AgentDaemon {
   private profiles: AgentProfile[] = [];
   private agentServers: Map<string, net.Server> = new Map();
   private mgmtServer: net.Server | null = null;
+  /**
+   * How this daemon proves it is this daemon, on a platform reached by a port.
+   *
+   * Null everywhere else, and null is the honest value: the unix-socket platforms do not
+   * need it, because a socket path lives in a directory only the daemon can write and
+   * nobody else can put something there for an agent to find.
+   */
+  private helloSigner: HelloSigner | null = null;
   private knocks = new Knocks();
   /**
    * One operations object per agent, built on first use and kept.
@@ -645,7 +851,7 @@ class AgentDaemon {
     if (srv) { try { srv.close(); } catch { /* already gone */ } }
     this.agentServers.delete(safe);
     this.dropOps(safe);
-    try { fs.unlinkSync(agentSocketPath(safe)); } catch { /* already gone */ }
+    releaseEndpoint(agentEndpoint(safe));
     this.saveProfiles();
     return true;
   }
@@ -765,10 +971,10 @@ class AgentDaemon {
   }
 
   startAgentSocket(profile: AgentProfile): void {
-    const sockPath = agentSocketPath(profile.agent_name);
-    try { fs.unlinkSync(sockPath); } catch { /* nothing to clear */ }
+    const ep = agentEndpoint(profile.agent_name);
+    releaseEndpoint(ep);
 
-    const srv = net.createServer((socket) => {
+    const srv: net.Server = net.createServer(withHello((socket) => {
       // BUFFERS, not a string, and the reasons are two separate bugs.
       //
       // 1. `buf.length` on a string counts UTF-16 code units, not bytes. A request of
@@ -921,7 +1127,10 @@ class AgentDaemon {
           });
       });
       socket.on('error', () => { /* a client that hangs up is not an event */ });
-    });
+    }, this.helloSigner, () => {
+      const a = srv.address();
+      return a && typeof a !== 'string' ? a.port : 0;
+    }));
 
     // NO maxConnections here, deliberately — the second version of this code had one, and
     // it recreated the denial of service it was meant to prevent one layer down. A ceiling
@@ -934,29 +1143,60 @@ class AgentDaemon {
     // fixed time after it was accepted, whatever it sends. Slots cannot be held, so they
     // do not need to be rationed, and nothing an attacker does can make the daemon refuse
     // a connection it has not yet authenticated.
-    srv.listen(sockPath, () => {
-      // World-connectable BY DESIGN — see the header. The daemon is a different uid from
-      // every agent, so a mode that excluded others would exclude the agent too. The
-      // token is the identity; this mode is not a control and must not be read as one.
-      try { fs.chmodSync(sockPath, 0o666); } catch { /* best effort */ }
-    });
+    listenOn(
+      srv, ep, this.helloSigner,
+      () => { /* the per-agent endpoint is not announced; the mgmt line covers the start */ },
+      (message) => {
+        // A per-agent endpoint that cannot be published is an agent nobody can reach. It
+        // is reported and the server is dropped, rather than left bound to a port no
+        // discovery file names — which reads as "running" and serves nobody.
+        console.error(`[wundervault-agent] ${profile.agent_name}: ${message}`);
+        try { srv.close(); } catch { /* already gone */ }
+        this.agentServers.delete(profile.agent_name);
+      },
+    );
     srv.on('error', (err) => {
       console.error(`[wundervault-agent] Socket error for ${profile.agent_name}:`, err.message);
     });
     this.agentServers.set(profile.agent_name, srv);
   }
 
+  /**
+   * Refuse to become the second broker on a machine that already has one.
+   *
+   * Awaited before start(), because on a port-addressed platform there is no EADDRINUSE to
+   * stop us: two daemons run happily and the second overwrites the first's discovery
+   * files, taking every agent with it. Observed during phase 8's own testing.
+   */
+  static async refuseIfAlreadyServing(): Promise<void> {
+    if (!usesPortFiles()) return;
+    const ep = mgmtEndpoint();
+    if (await anotherBrokerIsServing(ep)) {
+      throw new ConfigurationRefusal(
+        `Another secret broker is already serving on this machine.\n` +
+        `  ${endpointLabel(ep)} names a port that is answering, so starting a second\n` +
+        `  broker would overwrite the address every agent here is using and point them\n` +
+        `  at this process instead.\n` +
+        `  Stop the running one first, or let the scheduled task manage it:\n` +
+        `    schtasks /end /tn wundervault-agent`,
+      );
+    }
+  }
+
   startMgmtSocket(): void {
-    const mp = mgmtSocketPath();
+    const ep = mgmtEndpoint();
     // The directory is the control, and it exists before the socket does. chmod-after-
     // listen leaves a window in which the socket is bound at the default mode and a
     // process watching for it can connect; a 0770 directory has no such window.
     const md = mgmtDir();
     fs.mkdirSync(md, { recursive: true, mode: 0o755 });
-    fs.chmodSync(md, 0o755);
-    try { fs.unlinkSync(mp); } catch { /* nothing to clear */ }
+    // chmod is a no-op on Windows — measured, it reports 666 whatever is asked — so it is
+    // skipped rather than run for the look of it. The Windows equivalent is the ACL the
+    // installer puts on the run directory, and it is the installer's job.
+    if (!usesPortFiles()) fs.chmodSync(md, 0o755);
+    releaseEndpoint(ep);
 
-    const mgmt = net.createServer((socket) => {
+    const mgmt: net.Server = net.createServer(withHello((socket) => {
       let buf = '';
       // An ABSOLUTE deadline as well as the inactivity one. setTimeout() below is reset by
       // any traffic, so a byte every nine seconds held a management connection for days —
@@ -1185,6 +1425,13 @@ class AgentDaemon {
             socket.write(JSON.stringify({
               ok: true, version: VERSION, store_unreadable: this.storeUnreadable,
               key_mode: this.keyMode,
+              // Whether there is ACTUALLY a boundary here, from the daemon's own mouth.
+              // The startup warning says this too, but a warning is a line in a log that
+              // nothing can assert on; an installer's verifier needs an answer it can
+              // read. Observed rather than inferred -- boundaryIsReal() looks at the
+              // directory, not at process.platform.
+              boundary: boundaryIsReal(),
+              account: (() => { try { return os.userInfo().username; } catch { return null; } })(),
             }) + '\n');
           } else if (msg.action === 'known_agents') {
             // Names only, never credentials. This is what lets migration tell you which of
@@ -1205,16 +1452,21 @@ class AgentDaemon {
         socket.end();
       });
       socket.on('error', () => { /* hang-ups are not events */ });
-    });
+    }, this.helloSigner, () => {
+      const a = mgmt.address();
+      return a && typeof a !== 'string' ? a.port : 0;
+    }));
 
-    mgmt.listen(mp, () => {
-      // Connectable by anyone, like the per-agent sockets, and for the same reason: the
-      // daemon is a different uid, so a socket it owns at 0660 is one no agent could
-      // reach. What guards the actions behind it is a server-issued setup link to enrol
-      // and the agent's own token to remove — neither of which a file mode can supply.
-      try { fs.chmodSync(mp, 0o666); } catch { /* best effort */ }
-      console.log(`[wundervault-agent] Listening. Management: ${mp}`);
-    });
+    listenOn(
+      mgmt, ep, this.helloSigner,
+      (label) => { console.log(`[wundervault-agent] Listening. Management: ${label}`); },
+      (message) => {
+        // The management endpoint is how an agent is enrolled and removed. A daemon that
+        // cannot publish it has nothing to offer, and saying so is better than a process
+        // that looks alive.
+        throw new ConfigurationRefusal(message);
+      },
+    );
     mgmt.on('error', (err) => {
       console.error('[wundervault-agent] Mgmt socket error:', err.message);
     });
@@ -1234,22 +1486,40 @@ class AgentDaemon {
     // The directory being traversable costs nothing. The sockets inside it are
     // world-connectable by design and each carries its own token — nothing here is
     // protected by being hard to reach.
-    fs.chmodSync(rt, 0o755);
-    const rtMode = fs.statSync(rt).mode & 0o777;
-    if ((rtMode & 0o011) !== 0o011) {
-      throw new ConfigurationRefusal(
-        `${rt} is mode ${rtMode.toString(8)}. Agents run as the machine's owner and need ` +
-        `search permission on this directory to reach their sockets; at this mode every ` +
-        `connection would fail with EACCES.`,
-      );
+    // WINDOWS HAS NO MODE TO CHECK. chmod there is a no-op and stat() reports 666 for
+    // everything, measured — so running this check would either pass vacuously or, worse,
+    // refuse to start on a correct install. The Windows equivalent is the run directory's
+    // ACL, which the installer sets and verify-windows.ps1 proves from a second account.
+    if (!usesPortFiles()) {
+      fs.chmodSync(rt, 0o755);
+      const rtMode = fs.statSync(rt).mode & 0o777;
+      if ((rtMode & 0o011) !== 0o011) {
+        throw new ConfigurationRefusal(
+          `${rt} is mode ${rtMode.toString(8)}. Agents run as the machine's owner and need ` +
+          `search permission on this directory to reach their sockets; at this mode every ` +
+          `connection would fail with EACCES.`,
+        );
+      }
     }
-    // Clear sockets left by a crash. A stale file makes listen() fail, and the daemon
-    // would come up with no socket while reporting itself started.
+    // Clear endpoints left by a crash. A stale socket makes listen() fail; a stale PORT
+    // FILE is worse than that, because it does not fail — it names a port this daemon no
+    // longer holds, which anything local may now have bound. Both go.
     try {
       for (const f of fs.readdirSync(rt)) {
-        if (f.endsWith('.sock')) { try { fs.unlinkSync(path.join(rt, f)); } catch { /* ignore */ } }
+        if (f.endsWith('.sock') || f.endsWith('.port') || f.endsWith('.port.tmp')) {
+          try { fs.unlinkSync(path.join(rt, f)); } catch { /* ignore */ }
+        }
       }
     } catch { /* first run */ }
+
+    // The identity, and the half of it agents verify against. Only where the transport
+    // needs it: on the unix-socket platforms nothing reads broker.pub and publishing it
+    // would be a file with no reader and a question for whoever found it.
+    if (usesPortFiles()) {
+      const identity = loadOrCreateIdentity();
+      this.helloSigner = helloSignerFrom(identity.privateKeyPem);
+      publishBrokerPublicKey(identity.publicKeyB64);
+    }
 
     for (const profile of this.profiles) {
       if (!profile.socket_token) {
@@ -1304,21 +1574,38 @@ class AgentDaemon {
         '[wundervault-agent] broker, or set WUNDERVAULT_MACHINE_ID to something per-machine.',
       );
     } else {
-      console.error(
-        '[wundervault-agent] Store key: DERIVED from machine-id and uid, which are not secret.\n' +
-        '[wundervault-agent] Anyone who can read this directory can recompute it, so the\n' +
-        '[wundervault-agent] directory mode is what protects the store — not the encryption.',
+      // THREE PLATFORMS, THREE TRUE SENTENCES, and the third one was being told the first
+      // one's. On Windows there is no machine-id, no uid, and no directory mode — chmod is
+      // a no-op there and stat reports 666 whatever is asked. Printing "the directory mode
+      // is what protects the store" on a Windows box names a control that does not exist
+      // and points the reader away from the one that does, which is the ACL.
+      const source = process.platform === 'win32'
+        ? 'this machine\'s hardware id and your account SID'
+        : process.platform === 'darwin'
+          ? 'the hardware UUID and uid'
+          : 'machine-id and uid';
+      const control = platformShape() === 'windows'
+        ? 'the directory\'s ACL is what protects the store'
+        : 'the directory mode is what protects the store';
+      say(
+        `[wundervault-agent] Store key: DERIVED from ${source}, which are not secret.\n` +
+        `[wundervault-agent] Anyone who can read this directory can recompute it, so\n` +
+        `[wundervault-agent] ${control} — not the encryption.`,
       );
     }
   }
 
   shutdown(): void {
+    // The discovery file goes with the server. A port file that outlives its daemon names
+    // an address anything local may now bind, and an agent that read it would be talking
+    // to a stranger — which the hello handshake catches, but only because this also
+    // happens on the paths where it can.
     for (const [name, srv] of this.agentServers) {
       try { srv.close(); } catch { /* already closing */ }
-      try { fs.unlinkSync(agentSocketPath(name)); } catch { /* already gone */ }
+      releaseEndpoint(agentEndpoint(name));
     }
     if (this.mgmtServer) { try { this.mgmtServer.close(); } catch { /* already closing */ } }
-    try { fs.unlinkSync(mgmtSocketPath()); } catch { /* already gone */ }
+    releaseEndpoint(mgmtEndpoint());
   }
 }
 
@@ -1388,6 +1675,8 @@ function readLinkFromStdin(): Promise<string> {
 // migration command without starting a daemon as a side effect.
 const invokedDirectly = process.argv[1] && /wundervault-agent|agent\.(js|ts)$/.test(process.argv[1]);
 if (invokedDirectly && !process.env.WUNDERVAULT_AGENT_NO_AUTOSTART) {
+  // Before anything writes a byte. A warning nobody can read is a warning nobody reads.
+  installConsoleTransliteration();
   const argv = process.argv.slice(2);
 
   if (argv.includes('--help') || argv.includes('-h')) {
@@ -1651,10 +1940,34 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
         .catch((e: Error) => { console.error(e.message); process.exit(1); });
     }
   } else {
+    // AN UNRECOGNISED FLAG MUST NOT START A BROKER.
+    //
+    // Everything that is not a known subcommand fell through to here and launched a
+    // daemon in the foreground. So `wundervault-agent --ping` -- a flag that does not
+    // exist, and which this project's own verifier script asked for -- started a SECOND
+    // broker, as the wrong user, which then sat there for ever. On Windows that second
+    // broker overwrites the discovery files the real one published, so a typo silently
+    // repoints every agent on the machine at a daemon running as the person who typed it.
+    //
+    // Found by running the verifier on Windows. It is not a Windows bug: a typo has
+    // started a stray broker on every platform since phase 4.
+    const unknown = argv.filter(a => a.startsWith('-'));
+    if (unknown.length > 0) {
+      console.error(
+        `[wundervault-agent] Unrecognised option${unknown.length > 1 ? 's' : ''}: ` +
+        `${unknown.join(', ')}\n` +
+        `  Refusing to start a broker, because that is almost certainly not what you meant.\n` +
+        `  Run with --help to see what this command accepts.`,
+      );
+      process.exit(2);
+    }
     refuseRoot();
     announceBoundary();
     let daemon: AgentDaemon;
     try {
+      // Before anything is constructed or published. A second broker that has already
+      // written its discovery files has already stolen the agents.
+      await AgentDaemon.refuseIfAlreadyServing();
       daemon = new AgentDaemon();
       daemon.start();
     } catch (err) {

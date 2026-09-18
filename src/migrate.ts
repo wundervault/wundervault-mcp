@@ -26,29 +26,58 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import net from 'node:net';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { legacy, mgmtSocketPath, splitAvailable, systemRoot, isInside } from './paths.js';
+import { mgmtEndpoint, connectToEndpoint, endpointLabel, type Endpoint } from './endpoint.js';
 
-/** One request/response over a socket. */
-export function ask(payload: unknown, sockPath = mgmtSocketPath(), timeoutMs = 30_000): Promise<any> {
+/**
+ * One request/response to the management endpoint.
+ *
+ * Takes an ENDPOINT rather than a path, because on Windows the broker is reached by a port
+ * and the connection is not complete until the far end has signed a nonce. The signature
+ * check lives in connectToEndpoint, so everything that talks to the broker inherits it
+ * instead of each caller remembering.
+ *
+ * The `sockPath` overload is kept for the tests that stand up a socket of their own.
+ */
+export function ask(
+  payload: unknown,
+  where: string | Endpoint = mgmtEndpoint(),
+  timeoutMs = 30_000,
+): Promise<any> {
+  const ep: Endpoint = typeof where === 'string' ? { kind: 'path', address: where } : where;
+  const label = endpointLabel(ep);
   return new Promise((resolve, reject) => {
-    const sock = net.createConnection(sockPath);
-    let buf = '';
-    const done = (fn: () => void) => { clearTimeout(timer); sock.destroy(); fn(); };
+    let settled = false;
     const timer = setTimeout(
-      () => done(() => reject(new Error(`timed out talking to the daemon at ${sockPath}`))),
+      () => { if (!settled) { settled = true; reject(new Error(`timed out talking to the daemon at ${label}`)); } },
       timeoutMs,
     );
-    sock.on('connect', () => sock.write(JSON.stringify(payload) + '\n'));
-    sock.on('data', (d) => {
-      buf += d.toString();
-      if (!buf.includes('\n')) return;
-      try { done(() => resolve(JSON.parse(buf.trim()))); }
-      catch { done(() => reject(new Error('unparseable reply from the daemon'))); }
+    connectToEndpoint(ep, timeoutMs).then((sock) => {
+      if (settled) { try { sock.destroy(); } catch { /* gone */ } return; }
+      let buf = '';
+      const done = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        sock.destroy();
+        fn();
+      };
+      sock.on('data', (d) => {
+        buf += d.toString();
+        if (!buf.includes('\n')) return;
+        try { const v = JSON.parse(buf.trim()); done(() => resolve(v)); }
+        catch { done(() => reject(new Error('unparseable reply from the daemon'))); }
+      });
+      sock.on('error', (e) => done(() => reject(e)));
+      sock.write(JSON.stringify(payload) + '\n');
+    }).catch((e: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(e);
     });
-    sock.on('error', (e) => done(() => reject(e)));
   });
 }
 
@@ -191,7 +220,7 @@ export async function status(): Promise<MigrationStatus> {
   const oldStorePath = legacy.profiles();
   const ping = await ask({ action: 'ping' }).catch((e) => {
     throw new Error(
-      `Could not reach the secret broker at ${mgmtSocketPath()}: ${(e as Error).message}\n` +
+      `Could not reach the secret broker at ${endpointLabel(mgmtEndpoint())}: ${(e as Error).message}\n` +
       `Install it first:  sudo sh packaging/install-daemon.sh\n` +
       `Then check:        systemctl status wundervault-agent`,
     );

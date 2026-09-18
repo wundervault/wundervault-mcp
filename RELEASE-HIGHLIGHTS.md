@@ -106,8 +106,19 @@ replace at their providers, and which ones are handed over in full every time th
 - **Post-quantum signatures.** The TRANSPORT is already hybrid post-quantum
   (X25519MLKEM768, verified) and the vault is symmetric end to end, so both of those are
   claimable. PQ *signatures* are not — we do not have them.
-- **Windows brokers.** Linux and macOS only. On Windows the credentials are held by a
-  process running as the same user as the agents — say so, do not imply otherwise.
+- **Windows brokers.** All three now have one, as of phase 8 — but it has run on exactly
+  one Windows machine, and until `packaging\verify-windows.ps1` exits 0 on a customer's
+  own box, do not describe Windows as supported for them.
+- **Windows parity with the Linux hardening.** Same as macOS below: the account split is
+  the same, the sandboxing around it is not there. Task Scheduler has no equivalent of
+  ProtectSystem, ProtectProc or a syscall filter.
+- **A sealed store key on Windows.** There isn't one. It is a random key in a file only
+  the broker's account can open. BitLocker covers a stolen disk and BitLocker is the
+  customer's to switch on — the installer reports its state and claims nothing.
+- **Anything about what the broker RUNS.** The boundary protects whatever is inside it,
+  including code somebody else chose. If node or the package sits where an ordinary user
+  can write — nvm-windows puts node under %APPDATA% — the account split protects their
+  code instead of ours. The verifier fails on it; the copy must not gloss it.
 - **macOS parity with the Linux hardening.** The uid split is the same on both. The
   systemd unit's sandboxing — ProtectSystem, ProtectHome, ProtectProc, the syscall filter —
   has no launchd equivalent, so on macOS the uid split is very nearly the whole defence.
