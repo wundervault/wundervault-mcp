@@ -39,6 +39,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { AgentVaultAPI } from './api-client.js';
+import { signerFromIdentity, type BrokerSigner } from './broker-sign.js';
 import { decryptSecretContent, verifyDirectiveSignature, loadEncryptionKey } from './crypto.js';
 import {
   modeAllowsLegacyExec, modeAllowsSshBroker, modeAllowsHttpBroker, wrongModeMessage,
@@ -85,8 +86,14 @@ export class BrokerOps {
     apiKey: string,
     encKeyB64: string,
     vaultUrl: string,
+    /**
+     * PHASE 6. Injectable so a test can drive a signed call without a key in
+     * /var/lib/wundervault — and so the default path is the real one, read from this
+     * machine's broker identity rather than passed in by whoever constructs this.
+     */
+    signer: BrokerSigner | null = signerFromIdentity(),
   ) {
-    this.api = new AgentVaultAPI(apiKey, loadEncryptionKey(encKeyB64), vaultUrl);
+    this.api = new AgentVaultAPI(apiKey, loadEncryptionKey(encKeyB64), vaultUrl, signer);
   }
 
   /**

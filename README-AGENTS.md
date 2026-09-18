@@ -75,13 +75,32 @@ agent = Agent(
 
 ## Where the keys actually come from
 
-There is no credentials file and no key in your MCP config. `onboard.py` registers
-the agent and starts the local `wundervault-agent` daemon; the daemon holds the API
-key and the encryption key and hands them to the MCP server over a unix socket at
-`~/.wundervault/agents/<name>.sock`, authenticated with the agent token in
-`~/.wundervault/agents/<name>.token`.
+There is no credentials file and no key in your MCP config. `onboard.py` registers the
+agent and the local `wundervault-agent` broker holds the API key and the encryption key.
+The MCP server talks to it over a unix socket at `~/.wundervault/agents/<name>.sock`,
+authenticated with the agent token in `~/.wundervault/agents/<name>.token`.
+
+**The socket serves operations, not credentials.** The broker does not hand the keys over:
+it lists entries, performs a brokered HTTP call, answers a signature request. What crosses
+the socket is the result, not the secret.
 
 All your config has to say is which agent this is.
+
+## What the server checks, and what it does not
+
+On Linux, once you have run `sudo wundervault-agent --pair` and repaired the agent onto
+that broker, every request to Wundervault is signed with a private key that lives in
+`/var/lib/wundervault` — a directory the agents cannot read. The server refuses an
+unsigned request from an agent bonded to a broker, and refuses to hand over a
+broker-mode secret to anyone who did not sign. A copy of the credential on its own stops
+being enough.
+
+**An agent with no paired broker is authenticated on its credential alone**, exactly as
+before. That is every agent on **macOS and Windows** today, and every Linux agent until it
+has been repaired onto a broker. For those, a broker-mode secret is refused outright —
+there is nothing on that machine that could use one — and everything still in the legacy
+mode is served to whoever holds the credential. Nothing here is a claim about macOS or
+Windows; support for those is not built.
 
 ## Environment Variables Reference
 

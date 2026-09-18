@@ -46,7 +46,13 @@ export interface RemoteHost {
 }
 
 export interface SecretResponse {
-  /** LEGACY_EXEC | BROKER_SSH_AGENT — set server-side, enforced client-side. */
+  /**
+   * LEGACY_EXEC | BROKER_SSH_AGENT | BROKER_HTTP — set server-side.
+   *
+   * Enforced in the BROKER, and since phase 6 also on the server: a broker mode is served
+   * only to a caller that signed with the broker key this agent is bonded to. An agent on
+   * a machine with no paired broker cannot fetch one at all.
+   */
   entry_mode?: string;
   /** Signed operation catalogue, JSON. */
   operations?: string;

@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { hmacForApiKey, decryptVaultKey } from './crypto.js';
+import type { BrokerSigner } from './broker-sign.js';
 import type { VaultEntry, ProfileResponse, SecretsResponse, SecretResponse } from './types.js';
 import { VERSION } from './version.js';
 
@@ -14,6 +15,15 @@ export class AgentVaultAPI {
     private apiKey: string,
     private encKey: Uint8Array,
     private baseUrl: string = 'https://wundervault.com',
+    /**
+     * PHASE 6. The broker's signer, or null on a machine that has never paired.
+     *
+     * Null is not a way to opt out of the check: the SERVER decides which agents may go
+     * unsigned, from a column the owner's repair writes. A signer that is null against a
+     * broker-held agent produces a refusal naming the upgrade, which is the correct
+     * outcome — not a quiet downgrade to the weaker path.
+     */
+    private signer: BrokerSigner | null = null,
   ) {
     this.hmacB64 = hmacForApiKey(apiKey, encKey);
   }
@@ -28,15 +38,36 @@ export class AgentVaultAPI {
     };
   }
 
+  /**
+   * The headers for one request, signed when this machine has a broker identity.
+   *
+   * Every call goes through here, so a method added later is signed without anyone having
+   * to remember — the same reason the server puts its check in one place.
+   */
+  private signedHeaders(
+    method: string, url: string, body?: string,
+  ): Record<string, string> {
+    const base = this.headers();
+    if (!this.signer) return base;
+    // Signed from the PARSED url, not from the path string that was passed in. The
+    // server verifies against the raw path it received, and `new URL()` applies the same
+    // encoding `fetch` will put on the wire — so signing the unparsed string would be
+    // signing something merely equivalent to what is sent. No current path needs
+    // encoding, which is why this would have failed the first time one did.
+    const u = new URL(url);
+    return { ...base, ...this.signer.sign(method, u.pathname, u.search.replace(/^\?/, ''), body) };
+  }
+
   private async fetchJson<T>(path: string, params?: Record<string, string>): Promise<T> {
     let url = `${this.baseUrl}${path}`;
-    if (params) {
-      const searchParams = new URLSearchParams(params);
-      url += `?${searchParams.toString()}`;
-    }
+    // Built once and signed as built. Re-serialising the params for the signature would
+    // mean signing a string that is merely equivalent to the one sent, and the server
+    // compares bytes.
+    const query = params ? new URLSearchParams(params).toString() : '';
+    if (query) url += `?${query}`;
     const resp = await fetch(url, {
       method: 'GET',
-      headers: this.headers(),
+      headers: this.signedHeaders('GET', url),
       signal: AbortSignal.timeout(TIMEOUT),
     });
     if (!resp.ok) {
@@ -86,10 +117,16 @@ export class AgentVaultAPI {
     first_sighting?: boolean;
   }): Promise<{ allowed: boolean; tier: string; request_id?: string; message?: string;
                 emailed?: boolean }> {
+    // Serialised once. The bytes that are hashed for the signature must be the bytes
+    // that are sent, and JSON.stringify called twice is two chances to differ.
+    const payload = JSON.stringify(body);
     const resp = await fetch(`${this.baseUrl}/agent/vault/operation-check`, {
       method: 'POST',
-      headers: { ...this.headers(), 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+      headers: {
+        ...this.signedHeaders('POST', `${this.baseUrl}/agent/vault/operation-check`, payload),
+        'content-type': 'application/json',
+      },
+      body: payload,
       signal: AbortSignal.timeout(TIMEOUT),
     });
     if (!resp.ok) {
@@ -174,9 +211,10 @@ export class AgentVaultAPI {
    */
   private async reportUnanswered(requestId: string): Promise<void> {
     try {
-      await fetch(`${this.baseUrl}/agent/vault/tier2-requests/${requestId}/unanswered`, {
+      const path = `/agent/vault/tier2-requests/${requestId}/unanswered`;
+      await fetch(`${this.baseUrl}${path}`, {
         method: 'POST',
-        headers: this.headers(),
+        headers: this.signedHeaders('POST', `${this.baseUrl}${path}`),
         signal: AbortSignal.timeout(TIMEOUT),
       });
     } catch { /* the call already failed; do not fail it differently */ }
