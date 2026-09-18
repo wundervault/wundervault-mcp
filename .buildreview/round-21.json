@@ -1,0 +1,189 @@
+{
+  "verdict": "revise",
+  "summary": "The build adds the macOS path shape, local-file key mode, observable boundary checks, and a stable single-port lock, with the lock changes largely matching Part D. It does not yet satisfy the phase because the no-identity path still proceeds with the shared key, the boundary check can certify a daemon running as the agent owner, and several migration and realpath cases remain unsafe or unverified.",
+  "spec_check": [
+    {
+      "requirement": "A1. `platformShape()` returns `'linux' | 'darwin' | 'none'`, overridable for tests by `WUNDERVAULT_PLATFORM_SHAPE`.",
+      "status": "met",
+      "evidence": "`src/paths.ts` implements the three-valued override with validation, and `test/macos-shape.test.ts` exercises darwin, linux, none-related behavior, and invalid values."
+    },
+    {
+      "requirement": "A2. `splitAvailable()` returns true only when the real `process.platform` is one that supports a uid split AND the shape says so.",
+      "status": "met",
+      "evidence": "`splitAvailableFor()` vetoes platforms outside linux and darwin, and the tests directly assert that win32 remains false under linux and darwin shapes."
+    },
+    {
+      "requirement": "A3. A new `boundaryIsReal()` reports on observed facts ... our euid is neither 0 nor the uid of the invoking owner.",
+      "status": "unmet",
+      "evidence": "`boundaryIsReal()` only compares the euid with `SUDO_UID` when that optional environment variable is present. A direct owner-run daemon using an external 0700 directory owned by that owner passes all checks and is reported as having a boundary."
+    },
+    {
+      "requirement": "Acceptance 3. `boundaryIsReal()` is false for a state root owned by the calling uid; true for one owned by another uid at 0700. Both directions asserted, with two uids.",
+      "status": "unmet",
+      "evidence": "The positive test creates a directory owned by the test process itself and expects true, while the negative ownership test may skip its only assertion; no shown test executes with two uids."
+    },
+    {
+      "requirement": "Acceptance 4. `announceBoundary()` prints the pre-split warning whenever `boundaryIsReal()` is false, including on Linux, and prints nothing when it is true.",
+      "status": "partial",
+      "evidence": "`announceBoundary()` now keys off `boundaryIsReal()`, but the latter can incorrectly return true for an owner-run daemon with a custom root, suppressing the required warning."
+    },
+    {
+      "requirement": "B1. State root: `/var/lib/wundervault`, mode 0700, owned by `_wundervault`.",
+      "status": "partial",
+      "evidence": "The darwin-shaped path is `/var/lib/wundervault`, and code checks a 0700 root owned by its euid; account creation, ownership setup, and installed permissions are in the withheld packaging."
+    },
+    {
+      "requirement": "B2. Runtime directory: `/var/lib/wundervault/run` ... Longest resulting socket path is well inside the 104-byte `sun_path` limit on macOS \u2014 asserted, not assumed.",
+      "status": "partial",
+      "evidence": "`runtimeDirFor('darwin', ...)` always returns the state-root run directory. The socket test uses JavaScript string length rather than encoded byte length, so it does not establish the byte limit for any non-ASCII output allowed by the omitted `safeName()` implementation."
+    },
+    {
+      "requirement": "Acceptance 8. Path containment checks resolve `/var/\u2026` and `/private/var/\u2026` to the same location; a test asserts a realpath comparison, not a prefix match.",
+      "status": "unmet",
+      "evidence": "The shown test uses ordinary temporary directories and no symlink alias. In addition, `isInside()` reverts an entire nonexistent child to its lexical path, so an existing `/var` parent and not-yet-created child can still compare as `/private/var/...` versus `/var/...`."
+    },
+    {
+      "requirement": "B3. This phase writes a random 32-byte key to `/var/lib/wundervault/store.key`, mode 0600, owned by the service account ... `key_mode` is `local-file`.",
+      "status": "partial",
+      "evidence": "The code reads the darwin `store.key`, maps it to `local-file`, and prints the required not-sealed disk-copy warning. Random creation, exact length, mode, ownership, and installed startup behavior depend on the withheld installer."
+    },
+    {
+      "requirement": "Acceptance 10. With no machine identity available, the derived fallback refuses rather than deriving from a constant. On darwin it derives from `IOPlatformUUID`.",
+      "status": "unmet",
+      "evidence": "`deriveMachineKey()` explicitly returns `legacyDerivedKey()` in `derived-shared` mode when identity is null and allows startup and existing secret service to continue; only new enrolment is refused."
+    },
+    {
+      "requirement": "Acceptance 11. Sabotage: making `IOPlatformUUID` lookup return a fixed string fails check 10.",
+      "status": "unmet",
+      "evidence": "The shown Linux tests exercise the parser and `derivedKeyFor()` separately but never force `machineIdentity()` through its darwin `ioreg` branch, so replacing that lookup with a fixed valid UUID would not fail them."
+    },
+    {
+      "requirement": "C1\u2013C5. The account, LaunchDaemon, installer refusals, post-bootstrap verification, and launchd limitation disclosure.",
+      "status": "partial",
+      "evidence": "The required installer and plist were explicitly withheld for round 22, so their behavior cannot be assessed from this package."
+    },
+    {
+      "requirement": "D1. One address, not eight. A single port derived into 20000\u201332767.",
+      "status": "met",
+      "evidence": "`addressPort()` derives one port in the required inclusive range, and the test samples 1000 agent names."
+    },
+    {
+      "requirement": "D2. An occupied port is a hard error naming the port, not a silent move to another address, and `WUNDERVAULT_LOCK_PORT` overrides it.",
+      "status": "met",
+      "evidence": "`acquireCredential()` refuses an unrecognized occupant and includes `addressLabel()` in the reason; tests cover the refusal and override."
+    },
+    {
+      "requirement": "D3. The port path becomes reachable from Linux tests (`WUNDERVAULT_LOCK_STRATEGY=port`).",
+      "status": "met",
+      "evidence": "`lockStrategy()` honors the validated override, and `test/lock-port.test.ts` drives the port implementation on the host test platform."
+    },
+    {
+      "requirement": "D4. `test/lock.test.ts` drops its `LINUX_ONLY` gate for everything that is not genuinely abstract-socket-specific.",
+      "status": "partial",
+      "evidence": "The new port-specific test is shown, but the existing `test/lock.test.ts` and its gates are not included. The shown override test also does not assert the specified two-process, different-port case."
+    },
+    {
+      "requirement": "Out of scope, and out of scope means unchanged: Windows ... keeps the pre-split shape and its warning, byte for byte.",
+      "status": "unmet",
+      "evidence": "The win32 path still remains pre-split, but `announceBoundary()` replaces the previous Windows warning text and removes its final `The boundary is Linux-only for now.` line."
+    },
+    {
+      "requirement": "E1\u2013E6. README, agent documentation, release highlights, limitations, handoff deletion, and path-header copy changes.",
+      "status": "partial",
+      "evidence": "Only two source comments are visible in the package; the shipped documentation and deletion of `HANDOFF-lock-on-non-linux.md` are not shown."
+    },
+    {
+      "requirement": "`packaging/verify-macos.sh` ... asserts checks 6, 7, 9, 12, 13, 14 and 17\u201320 against the real install.",
+      "status": "partial",
+      "evidence": "The verification script is explicitly deferred to round 22 and no real Mac run has occurred."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "When no sealed key or machine identity exists, the daemon still derives and uses the globally shared legacy key instead of refusing as required.",
+      "failure_scenario": "On a Mac with no `store.key`, failed `ioreg`, no `/etc/machine-id`, and service uid 250, `deriveMachineKey()` returns the key derived from `unknown:250`; the daemon starts and serves any existing profiles under that predictable cross-machine key, although acceptance 10 requires refusal.",
+      "suggested_direction": "Separate recovery from normal startup: refuse ordinary operation when identity is unavailable, and expose any legacy recovery through an explicit, narrowly scoped migration path that does not continue serving or writing under the shared key."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "file": "src/paths.ts",
+      "line": null,
+      "claim": "`boundaryIsReal()` can return true when the daemon and agents run as the same owner uid because it has no invoking-owner uid unless `SUDO_UID` happens to be present.",
+      "failure_scenario": "An owner with uid 501 directly starts the daemon with `WUNDERVAULT_SYSTEM_ROOT=/tmp/wv-state`; `/tmp/wv-state` is owned by uid 501 at 0700 and is outside `~/.wundervault`, so `boundaryIsReal()` returns true and `announceBoundary()` prints nothing even though owner-run agents have the same uid and can read the daemon's memory.",
+      "suggested_direction": "Provide and validate an authoritative owner uid independently of transient sudo environment state, compare it with the daemon euid, and test the false and true cases in subprocesses running under two actual uids."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "Unless the withheld installer re-encrypts the old store while it still knows the original owner uid, the shown legacy fallback cannot open a pre-phase-7 macOS store after the uid split.",
+      "failure_scenario": "A pre-split Mac store was encrypted from `unknown:501`; after installation the daemon runs as `_wundervault` uid 250, and `legacyDerivedKey()` derives `unknown:250`, so fallback decryption fails even with the original salt and ciphertext.",
+      "suggested_direction": "Make migration retain the original owner uid as an explicit input or decrypt and durably re-encrypt while still running in the old owner context; do not infer the historical derivation uid from the new daemon process."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "file": "src/migrate.ts",
+      "line": null,
+      "claim": "The migration refusal checks platform capability rather than an actual split, so a capable platform with source and destination configured to the same directory can still reach destructive cleanup.",
+      "failure_scenario": "On Linux or macOS, set `WUNDERVAULT_SYSTEM_ROOT` to the owner's existing `~/.wundervault` and run a compatible owner-run daemon; `splitAvailable()` is true, `profilesPath()` and `legacy.profiles()` identify the same store, and `cleanup()` can treat the live source as an already-migrated leftover and delete it.",
+      "suggested_direction": "Before status or cleanup proceeds, compare canonical source and destination identities and require positive evidence from the management endpoint that the destination daemon is the separate service account."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "src/paths.ts",
+      "line": null,
+      "claim": "`isInside()` does not correctly resolve macOS `/var` aliases when the child path does not yet exist, despite claiming to support paths that are about to be created.",
+      "failure_scenario": "On macOS, with existing parent `/var/lib/wundervault` and absent child `/var/lib/wundervault/run/new.sock`, the parent realpaths to `/private/var/lib/wundervault` while the child falls back wholesale to `/var/lib/wundervault/run/new.sock`, causing `isInside()` to return false for a child that is actually under the parent.",
+      "suggested_direction": "Canonicalize the deepest existing ancestor of each path and append the unresolved suffix before comparing, and add a test using a real symlink alias plus a nonexistent descendant."
+    },
+    {
+      "id": "F6",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "`machineIdentity()` is not guaranteed to use `IOPlatformUUID` on darwin because it consults `/etc/machine-id` first, and the shown tests never execute the darwin lookup.",
+      "failure_scenario": "On a Mac where an administrator or third-party package has created `/etc/machine-id`, `machineIdentity()` returns that file and never invokes `ioreg`; cloned or duplicated file contents then produce the same derived key on different Macs, while replacing the `ioreg` branch with a fixed UUID still leaves the shown Linux suite green.",
+      "suggested_direction": "Select the identity source by real platform, make the darwin command execution injectable, and test two mocked darwin UUID responses through `machineIdentity()` and the resulting derivation."
+    },
+    {
+      "id": "F7",
+      "severity": "minor",
+      "file": "src/agent.ts",
+      "line": null,
+      "claim": "The Windows pre-split warning was changed even though the spec requires that warning to remain byte-for-byte unchanged.",
+      "failure_scenario": "Starting on win32 with no shape override now prints the new `cannot have its own account` warning and omits the old final `The boundary is Linux-only for now.` sentence, so log assertions or support guidance expecting the unchanged phase-6 warning receive different output.",
+      "suggested_direction": "Keep a dedicated Windows warning branch matching the required prior text, or resolve the specification conflict explicitly before changing that out-of-scope platform's copy."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The 20000\u201332767 range is below default ephemeral ranges, but macOS and Windows ephemeral ranges are administrator-configurable.",
+      "why_it_matters": "A fleet image configured to allocate outbound ports from this lower range recreates transient lock conflicts; the new behavior is safe against double holders but can intermittently deny every launch until the caller retries or sets an override."
+    },
+    {
+      "id": "B2",
+      "concern": "Different agent names can hash to the same one of only 12,768 deterministic ports.",
+      "why_it_matters": "The birthday probability becomes material well before 12,768 agents\u2014around 100 distinct names already have roughly a one-third collision probability\u2014so unrelated credentials can permanently exclude one another and require per-agent override management."
+    },
+    {
+      "id": "B3",
+      "concern": "Derived identities can be duplicated by VM cloning or by reusing the suggested `WUNDERVAULT_MACHINE_ID` value, and no uniqueness validation is possible locally.",
+      "why_it_matters": "Two machines with the same identity and service uid derive the same fallback key; copied ciphertext then becomes decryptable on both machines even though startup reports ordinary per-machine derived mode rather than `derived-shared`."
+    }
+  ],
+  "_meta": {
+    "round": 21,
+    "at": "2026-09-18T15:24:02+00:00",
+    "package_bytes": 104212,
+    "schema_problems": []
+  }
+}

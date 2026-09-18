@@ -4,15 +4,14 @@ import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
-// The lock has two implementations. On Linux it claims a kernel-held abstract socket,
-// which is atomic and released on death — that is the one the daemon runs on and the
-// one these tests verify. Everywhere else it walks 8 loopback port candidates and
-// moves to the next when one is in use but does not answer the protocol, which is not
-// the same guarantee: macOS CI shows a second in-process claim succeeding, and
-// whoHolds() reporting 'holder' where 'lock-file' was expected. That is a real gap,
-// not a test artifact — see HANDOFF-lock-on-non-linux.md. Asserting Linux semantics
-// on a platform that does not implement them would just be a red suite nobody reads.
-const LINUX_ONLY = process.platform === 'linux' ? describe : describe.skip;
+// The lock has two implementations and they now make the SAME guarantee. This file
+// covers the Linux one — a kernel-held abstract socket, atomic and released on death.
+// The loopback-port implementation used everywhere else has its own file,
+// test/lock-port.test.ts, which runs on every platform including this one: it used to be
+// reachable only from macOS CI, and it shipped with a concurrency bug that let two
+// processes hold one credential. What remains platform-specific here is the address
+// primitive itself, not the semantics.
+const ABSTRACT_ONLY = process.platform === 'linux' ? describe : describe.skip;
 
 /**
  * A pid that is genuinely not running.
@@ -87,7 +86,7 @@ async function mustAcquire(version = '9.9.9'): Promise<void> {
   );
 }
 
-LINUX_ONLY('acquiring the credential', () => {
+ABSTRACT_ONLY('acquiring the credential', () => {
   it('grants it when nobody holds it', async () => {
     await mustAcquire();
   });
@@ -122,7 +121,7 @@ LINUX_ONLY('acquiring the credential', () => {
   });
 });
 
-LINUX_ONLY('compatibility lock file', () => {
+ABSTRACT_ONLY('compatibility lock file', () => {
   it('keeps a bare PID on line 1 so pre-1.7.1 readers still see the lock', async () => {
     await mustAcquire();
     const raw = readFileSync(lock.lockFilePath(), 'utf8');
@@ -152,7 +151,7 @@ LINUX_ONLY('compatibility lock file', () => {
   });
 });
 
-LINUX_ONLY('cross-process exclusion', () => {
+ABSTRACT_ONLY('cross-process exclusion', () => {
   it('a second OS process cannot take a held credential', () => {
     const script = `
       process.env.WUNDERVAULT_AGENT_NAME = ${JSON.stringify(AGENT)};
@@ -207,7 +206,7 @@ LINUX_ONLY('cross-process exclusion', () => {
   });
 });
 
-LINUX_ONLY('holder identity', () => {
+ABSTRACT_ONLY('holder identity', () => {
   it('answers who it is over the bound address, with no lock file involved', async () => {
     await mustAcquire();
     rmSync(lock.lockFilePath());          // the file anyone could delete
@@ -231,7 +230,7 @@ LINUX_ONLY('holder identity', () => {
   });
 });
 
-LINUX_ONLY('release guard', () => {
+ABSTRACT_ONLY('release guard', () => {
   it('does not remove a lock file written by a different incarnation', async () => {
     await mustAcquire();
     // Same PID, different token — a replaced or restored file.
@@ -251,7 +250,7 @@ LINUX_ONLY('release guard', () => {
   });
 });
 
-LINUX_ONLY('distinct agents that slug the same', () => {
+ABSTRACT_ONLY('distinct agents that slug the same', () => {
   it('share a lock FILENAME but claim different addresses', async () => {
     // 'Team A' and 'Team?A' both slug to mcp-Team_A. They are DIFFERENT
     // credentials, so they must not exclude each other — but the lock filename
@@ -279,7 +278,7 @@ LINUX_ONLY('distinct agents that slug the same', () => {
   });
 });
 
-LINUX_ONLY('refusing when the claim cannot be made safely', () => {
+ABSTRACT_ONLY('refusing when the claim cannot be made safely', () => {
   it('does not serve when the lock file cannot be written', async () => {
     // An older copy gates on that file; unwritten, it would start alongside us.
     (os as any).homedir = () => path.join(home, 'does', 'not', 'exist');
@@ -290,7 +289,7 @@ LINUX_ONLY('refusing when the claim cannot be made safely', () => {
   });
 });
 
-LINUX_ONLY('a live PID in the lock file is not automatically the holder', () => {
+ABSTRACT_ONLY('a live PID in the lock file is not automatically the holder', () => {
   it('ignores a file belonging to a DIFFERENT agent that slugs the same', async () => {
     // 'Team A' and 'Team?A' share mcp-Team_A.lock. A live PID in it must not
     // block a distinct credential.
@@ -309,7 +308,10 @@ LINUX_ONLY('a live PID in the lock file is not automatically the holder', () => 
       `${process.ppid}\n${JSON.stringify({ pid: process.ppid, agent: AGENT, start: '999999999' })}\n`,
     );
     const claim = await lock.acquireCredential('9.9.9');
-    expect(claim.ok).toBe(process.platform === 'linux');
+    // True on both platforms now. procStart() used to return null off Linux, which made
+    // this check inert on macOS: a recycled pid refused a free credential until somebody
+    // deleted the lock file by hand. macOS answers with `ps -o lstart=`.
+    expect(claim.ok).toBe(true);
   });
 
   it('still stands down for a legacy file that says neither', async () => {
@@ -320,7 +322,7 @@ LINUX_ONLY('a live PID in the lock file is not automatically the holder', () => 
   });
 });
 
-LINUX_ONLY('address keying', () => {
+ABSTRACT_ONLY('address keying', () => {
   it('separates OS users, since the namespace is machine-global', () => {
     const mine = lock.addressDescription();
     const realUid = process.getuid;
@@ -340,7 +342,7 @@ LINUX_ONLY('address keying', () => {
   });
 });
 
-LINUX_ONLY('mixed-version safety', () => {
+ABSTRACT_ONLY('mixed-version safety', () => {
   it('stands down for an older-build holder, which binds no socket', async () => {
     // Simulates a frozen pre-socket copy: it writes only the pid file. The
     // socket is free, so binding succeeds — the pid file is the only evidence

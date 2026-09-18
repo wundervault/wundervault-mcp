@@ -90,8 +90,8 @@ export class BrokerSigner {
 /**
  * A signer from this machine's broker identity, or null when there is no identity.
  *
- * Null is the honest answer on a machine that has never paired, and on macOS and Windows
- * until phases 7 and 8. The server accepts unsigned requests from an agent it has no
+ * Null is the honest answer on a machine that has never paired, and on Windows until
+ * phase 8. The server accepts unsigned requests from an agent it has no
  * broker bond for, so returning null degrades to the pre-split shape rather than breaking
  * — and the server, not this, is what decides which agents may take that path.
  */

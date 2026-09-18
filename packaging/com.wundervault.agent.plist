@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The daemon, as its own user. The macOS half of phase 4.
+
+  UserName is what does the work, exactly as User= does in the systemd unit. Everything the
+  vault claims about a key "never reaching the agent" was, before this, true on a Mac only
+  against an agent that did not try: same uid meant the agent could read the key files and
+  attach to this process.
+
+  WHAT LAUNCHD DOES NOT GIVE US, AND WE MUST NOT IMPLY IT DOES
+
+  The systemd unit carries a second layer the boundary does not depend on but benefits
+  from: ProtectSystem=strict, ProtectHome, PrivateTmp, ProtectProc=invisible,
+  SystemCallFilter, an empty CapabilityBoundingSet. launchd has NO equivalent for any of
+  them. A launchd job is an ordinary process owned by an ordinary account.
+
+  So on macOS the uid split is not merely the boundary — it is very nearly the whole of the
+  defence, and the daemon's filesystem reach is wider than on Linux. That is written into
+  /limitations rather than left for someone to discover. What macOS does give us for free:
+  System Integrity Protection keeps the account out of the system directories, and
+  task_for_pid against another uid needs root just as ptrace does on Linux.
+
+  Sandboxing this properly means a signed binary and an App Sandbox entitlement, which is
+  phase 9. It is not a prerequisite for the uid split and must not be allowed to block it.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.wundervault.agent</string>
+
+  <!-- Rewritten by the installer to the resolved, verified path. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/wundervault-agent</string>
+  </array>
+
+  <key>UserName</key>
+  <string>_wundervault</string>
+  <key>GroupName</key>
+  <string>_wundervault</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!--
+    Restart on a FAULT, stay down on a deliberate refusal.
+    
+    A bare <true/> here was wrong, and wrong in a way that only shows up on a machine that
+    is already broken. launchd has no equivalent of systemd's Restart=on-failure with a
+    give-up count: a KeepAlive job that exits non-zero comes straight back, every
+    ThrottleInterval, for ever. So a daemon correctly refusing to start — no store key and
+    no machine identity, a socket directory its agents cannot traverse — would respawn
+    every two seconds and append its explanation to a log inside a 0700 directory nobody
+    is watching, until the disk filled.
+    
+    SuccessfulExit=false means "restart unless it exited cleanly". The daemon exits 0 for
+    exactly those refusals and non-zero for everything else, so a crash is still restarted
+    and a misconfiguration stays down with its reason in the log. See ConfigurationRefusal
+    in src/agent.ts — the two halves have to stay in step.
+  -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>2</integer>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!--
+      One level down. /var/lib/wundervault itself is 0755 and holds nothing readable, so
+      agents can traverse it to reach /var/lib/wundervault/run; the private state is here,
+      at 0700. Putting the sockets inside a 0700 directory would deny every agent search
+      permission on the path to its own socket.
+    -->
+    <key>WUNDERVAULT_SYSTEM_ROOT</key>
+    <string>/var/lib/wundervault/state</string>
+    <!--
+      Which mechanism produced the store key, so the startup line makes the RIGHT promise.
+      'local-file' is a random key in a 0600 file owned by this account: not recomputable,
+      which the old derived key was, and not sealed to hardware, which the TPM tier is.
+      A copy of the disk plus root opens it. FileVault is what covers that, and FileVault
+      is not ours to claim.
+    -->
+    <key>WUNDERVAULT_SEAL_KIND</key>
+    <string>local-file</string>
+  </dict>
+
+  <!-- 63 decimal is 0077. launchd reads this key as decimal, not octal. -->
+  <key>Umask</key>
+  <integer>63</integer>
+
+  <!--
+    Inside the STATE directory, which is 0700 and owned by this account — the log names
+    agents and reports which store key is in use, so it does not belong in the traversable
+    directory above it. /var/log would mean a file launchd creates as root that this
+    account may not be able to append to, and a log nobody can write is a daemon that dies
+    at boot for a reason nobody can read.
+  -->
+  <key>StandardOutPath</key>
+  <string>/var/lib/wundervault/state/agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/lib/wundervault/state/agent.log</string>
+
+  <!-- No core file. A crash must not spill credentials onto the disk. -->
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+  </dict>
+</dict>
+</plist>

@@ -25,10 +25,11 @@
  * still need doing. That read is something the owner could always do; it moves no secret.
  */
 import fs from 'node:fs';
+import path from 'node:path';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { legacy, mgmtSocketPath, splitAvailable } from './paths.js';
+import { legacy, mgmtSocketPath, splitAvailable, systemRoot, isInside } from './paths.js';
 
 /** One request/response over a socket. */
 export function ask(payload: unknown, sockPath = mgmtSocketPath(), timeoutMs = 30_000): Promise<any> {
@@ -69,7 +70,9 @@ export function legacyAgentNames(): string[] {
   const uid = (process as unknown as { getuid?: () => number }).getuid?.() ?? 0;
   const ikm = crypto.createHash('sha256').update(`${machineId}:${uid}`).digest();
   const salt = fs.readFileSync(legacy.salt());
-  const key = crypto.hkdfSync('sha256', ikm, salt, Buffer.from('wundervault-agent-v1'), 32) as unknown as Buffer;
+  const key = Buffer.from(
+    crypto.hkdfSync('sha256', ikm, salt, Buffer.from('wundervault-agent-v1'), 32),
+  );
 
   const buf = fs.readFileSync(profilesPath);
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, buf.subarray(0, 12));
@@ -133,26 +136,58 @@ export interface MigrationStatus {
 
 /** What still needs doing. Reads; changes nothing. */
 /**
- * Migration is a Linux-only operation, and saying so prevents data loss.
+ * Migration only means anything where there is a split to migrate TO, and saying so
+ * prevents data loss.
  *
- * Off Linux there is no split to migrate TO: systemRoot() returns the user's own directory,
- * which means `profilesPath()` and `legacy.profiles()` are THE SAME FILE. Every agent the
- * daemon knows about therefore appears "already across", nothing is pending, and
- * `--migrate --finish` shreds the store the running daemon is actually using. A cleanup
- * step that deletes the live credential file because it mistook it for a leftover is about
- * the worst outcome available here, and it would have looked like a successful migration.
+ * Without one, systemRoot() returns the user's own directory, which means
+ * `profilesPath()` and `legacy.profiles()` are THE SAME FILE. Every agent the daemon knows
+ * about therefore appears "already across", nothing is pending, and `--migrate --finish`
+ * shreds the store the running daemon is actually using. A cleanup step that deletes the
+ * live credential file because it mistook it for a leftover is about the worst outcome
+ * available here, and it would have looked like a successful migration.
+ *
+ * Linux and macOS both qualify since phase 7. Windows does not.
  */
-function refuseOffLinux(): void {
-  if (splitAvailable()) return;
-  throw new Error(
-    `Migration is Linux-only. On ${process.platform} the daemon already stores credentials ` +
-    `in your own directory and there is nothing to move — the source and destination are ` +
-    `the same file, so continuing would delete the store this machine is using.`,
-  );
+function refuseWithoutSplit(): void {
+  if (!splitAvailable()) {
+    throw new Error(
+      `Migration needs a secret broker with its own account, and ${process.platform} ` +
+      `cannot have one yet. The daemon here stores credentials in your own directory and ` +
+      `there is nothing to move — the source and destination are the same file, so ` +
+      `continuing would delete the store this machine is using.`,
+    );
+  }
+
+  // Capability is not the same as an actual split, and only the second one is safe.
+  //
+  // A platform that CAN have a separate account does not mean this machine HAS one. Point
+  // WUNDERVAULT_SYSTEM_ROOT at the owner's own ~/.wundervault on Linux — a hand-started
+  // daemon, a misconfigured unit — and splitAvailable() is still true while
+  // profilesPath() and legacy.profiles() are once again THE SAME FILE. cleanup() would
+  // then find every agent "already across", conclude the source is a leftover, and delete
+  // the live store. The precondition was never the platform; it was that the source and
+  // the destination are different places.
+  if (isInside(systemRoot(), legacy.profiles()) || samePath(systemRoot(), legacyRootDir())) {
+    throw new Error(
+      `Refusing to migrate: the destination (${systemRoot()}) and the source ` +
+      `(${legacyRootDir()}) are the same place, so there is nothing to move and ` +
+      `continuing would delete the store this machine is using. This machine has no ` +
+      `privilege boundary installed — see the installer in packaging/.`,
+    );
+  }
+}
+
+function legacyRootDir(): string {
+  return path.dirname(legacy.profiles());
+}
+
+function samePath(a: string, b: string): boolean {
+  try { return fs.realpathSync(a) === fs.realpathSync(b); }
+  catch { return path.resolve(a) === path.resolve(b); }
 }
 
 export async function status(): Promise<MigrationStatus> {
-  refuseOffLinux();
+  refuseWithoutSplit();
   const oldStorePath = legacy.profiles();
   const ping = await ask({ action: 'ping' }).catch((e) => {
     throw new Error(
@@ -328,7 +363,7 @@ export interface CleanupResult { deleted: boolean; oldUnitStopped: boolean; pend
  * way back except creating a new one.
  */
 export async function cleanup(): Promise<CleanupResult> {
-  refuseOffLinux();
+  refuseWithoutSplit();
   const st = await status();
   if (st.alreadyDone) {
     // The store is already gone, but the old unit may not be — an earlier --finish could

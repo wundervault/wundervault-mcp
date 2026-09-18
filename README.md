@@ -59,17 +59,33 @@ New account? [wundervault.com](https://wundervault.com) has a 90-second agent on
 
 ## Supported platforms
 
-**Linux is the verified platform.** macOS works for secret delivery; Windows does not.
+**Linux and macOS both get the privilege boundary. Windows does not yet.**
+
+On Linux and macOS the secret broker runs as its own account — a systemd unit as
+`wundervault`, a LaunchDaemon as `_wundervault` — with its state in a directory your
+agents cannot open. On Windows the daemon runs as you, which means its key material is
+readable by anything you run, and it says so at every start.
+
+What macOS does NOT get is the second layer. The systemd unit adds `ProtectSystem=strict`,
+`ProtectHome`, `ProtectProc`, a system-call filter and an empty capability set; launchd has
+no equivalent for any of them. The uid split is the boundary on both, and on macOS it is
+very nearly the whole of the defence. Neither is a sandbox.
+
+The store key differs too, because the mechanisms do. Linux seals it with `systemd-creds`,
+to a TPM where there is one. macOS has nothing we can reach without a signed binary, so the
+installer writes a random key into a 0600 file owned by the broker's account: not
+recomputable, which the old derived key was, but not sealed either — a copy of the disk
+plus root opens it, and FileVault is what covers that.
 
 Delivery is POSIX-only by construction: the `sudo` recipe pipes through `/bin/sh`, and
 the `git` / `ssh-passphrase` recipes need `mkfifo` and `setsid`. On Windows those
 mechanisms return a clear "not supported" error rather than failing somewhere deep
 inside.
 
-The single-instance lock has two implementations: a kernel-held abstract socket on
-Linux, and loopback ports elsewhere. Only the Linux one is covered by tests — see
-`HANDOFF-lock-on-non-linux.md` for what is unverified on macOS and why. CI runs both
-platforms; the lock suite runs on Linux.
+The single-instance lock has two implementations: a kernel-held abstract socket on Linux,
+and a single derived loopback port elsewhere. Both are covered by tests on every CI run —
+the port path is exercised on Linux through `WUNDERVAULT_LOCK_STRATEGY=port`, which is how
+a concurrency bug in it was found that only macOS could previously have shown.
 
 ## Security Model
 

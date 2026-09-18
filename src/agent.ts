@@ -32,12 +32,14 @@ import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { VERSION } from './version.js';
 import { redeemSetupLink, peekAgentName } from './enrol.js';
 import {
   systemRoot, profilesPath, saltPath, mgmtSocketPath, agentSocketPath,
   runtimeDir, ensureSystemRoot, safeName, SYSTEM_ACCOUNT, mgmtDir, networkStorePath,
-  splitAvailable, systemdCredential, sealedWithTpm,
+  splitAvailable, systemdCredential, sealKind, boundaryIsReal,
+  type SealKind,
 } from './paths.js';
 import { load as loadNetworkShape } from './network-store.js';
 import { BrokerOps } from './broker-ops.js';
@@ -105,14 +107,54 @@ interface ProfileStore {
  * does not try.
  */
 function announceBoundary(): void {
-  if (splitAvailable()) return;
+  if (boundaryIsReal()) return;
+
+  // Two different situations, and telling them apart is the whole value of the message.
+  if (!splitAvailable()) {
+    console.error(
+      `[wundervault-agent] Running on ${process.platform}, where the secret broker cannot\n` +
+      `[wundervault-agent] have its own account. State is in your own directory and it runs as\n` +
+      `[wundervault-agent] YOU — so its key material and memory are readable by anything you\n` +
+      `[wundervault-agent] run, including your agents. That is the pre-split threat model.`,
+    );
+    return;
+  }
+
+  // The platform CAN do this and the install has not been done — or has been undone. Said
+  // separately because the fix is a command, not a wait for a future release.
+  const installer = process.platform === 'darwin'
+    ? 'sudo sh packaging/install-daemon-macos.sh'
+    : 'sudo sh packaging/install-daemon.sh';
   console.error(
-    `[wundervault-agent] Running on ${process.platform}, where the secret broker cannot yet\n` +
-    `[wundervault-agent] have its own account. State is in your own directory and it runs as\n` +
-    `[wundervault-agent] YOU — so its key material and memory are readable by anything you\n` +
-    `[wundervault-agent] run, including your agents. That is the pre-split threat model.\n` +
-    `[wundervault-agent] The boundary is Linux-only for now.`,
+    `[wundervault-agent] No privilege boundary: ${systemRoot()} is not a 0700 directory\n` +
+    `[wundervault-agent] owned by a separate account, so this daemon is running as the same\n` +
+    `[wundervault-agent] user as the agents it serves. Its key material and memory are\n` +
+    `[wundervault-agent] readable by anything you run.\n` +
+    `[wundervault-agent]   ${installer}`,
   );
+}
+
+/**
+ * A refusal that RESTARTING CANNOT FIX.
+ *
+ * launchd has no equivalent of systemd's `Restart=on-failure` with a give-up count: a
+ * KeepAlive job that exits non-zero is restarted, immediately, for ever. So a daemon that
+ * correctly refuses to start — no store key and no machine identity, a socket directory
+ * the agents cannot traverse, running as the wrong account — would respawn every couple of
+ * seconds and append its explanation to a log inside a 0700 directory nobody is watching,
+ * until the disk filled.
+ *
+ * The launchd idiom for "do not bring me back" is a CLEAN exit, paired with
+ * `KeepAlive: {SuccessfulExit: false}` in the plist. So these refusals exit 0. That is not
+ * a claim that everything is fine — the message says plainly that it is not — it is the
+ * only way to tell launchd that coming back will not help. A genuine crash still exits
+ * non-zero and is still restarted, which is what KeepAlive is for.
+ *
+ * The two halves must stay in step: if the plist ever goes back to a bare `KeepAlive`,
+ * this becomes a silent stop instead of a loud one.
+ */
+export class ConfigurationRefusal extends Error {
+  readonly configurationRefusal = true;
 }
 
 function refuseRoot(): void {
@@ -151,24 +193,121 @@ function refuseRoot(): void {
  * the weaker mode while the release notes describe the stronger one, so the mode in force is
  * reported at startup and by `ping`.
  */
-type KeyMode = 'sealed-tpm' | 'sealed-host' | 'derived';
+type KeyMode = 'sealed-tpm' | 'sealed-host' | 'local-file' | 'derived' | 'derived-shared';
 
-function legacyDerivedKey(): Buffer {
+/**
+ * This machine's identity, or null when it has none we can read.
+ *
+ * `/etc/machine-id` is a Linux file. On macOS the read fails, and the ORIGINAL code
+ * swallowed that and carried on with the literal string `unknown` — so the derived store
+ * key on a Mac was HKDF over sha256("unknown:501"), and 501 is the first account macOS
+ * creates. Every Mac in the world running this daemon derived the SAME store key. The
+ * fallback was documented as "recomputable by anyone who can read the directory"; on macOS
+ * it was computable by anyone who could read this source file.
+ *
+ * The macOS equivalent is the hardware UUID from the IOKit registry. It is not a secret
+ * either — nothing about the derived mode is — but it is per-machine, which is the entire
+ * property the derivation was supposed to have.
+ */
+export function machineIdentity(): string | null {
+  const override = process.env.WUNDERVAULT_MACHINE_ID;
+  if (override && override.trim()) return override.trim();
+
+  // DARWIN FIRST, and the order is deliberate. /etc/machine-id is not a macOS file, but
+  // nothing stops a third-party package or an administrator creating one — and a file that
+  // can be copied between machines with the disk image is exactly the property this
+  // derivation must not have. The hardware UUID cannot be copied, so on a Mac it wins.
+  if (process.platform === 'darwin') {
+    try {
+      const out = execFileSync('/usr/sbin/ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'], {
+        encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const uuid = parseIOPlatformUUID(out);
+      if (uuid) return uuid;
+    } catch { /* no ioreg, or it failed */ }
+  }
+
+  try {
+    const id = fs.readFileSync('/etc/machine-id', 'utf8').trim();
+    if (id) return id;
+  } catch { /* not linux, or a container without one */ }
+
+  return null;
+}
+
+/**
+ * Pull the hardware UUID out of ioreg's output.
+ *
+ * Separated from the exec so the parsing — the part that can silently return the wrong
+ * thing — is testable somewhere other than a Mac. A regex that quietly fails to match
+ * lands us straight back on the shared key, which is the bug this replaced.
+ */
+export function parseIOPlatformUUID(ioregOutput: string): string | null {
+  const m = ioregOutput.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
+  if (!m || !m[1]) return null;
+  // ioreg prints a canonical UUID. Anything else means the format moved and we should say
+  // we have no identity rather than derive a key from a surprise.
+  const v = m[1].trim();
+  return /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/.test(v)
+    ? v
+    : null;
+}
+
+/**
+ * The OLD derived key, kept for ONE purpose: opening a store THIS DAEMON ACCOUNT wrote
+ * under the previous derivation.
+ *
+ * It contains the `unknown` constant deliberately — removing it would leave such a store
+ * unopenable, turning an upgrade into silent data loss. New stores are never written
+ * under it.
+ *
+ * WHAT IT DOES NOT DO, because an earlier comment here implied otherwise: it does not
+ * carry a PRE-SPLIT macOS store across. That store lives in the owner's home and was
+ * encrypted with the OWNER's uid in the derivation; this runs as the daemon account, with
+ * a different uid, so the key does not match and could not. Nor should it — migration
+ * deliberately carries no credentials. `--migrate` runs as the owner, reads only the
+ * agent NAMES out of that store (see legacyAgentNames in migrate.ts, which derives with
+ * the owner's uid and is correct as written), and the credentials themselves are replaced
+ * by REPAIR, in the dashboard. Do not "fix" this to reach across the uid boundary.
+ */
+export function legacyDerivedKey(): Buffer {
   let machineId = 'unknown';
   try { machineId = fs.readFileSync('/etc/machine-id', 'utf8').trim(); } catch { /* not linux */ }
   const uid = (process as unknown as { getuid?: () => number }).getuid?.() ?? 0;
   const ikm = crypto.createHash('sha256').update(`${machineId}:${uid}`).digest();
 
-  let salt: Buffer;
+  // Buffer.from, not a cast: hkdfSync returns an ArrayBuffer, and the `as unknown as
+  // Buffer` this replaced made `.length` read undefined on a value the rest of the file
+  // treats as a Buffer. It happened to work because nothing asked.
+  return Buffer.from(crypto.hkdfSync(
+    'sha256', ikm, readOrCreateSalt(), Buffer.from('wundervault-agent-v1'), 32,
+  ));
+}
+
+function readOrCreateSalt(): Buffer {
   const sp = saltPath();
-  if (fs.existsSync(sp)) {
-    salt = fs.readFileSync(sp);
-  } else {
-    salt = crypto.randomBytes(32);
-    ensureSystemRoot();
-    fs.writeFileSync(sp, salt, { mode: 0o600 });
-  }
-  return crypto.hkdfSync('sha256', ikm, salt, Buffer.from('wundervault-agent-v1'), 32) as unknown as Buffer;
+  if (fs.existsSync(sp)) return fs.readFileSync(sp);
+  const salt = crypto.randomBytes(32);
+  ensureSystemRoot();
+  fs.writeFileSync(sp, salt, { mode: 0o600 });
+  return salt;
+}
+
+/**
+ * The derived key for a machine that HAS an identity. Same construction, real input.
+ *
+ * Shares the salt file with the legacy key deliberately: the salt is not the secret and a
+ * second salt would mean a second file to lose.
+ */
+export function derivedKeyFor(identity: string): Buffer {
+  const uid = (process as unknown as { getuid?: () => number }).getuid?.() ?? 0;
+  const ikm = crypto.createHash('sha256').update(`${identity}:${uid}`).digest();
+  // Buffer.from, not a cast: hkdfSync returns an ArrayBuffer, and the `as unknown as
+  // Buffer` this replaced made `.length` read undefined on a value the rest of the file
+  // treats as a Buffer. It happened to work because nothing asked.
+  return Buffer.from(crypto.hkdfSync(
+    'sha256', ikm, readOrCreateSalt(), Buffer.from('wundervault-agent-v1'), 32,
+  ));
 }
 
 function sealedKey(): Buffer | null {
@@ -176,15 +315,66 @@ function sealedKey(): Buffer | null {
   if (!raw) return null;
   // Expanded rather than used raw, so the stored secret is never the working key and can be
   // re-purposed later (a second context string gives a second independent key).
-  return crypto.hkdfSync(
+  return Buffer.from(crypto.hkdfSync(
     'sha256', raw, Buffer.alloc(0), Buffer.from('wundervault-store-v2'), 32,
-  ) as unknown as Buffer;
+  ));
+}
+
+/**
+ * WHICH mode applies, separated from the key material so the decision can be asserted.
+ *
+ * The inputs are the three facts that decide it, supplied rather than read: whether a key
+ * was unsealed, what kind, whether this machine has an identity, and whether there is
+ * already a store on disk. Every one of those is awkward to arrange in a test and trivial
+ * to pass — and the no-identity branch in particular is unreachable on any machine that
+ * has /etc/machine-id or ioreg, which is all of them.
+ */
+export function keyModeFor(
+  sealed: boolean,
+  kind: SealKind,
+  hasIdentity: boolean,
+  storeExists: boolean,
+): KeyMode | 'refuse' {
+  if (sealed) {
+    return kind === 'tpm' ? 'sealed-tpm' : kind === 'local-file' ? 'local-file' : 'sealed-host';
+  }
+  if (hasIdentity) return 'derived';
+  // No key and no identity. Refusing is right only when nothing is lost by it.
+  return storeExists ? 'derived-shared' : 'refuse';
 }
 
 function deriveMachineKey(): { key: Buffer; mode: KeyMode } {
   const sealed = sealedKey();
-  if (sealed) return { key: sealed, mode: sealedWithTpm() ? 'sealed-tpm' : 'sealed-host' };
-  return { key: legacyDerivedKey(), mode: 'derived' };
+  const identity = machineIdentity();
+  const mode = keyModeFor(!!sealed, sealKind(), identity !== null, fs.existsSync(profilesPath()));
+
+  if (mode === 'refuse') {
+    throw new ConfigurationRefusal(
+      `Refusing to start: there is no store key and this machine has no identity to ` +
+      `derive one from, so the only key available is identical on every machine with ` +
+      `this uid. There is no existing store here, so nothing is lost by stopping.\n` +
+      `  Install the broker, which writes a random store key, or set ` +
+      `WUNDERVAULT_MACHINE_ID to a per-machine value.`,
+    );
+  }
+  if (sealed) return { key: sealed, mode };
+  if (identity) return { key: derivedKeyFor(identity), mode };
+
+  // No sealed key and no machine identity. The legacy derivation still works here, and it
+  // is the same value on every machine with this uid — so the store is readable by anyone
+  // holding a copy of the ciphertext and this source file.
+  //
+  // WHETHER TO REFUSE DEPENDS ENTIRELY ON WHETHER THERE IS ANYTHING TO LOSE.
+  //
+  // With NO store on disk, refusing is right and there is no cost: nothing is stranded,
+  // and starting would mean writing a NEW store under a key that is not a secret. Refuse.
+  //
+  // With a store already there, refusing to start is how an existing install becomes
+  // unrecoverable — the same failure the unit file refuses elsewhere, where a cleared TPM
+  // must not mean a broker that never reaches ExecStart. The store is already encrypted
+  // under this key; declining to open it protects nothing and strands everything. Serve
+  // it, say so at every start, and refuse ENROLMENT so no new secret joins it.
+  return { key: legacyDerivedKey(), mode };
 }
 
 function encryptProfiles(store: ProfileStore, key: Buffer): Buffer {
@@ -398,6 +588,17 @@ class AgentDaemon {
       throw new Error(
         `Refusing to enrol while the profile store cannot be read. Writing now would ` +
         `replace every credential in it with only what is in memory.`,
+      );
+    }
+
+    // A key that is identical on every machine with this uid is not a key. Existing agents
+    // keep working — pulling them off the air would be a worse answer than the one this
+    // refuses — but a NEW credential must not be committed to it.
+    if (this.keyMode === 'derived-shared') {
+      throw new Error(
+        `Refusing to enrol: this machine has no identity to derive a store key from, so ` +
+        `the key protecting the store is the same on every machine with this uid. ` +
+        `Install the broker, or set WUNDERVAULT_MACHINE_ID to a per-machine value.`,
       );
     }
 
@@ -1023,6 +1224,25 @@ class AgentDaemon {
   start(): void {
     const rt = runtimeDir();
     fs.mkdirSync(rt, { recursive: true, mode: 0o755 });
+    // chmod, not just mkdir's mode. mkdir masks its mode by umask and ignores it outright
+    // when the directory already exists — the same trap ensureSystemRoot() documents, and
+    // it bites harder here. The macOS LaunchDaemon sets Umask 0077 so that files this
+    // process writes are private, which silently turns this 0755 into 0700; the agents run
+    // as the OWNER, so a 0700 socket directory means every single one of them gets EACCES
+    // connecting to its own socket, on a machine where nothing else is wrong.
+    //
+    // The directory being traversable costs nothing. The sockets inside it are
+    // world-connectable by design and each carries its own token — nothing here is
+    // protected by being hard to reach.
+    fs.chmodSync(rt, 0o755);
+    const rtMode = fs.statSync(rt).mode & 0o777;
+    if ((rtMode & 0o011) !== 0o011) {
+      throw new ConfigurationRefusal(
+        `${rt} is mode ${rtMode.toString(8)}. Agents run as the machine's owner and need ` +
+        `search permission on this directory to reach their sockets; at this mode every ` +
+        `connection would fail with EACCES.`,
+      );
+    }
     // Clear sockets left by a crash. A stale file makes listen() fail, and the daemon
     // would come up with no socket while reporting itself started.
     try {
@@ -1064,6 +1284,24 @@ class AgentDaemon {
         '[wundervault-agent] That key is on this same disk, so an offline copy plus root\n' +
         '[wundervault-agent] WOULD open the store. It stops a casual file read, not a\n' +
         '[wundervault-agent] stolen disk. A TPM is what makes the disk copy useless.',
+      );
+    } else if (this.keyMode === 'local-file') {
+      // macOS. Not sealed to anything, and deliberately NOT given the TPM sentence. What it
+      // is: a random key, so it cannot be recomputed. What it is not: protected against
+      // someone holding the disk. FileVault covers that and FileVault is not ours to claim.
+      console.log(
+        '[wundervault-agent] Store key: a random key in a 0600 file owned by this account.\n' +
+        '[wundervault-agent] It is NOT sealed to hardware — a copy of the disk plus root\n' +
+        '[wundervault-agent] WOULD open the store. It is not recomputable, which the old\n' +
+        '[wundervault-agent] derived key was. FileVault is what covers a stolen disk.',
+      );
+    } else if (this.keyMode === 'derived-shared') {
+      console.error(
+        '[wundervault-agent] Store key: DERIVED, and this machine has no identity to derive\n' +
+        '[wundervault-agent] from — so the key is THE SAME on every machine with this uid.\n' +
+        '[wundervault-agent] Anyone holding a copy of the store can open it without this\n' +
+        '[wundervault-agent] machine. Enrolment is refused until that is fixed: install the\n' +
+        '[wundervault-agent] broker, or set WUNDERVAULT_MACHINE_ID to something per-machine.',
       );
     } else {
       console.error(
@@ -1415,8 +1653,17 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
   } else {
     refuseRoot();
     announceBoundary();
-    const daemon = new AgentDaemon();
-    daemon.start();
+    let daemon: AgentDaemon;
+    try {
+      daemon = new AgentDaemon();
+      daemon.start();
+    } catch (err) {
+      const e = err as Error & { configurationRefusal?: boolean };
+      console.error(`[wundervault-agent] ${e.message}`);
+      // Exit 0 ONLY for a refusal a restart cannot fix — see ConfigurationRefusal. Any
+      // other failure keeps its non-zero code so launchd and systemd both retry it.
+      process.exit(e.configurationRefusal ? 0 : 1);
+    }
     process.on('SIGTERM', () => { daemon.shutdown(); process.exit(0); });
     process.on('SIGINT', () => { daemon.shutdown(); process.exit(0); });
   }

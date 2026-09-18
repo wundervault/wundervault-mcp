@@ -1,0 +1,29 @@
+{"round": 21, "decisions": [
+  {"id": "F1", "action": "fixed",
+   "claim": "With no sealed key and no machine identity the daemon uses the globally shared legacy key instead of refusing, as acceptance 10 required",
+   "reason": "Confirmed against the code as shown. I had deliberately softened this during the build and the reviewer was sent the PRE-amendment spec, so it was holding me to the text it had. Its scenario is right and my softening was too broad. Now split on the only thing that matters: keyModeFor(sealed=false, identity=false, storeExists=false) returns 'refuse' and the daemon throws, because nothing is lost by stopping and starting would write a NEW store under a key that is not a secret; with a store already present it returns 'derived-shared', serves it, warns at every start and refuses enrolment, because refusing to open a store already encrypted under that key protects nothing and strands everything. Extracted keyModeFor() as a pure function so the no-identity branch is assertable at all — it is unreachable on any machine that has /etc/machine-id or ioreg."},
+
+  {"id": "F2", "action": "fixed",
+   "claim": "boundaryIsReal() can return true when the daemon and the agents are the same owner uid, because SUDO_UID is only set under sudo",
+   "reason": "Confirmed, and it is the hole the function existed to close. An owner starting the daemon by hand with WUNDERVAULT_SYSTEM_ROOT pointed at a scratch directory gets a 0700 directory owned by their own uid outside ~/.wundervault, which passed every check. boundaryIsReal() now also requires os.userInfo().username to equal the expected service account (wundervault / _wundervault, overridable by WUNDERVAULT_SYSTEM_ACCOUNT for a non-standard install). The account name is the one signal present however the process was started. Sabotage: removing that line fails the new test."},
+
+  {"id": "F3", "action": "rejected",
+   "claim": "The legacy fallback cannot open a pre-phase-7 macOS store after the uid split, because the old store was keyed on the owner uid and the daemon now runs as another",
+   "reason": "The arithmetic is right and the conclusion does not follow, because nothing ever asks the daemon to open that store. Migration deliberately carries no credentials: `--migrate` runs as the OWNER, and legacyAgentNames() in migrate.ts derives with the owner's uid to read only the agent NAMES; the credentials are replaced by REPAIR in the dashboard, which is the phase-4 design. The daemon's loadProfiles fallback exists for a store THIS ACCOUNT wrote under the previous derivation, not for the pre-split user store. Reviewer was not shown migrate.ts. What it did catch is a comment of mine that implied the fallback carried a macOS store across — that overclaim is now corrected in the source, with an explicit note not to 'fix' it into reaching across the uid boundary."},
+
+  {"id": "F4", "action": "fixed",
+   "claim": "The migration refusal checks platform capability rather than an actual split, so a same-directory source and destination can still reach destructive cleanup",
+   "reason": "Confirmed, and it predates this phase — the original guard checked splitAvailable() too; renaming it is what drew the eye. The precondition was never the platform, it was that source and destination are different places. refuseWithoutSplit() now also refuses when systemRoot() and the legacy root resolve to the same path or one contains the other. Sabotage: reverting to the capability-only check fails the new test."},
+
+  {"id": "F5", "action": "fixed",
+   "claim": "isInside() mis-resolves a macOS /var alias when the child does not exist yet",
+   "reason": "Confirmed, and it hits every socket path, since those are always about to be created. Resolving each side independently let the parent resolve through the symlink while the child fell back to its literal form. Now resolves the deepest EXISTING ancestor of each side and re-appends the remainder. Tested with a real symlink, which is the same shape on any platform."},
+
+  {"id": "F6", "action": "fixed",
+   "claim": "machineIdentity() consults /etc/machine-id before ioreg, so a Mac with that file never uses the hardware UUID, and the darwin branch is untested",
+   "reason": "Confirmed on the ordering. A file that travels with a disk image is exactly the property this derivation must not have, and the hardware UUID cannot be copied, so on darwin it now wins. The test gap is real and only partly closed: parseIOPlatformUUID is tested against real ioreg output, but the branch that SHELLS OUT is exercised only when CI runs on macos-latest, which it does. Recorded as a known gap rather than claimed as covered."},
+
+  {"id": "F7", "action": "rejected",
+   "claim": "The Windows pre-split warning changed, though the spec requires it byte-for-byte unchanged",
+   "reason": "The text did change and it had to. The removed sentence was 'The boundary is Linux-only for now.', which this phase makes FALSE — keeping it byte-for-byte would ship a statement the release contradicts. The spec's 'byte for byte' was about Windows BEHAVIOUR being untouched, which it is: shape 'none', splitAvailable() false, pre-split layout, warning printed. Spec amended to say behaviour rather than bytes, so the next round is not told the same thing."}
+]}

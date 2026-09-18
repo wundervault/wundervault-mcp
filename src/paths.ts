@@ -8,11 +8,16 @@
  * writable by the party it described.
  *
  * The split moves daemon state to `/var/lib/wundervault`, mode 0700, owned by a system
- * account. The mode is the control. The at-rest encryption beside it is defence in depth
- * and nothing more — its key derives from the machine id, the uid and a salt file stored
- * next to the ciphertext, so anyone who can read the directory can recompute it. Calling
- * that "encrypted at rest" as though it were the boundary would repeat exactly the mistake
- * this phase exists to correct.
+ * account — `wundervault` under a systemd unit on Linux, `_wundervault` under a
+ * LaunchDaemon on macOS. The mode is the control. The at-rest encryption beside it is
+ * defence in depth and nothing more; calling it "encrypted at rest" as though it were the
+ * boundary would repeat exactly the mistake this phase exists to correct.
+ *
+ * ON macOS THE BOUNDARY IS THE SAME AND THE DEFENCE AROUND IT IS THINNER. The systemd unit
+ * carries ProtectSystem=strict, ProtectHome, ProtectProc=invisible, a system-call filter
+ * and an empty capability set. launchd has no equivalent for any of them, so the uid split
+ * there is very nearly the whole of it. Written down here and in /limitations rather than
+ * left for someone to infer parity that does not exist.
  *
  * TWO ROOTS, AND THEY ARE NOT THE SAME THING
  *
@@ -33,6 +38,31 @@ export const DEFAULT_SYSTEM_ROOT = '/var/lib/wundervault';
 export const SYSTEM_ACCOUNT = 'wundervault';
 
 /**
+ * macOS keeps its state one level down, and the reason is not tidiness.
+ *
+ * On Linux the sockets live in /run/wundervault, which systemd creates at 0755 OUTSIDE the
+ * 0700 state directory. macOS has no /run and no RuntimeDirectory=, and the obvious answer
+ * — put the sockets inside the state directory — is fatally wrong: 0700 means no search
+ * permission for anyone but the daemon account, so an agent, which runs as the OWNER,
+ * cannot traverse into it to reach its own socket. Every connection would fail with EACCES
+ * on a machine where the install had gone perfectly.
+ *
+ * So the top directory is traversable and holds nothing readable, with the private state
+ * one level down:
+ *
+ *   /var/lib/wundervault        0755  the account   — traversable, empty of secrets
+ *   /var/lib/wundervault/state  0700  the account   — the boundary
+ *   /var/lib/wundervault/run    0755  the account   — sockets, reachable by agents
+ *
+ * This is the same shape the module already argues for elsewhere: the sockets are
+ * world-connectable and the TOKEN is the identity. Nothing is protected by being hard to
+ * reach — so nothing legitimate may be made hard to reach either.
+ */
+export const DARWIN_BASE = '/var/lib/wundervault';
+export const DARWIN_SYSTEM_ROOT = `${DARWIN_BASE}/state`;
+export const DARWIN_ACCOUNT = '_wundervault';
+
+/**
  * Daemon-owned state.
  *
  * `WUNDERVAULT_SYSTEM_ROOT` exists so tests can point this somewhere writable, and so an
@@ -42,31 +72,84 @@ export const SYSTEM_ACCOUNT = 'wundervault';
  * daemon's environment.
  */
 /**
- * Is the uid split actually available here?
+ * Is the uid split actually available here, and which layout are we using?
  *
- * Phase 4 is Linux, and macOS (4b) and Windows (4c) are deliberately later. But OUT OF
- * SCOPE HAS TO MEAN UNCHANGED, not broken — and for two commits it meant broken. The
+ * Phase 4 was Linux; phase 7 adds macOS; Windows (phase 8) is deliberately later. But OUT
+ * OF SCOPE HAS TO MEAN UNCHANGED, not broken — and for two commits it meant broken. The
  * daemon's constructor calls ensureSystemRoot() unconditionally, so on macOS it tried to
  * mkdir /var/lib/wundervault as a normal user and died with EACCES where it had previously
  * used the home directory. On Windows it is quieter and worse: /var/lib/wundervault
  * resolves to C:\var\lib\wundervault, the mkdir SUCCEEDS, and the daemon then tries to
  * bind unix domain sockets there, which Windows does not have.
  *
- * Every non-Linux platform therefore keeps the pre-split layout exactly: state in the
- * user's own directory, daemon as the user. That is the old threat model, and the code
- * says so out loud rather than letting anyone infer a boundary that is not there.
+ * Windows therefore keeps the pre-split layout exactly: state in the user's own directory,
+ * daemon as the user. That is the old threat model, and the code says so out loud rather
+ * than letting anyone infer a boundary that is not there.
+ *
+ * TWO QUESTIONS, NOT ONE — AND KEEPING THEM APART IS THE POINT
+ *
+ * `platformShape()` decides WHERE THINGS GO. It is overridable, because otherwise the
+ * macOS layout is unreachable from CI on Linux and verifiable only by hand on one
+ * machine — which is precisely how the port lock in lock.ts shipped broken and stayed
+ * broken for a release.
+ *
+ * `splitAvailable()` decides WHETHER A BOUNDARY IS POSSIBLE. It consults the REAL
+ * platform, so the override can make a Linux box exercise the darwin paths but can never
+ * make a platform claim a separation it cannot perform.
+ *
+ * And neither of them is what we tell the user. That is `boundaryIsReal()`, below, which
+ * looks at the directory rather than at the operating system.
  */
-export const SPLIT_AVAILABLE = process.platform === 'linux';
+export type PlatformShape = 'linux' | 'darwin' | 'none';
 
-/** True where the daemon holds a real privilege boundary rather than merely tidy habits. */
+/** Platforms on which a second uid is actually reachable. NOT overridable. */
+const SPLIT_CAPABLE = new Set(['linux', 'darwin']);
+
+function shapeFor(platform: string): PlatformShape {
+  if (platform === 'linux') return 'linux';
+  if (platform === 'darwin') return 'darwin';
+  return 'none';
+}
+
+/**
+ * Which layout to use. `WUNDERVAULT_PLATFORM_SHAPE` exists so a test on one platform can
+ * exercise another's paths. An unrecognised value is a typo, not a request for the
+ * pre-split layout, so it throws rather than silently dropping the boundary.
+ */
+export function platformShape(): PlatformShape {
+  const override = process.env.WUNDERVAULT_PLATFORM_SHAPE;
+  if (override) {
+    if (override !== 'linux' && override !== 'darwin' && override !== 'none') {
+      throw new Error(
+        `WUNDERVAULT_PLATFORM_SHAPE=${JSON.stringify(override)} is not one of ` +
+        `linux, darwin, none.`,
+      );
+    }
+    return override;
+  }
+  return shapeFor(process.platform);
+}
+
+/**
+ * Pure, so the combination can be asserted directly rather than by stubbing a global.
+ *
+ * The real platform is the veto. A shape of 'linux' on Windows yields FALSE: the override
+ * relocates state, it does not conjure an account the operating system cannot give us.
+ */
+export function splitAvailableFor(realPlatform: string, shape: PlatformShape): boolean {
+  return SPLIT_CAPABLE.has(realPlatform) && shape !== 'none';
+}
+
+/** True where the daemon CAN hold a real privilege boundary. Not that it does. */
 export function splitAvailable(): boolean {
-  return SPLIT_AVAILABLE;
+  return splitAvailableFor(process.platform, platformShape());
 }
 
 export function systemRoot(): string {
   if (process.env.WUNDERVAULT_SYSTEM_ROOT) return process.env.WUNDERVAULT_SYSTEM_ROOT;
-  // Off Linux there is no system account and no unit: the daemon is the user, as before.
-  if (!SPLIT_AVAILABLE) return userRoot();
+  // Where there is no system account and no unit, the daemon is the user, as before.
+  if (!splitAvailable()) return userRoot();
+  if (platformShape() === 'darwin') return DARWIN_SYSTEM_ROOT;
   return DEFAULT_SYSTEM_ROOT;
 }
 
@@ -103,10 +186,36 @@ export function runtimeDir(): string {
   if (process.env.RUNTIME_DIRECTORY) return process.env.RUNTIME_DIRECTORY.split(':')[0];
   if (process.env.WUNDERVAULT_RUNTIME_DIR) return process.env.WUNDERVAULT_RUNTIME_DIR;
   // /run is a Linux thing, and so is the systemd RuntimeDirectory that manages it.
-  if (!SPLIT_AVAILABLE) return userRoot();
+  if (!splitAvailable()) return userRoot();
   const run = `/run/${SYSTEM_ACCOUNT}`;
-  try { if (fs.existsSync(run)) return run; } catch { /* fall through */ }
-  return path.join(systemRoot(), 'run');
+  let linuxRunExists = false;
+  try { linuxRunExists = fs.existsSync(run); } catch { /* treat as absent */ }
+  return runtimeDirFor(platformShape(), systemRoot(), linuxRunExists);
+}
+
+/**
+ * Pure, and pure for a reason that cost a round to learn.
+ *
+ * The darwin branch and the Linux fallback return THE SAME STRING on a box that has no
+ * /run/wundervault — which is every development box. So a test asserting the returned path
+ * passed whether the darwin branch was there or not: deleting it entirely left the suite
+ * green. What distinguishes the two is the DECISION, not the result, and a decision is only
+ * observable if the inputs can be supplied.
+ *
+ * macOS has no /run, and /var/run is cleared at boot and unwritable by the service account,
+ * so there is no analogue of systemd's RuntimeDirectory=. The runtime directory lives inside
+ * the state directory, which the account already owns.
+ */
+export function runtimeDirFor(
+  shape: PlatformShape,
+  root: string,
+  linuxRunExists: boolean,
+): string {
+  // A SIBLING of the state directory, never a child. The state directory is 0700, which
+  // denies search permission to the agents that have to reach these sockets.
+  if (shape === 'darwin') return path.join(path.dirname(root), 'run');
+  if (linuxRunExists) return `/run/${SYSTEM_ACCOUNT}`;
+  return path.join(root, 'run');
 }
 
 /**
@@ -129,6 +238,11 @@ export function systemdCredential(name = CREDENTIAL_NAME): Buffer | null {
   const dir = process.env.CREDENTIALS_DIRECTORY;
   if (dir) candidates.push(path.join(dir, name));
   candidates.push(path.join(runtimeDir(), 'store.key'));
+  // macOS has no systemd and nothing that unseals on our behalf, so the installer writes a
+  // RANDOM key into the state directory at 0600, owned by the daemon account. It is not
+  // sealed and the startup report must not say it is — but it is not DERIVED either, which
+  // is the difference that matters: nobody can recompute it from public inputs.
+  if (platformShape() === 'darwin') candidates.push(storeKeyPath());
 
   for (const p of candidates) {
     try {
@@ -151,8 +265,37 @@ export function systemdCredential(name = CREDENTIAL_NAME): Buffer | null {
  * was being printed.
  */
 export function sealedWithTpm(): boolean {
-  return process.env.WUNDERVAULT_SEAL_KIND === 'tpm';
+  return sealKind() === 'tpm';
 }
+
+/**
+ * Which mechanism produced the store key, so the startup report can make the RIGHT promise.
+ *
+ *   'tpm'        — sealed to this machine's TPM. A copy of the disk does not open it.
+ *   'host'       — sealed to systemd's host key, which is on the same disk. Root plus a
+ *                  disk copy does open it.
+ *   'local-file' — macOS. A random key in a 0600 file owned by the daemon account. Same
+ *                  promise as 'host': not recomputable, not sealed to hardware. FileVault
+ *                  is what covers the stolen-disk case, and FileVault is not ours to claim.
+ *
+ * Three names because three different sentences are true, and the failure this codebase
+ * keeps having is one sentence being reused for a weaker mechanism.
+ */
+export type SealKind = 'tpm' | 'host' | 'local-file' | null;
+
+export function sealKind(): SealKind {
+  const declared = process.env.WUNDERVAULT_SEAL_KIND;
+  if (declared === 'tpm' || declared === 'host' || declared === 'local-file') return declared;
+  // Undeclared on darwin but the file is there: the installer wrote it and did not get to
+  // set the variable, or the daemon was started by hand. Report what is actually in use.
+  if (platformShape() === 'darwin') {
+    try { if (fs.statSync(storeKeyPath()).size >= 32) return 'local-file'; } catch { /* none */ }
+  }
+  return null;
+}
+
+/** The macOS store key: written by the installer, read by us, 0600 and never shared. */
+export const storeKeyPath = () => path.join(systemRoot(), 'store.key');
 
 /** The sealed blob on disk. Written by the installer, read by systemd, never by us. */
 export const sealedKeyPath = () => path.join(systemRoot(), 'store.key.cred');
@@ -188,10 +331,10 @@ export const networkStorePath = () => path.join(systemRoot(), 'network.json');
  * enrol, the agent's own token to remove. Nothing is protected by being hard to reach.
  */
 export const mgmtDir = () =>
-  SPLIT_AVAILABLE ? path.join(runtimeDir(), 'mgmt') : runtimeDir();
+  splitAvailable() ? path.join(runtimeDir(), 'mgmt') : runtimeDir();
 export const mgmtSocketPath = () => path.join(mgmtDir(), 'agent.sock');
 export const agentSocketPath = (name: string) =>
-  SPLIT_AVAILABLE
+  splitAvailable()
     ? path.join(runtimeDir(), `${safeName(name)}.sock`)
     : path.join(runtimeDir(), 'agents', `${safeName(name)}.sock`);
 
@@ -265,13 +408,35 @@ export function safeName(name: string): string {
  * chmod unconditionally, then verify.
  */
 export function ensureSystemRoot(root = systemRoot()): void {
-  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  fs.chmodSync(root, 0o700);
+  try {
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    fs.chmodSync(root, 0o700);
+  } catch (err) {
+    // The commonest first-run failure on a machine where the privileged step has not been
+    // taken: the daemon is not the account that owns this directory, and cannot create it.
+    // Raw EACCES on /var/lib/wundervault sends a person looking for a bug in the daemon
+    // rather than telling them the one command that fixes it — and on macOS, where this
+    // path is new in phase 7, an upgrade lands exactly here.
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EACCES' || code === 'EPERM') {
+      const installer = process.platform === 'darwin'
+        ? 'sudo sh packaging/install-daemon-macos.sh'
+        : 'sudo sh packaging/install-daemon.sh';
+      throw new Error(
+        `Cannot use ${root}: permission denied.\n` +
+        `  The secret broker needs its own account, and the privileged install step has\n` +
+        `  not been run on this machine:\n` +
+        `    ${installer}\n` +
+        `  Then hand your existing agents over:  wundervault-agent --migrate`,
+      );
+    }
+    throw err;
+  }
   // The mode check is the BOUNDARY on Linux and merely hygiene elsewhere, where the
   // directory belongs to the same user the agents run as. Refusing to start over it off
   // Linux would block a daemon on a platform that never claimed the boundary — Windows in
   // particular reports modes that do not mean what they say.
-  if (!SPLIT_AVAILABLE) return;
+  if (!splitAvailable()) return;
   const mode = fs.statSync(root).mode & 0o777;
   if (mode !== 0o700) {
     throw new Error(
@@ -299,4 +464,126 @@ export function runningAsDaemonAccount(root = systemRoot()): boolean {
     const uid = (process as unknown as { getuid?: () => number }).getuid?.();
     return uid !== undefined && fs.statSync(root).uid === uid;
   } catch { return false; }
+}
+
+/**
+ * Is there ACTUALLY a boundary here, right now?
+ *
+ * Every other function in this file answers a question about the operating system. This
+ * one answers the question the user is actually asking, and it answers it by looking at
+ * the directory rather than at `process.platform`.
+ *
+ * The distinction is not academic. Before this existed, the startup warning keyed off the
+ * platform alone — so a daemon started by hand on Linux with WUNDERVAULT_SYSTEM_ROOT
+ * pointed into the owner's home printed NOTHING, while running as the same uid as the
+ * agents it served. The platform was Linux, and the platform was all the check consulted.
+ * The same shape of mistake on macOS would be a broker that had never been installed
+ * reporting a separation it did not have.
+ *
+ * Five things, all observed:
+ *   - the state root exists and is a directory;
+ *   - its mode is exactly 0700 — anything wider is not a boundary whatever owns it;
+ *   - it is owned by OUR euid, so we are the daemon account rather than a visitor;
+ *   - our euid is not 0, because root is not a boundary against anything, and is not the
+ *     uid that invoked us under sudo, because that is the owner's own account;
+ *   - the state root is NOT the pre-split location.
+ *
+ * That last one is not belt-and-braces, it is the check that makes the rest mean anything.
+ * Pre-split, state lives in the owner's own `~/.wundervault`, which ensureSystemRoot()
+ * chmods to 0700 — so it is a 0700 directory owned by the euid running the daemon, and the
+ * first four tests all pass while the agent and the daemon are the same account. The
+ * boundary is not "a private directory"; it is "a directory belonging to somebody the
+ * agent is not". When the state root IS the agent's own directory, there is nobody else.
+ */
+export function expectedAccount(): string {
+  return process.env.WUNDERVAULT_SYSTEM_ACCOUNT
+    || (platformShape() === 'darwin' ? DARWIN_ACCOUNT : SYSTEM_ACCOUNT);
+}
+
+export function boundaryIsReal(root = systemRoot()): boolean {
+  const geteuid = (process as unknown as { geteuid?: () => number }).geteuid;
+  if (typeof geteuid !== 'function') return false; // Windows: no uids, no boundary.
+  const euid = geteuid.call(process);
+  if (euid === 0) return false;
+
+  // WE MUST BE THE SERVICE ACCOUNT, BY NAME. This is the check that does the work, and
+  // leaving it out was a hole big enough to drive the whole phase through: an owner who
+  // starts the daemon by hand with WUNDERVAULT_SYSTEM_ROOT pointed at a scratch directory
+  // gets a 0700 directory owned by their own uid, outside their ~/.wundervault — which
+  // passes every test below it. The daemon would then report a boundary while running as
+  // precisely the account its agents run as.
+  //
+  // SUDO_UID does not cover this; it is only set when someone used sudo. The account name
+  // is the one signal that is present however the process was started.
+  try {
+    if (os.userInfo().username !== expectedAccount()) return false;
+  } catch {
+    return false; // Cannot identify ourselves: not a boundary we can vouch for.
+  }
+
+  // Running under `sudo` as the invoking user's own account is the one case that looks
+  // right from the inside and is not: the agent runs as that uid too.
+  const sudoUid = process.env.SUDO_UID ? Number(process.env.SUDO_UID) : NaN;
+  if (Number.isInteger(sudoUid) && sudoUid === euid) return false;
+
+  // The pre-split layout, which passes every other test here while being the exact thing
+  // this function exists to deny. EQUALITY, not containment: pre-split, systemRoot()
+  // literally returns userRoot(), so they are the same path and nothing weaker is needed.
+  //
+  // Containment was tried and is WRONG. The installer runs
+  // `useradd --home-dir /var/lib/wundervault`, so inside the daemon os.homedir() is the
+  // state directory and userRoot() is `<state dir>/.wundervault` — contained by the state
+  // root on every correct install. A containment test therefore reports "no privilege
+  // boundary" on precisely the configuration that has one.
+  try {
+    if (fs.realpathSync(root) === fs.realpathSync(userRoot())) return false;
+  } catch {
+    if (path.resolve(root) === path.resolve(userRoot())) return false;
+  }
+
+  try {
+    const st = fs.statSync(root);
+    if (!st.isDirectory()) return false;
+    if ((st.mode & 0o777) !== 0o700) return false;
+    return st.uid === euid;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Does `child` live inside `parent`?
+ *
+ * Both sides are resolved before they are compared, because on macOS `/var` is a symlink
+ * to `/private/var`. `/var/lib/wundervault` and `/private/var/lib/wundervault` are the
+ * same directory, and a string prefix test says they are not — so a containment check
+ * written the obvious way passes on Linux, fails on a Mac, and fails in the direction that
+ * refuses legitimate paths rather than admitting illegitimate ones.
+ *
+ * Falls back to the unresolved path when a component does not exist yet: realpath throws
+ * on a path that is about to be created, and refusing to answer would be worse than
+ * answering about the lexical path.
+ */
+export function isInside(parent: string, child: string): boolean {
+  // Resolving each side independently is NOT enough, and the asymmetry is the bug: on a
+  // Mac an existing parent resolves to /private/var/... while a child that does not exist
+  // yet falls back to its literal /var/... form, so a path genuinely inside the parent
+  // reports false. Anything about to be created — every socket path — takes that branch.
+  //
+  // So: resolve the deepest ancestor that DOES exist, then re-append the rest.
+  const resolve = (p: string): string => {
+    const abs = path.resolve(p);
+    let head = abs;
+    const tail: string[] = [];
+    for (;;) {
+      try { return path.join(fs.realpathSync(head), ...tail); } catch { /* go up */ }
+      const parentOfHead = path.dirname(head);
+      if (parentOfHead === head) return abs;   // reached the root, nothing resolvable
+      tail.unshift(path.basename(head));
+      head = parentOfHead;
+    }
+  };
+  const p = resolve(parent);
+  const c = resolve(child);
+  return c === p || c.startsWith(p.endsWith(path.sep) ? p : p + path.sep);
 }

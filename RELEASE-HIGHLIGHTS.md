@@ -106,8 +106,14 @@ replace at their providers, and which ones are handed over in full every time th
 - **Post-quantum signatures.** The TRANSPORT is already hybrid post-quantum
   (X25519MLKEM768, verified) and the vault is symmetric end to end, so both of those are
   claimable. PQ *signatures* are not — we do not have them.
-- **macOS and Windows brokers.** Linux only. On other platforms the credentials are held by a
+- **Windows brokers.** Linux and macOS only. On Windows the credentials are held by a
   process running as the same user as the agents — say so, do not imply otherwise.
+- **macOS parity with the Linux hardening.** The uid split is the same on both. The
+  systemd unit's sandboxing — ProtectSystem, ProtectHome, ProtectProc, the syscall filter —
+  has no launchd equivalent, so on macOS the uid split is very nearly the whole defence.
+  Do not describe the two as equivalent beyond the boundary itself.
+- **A sealed store key on macOS.** There isn't one. It is a random key in a 0600 file owned
+  by the broker's account: not recomputable, not sealed. A disk copy plus root opens it.
 - **"Hardened encryption" as a phase-4 claim.** Phase 4 added an access boundary. The
   encryption is unchanged. The strong crypto (2SKD, wrapped vault keys) predates it and should
   be credited to itself.

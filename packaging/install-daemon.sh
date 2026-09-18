@@ -36,6 +36,10 @@ done
 [ "$(id -u)" = "0" ] || { echo "This step needs root. Re-run with sudo." >&2; exit 1; }
 case "$(uname -s)" in
   Linux) ;;
+  Darwin)
+    echo "This is the Linux installer. On macOS use:" >&2
+    echo "  sudo sh $(dirname -- "$0")/install-daemon-macos.sh" >&2
+    exit 1 ;;
   *)
     echo "This installer is for Linux. The uid split is not available on $(uname -s) yet —" >&2
     echo "the daemon there runs as you, with the pre-split threat model. Nothing to install." >&2
@@ -242,8 +246,12 @@ if [ -f "$BROKER_KEY" ]; then
 elif command -v openssl >/dev/null 2>&1; then
   # umask before the write, not chmod after: openssl creates the file itself, and a
   # chmod that lands a moment later is a moment in which the key was world-readable.
+  # `|| true` is load-bearing under `set -e`. Without it a failing openssl exits the whole
+  # script here, and the guarded fallback below — the one that warns and lets the broker
+  # make its own key at first --pair — can never run. Found while writing the macOS
+  # installer, which had inherited the same shape.
   ( umask 077 && openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-      -out "$BROKER_KEY" 2>/dev/null )
+      -out "$BROKER_KEY" 2>/dev/null ) || true
   if [ -s "$BROKER_KEY" ]; then
     chown "${ACCOUNT}:$(id -gn "$ACCOUNT")" "$BROKER_KEY"
     chmod 0600 "$BROKER_KEY"

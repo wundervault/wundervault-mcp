@@ -20,7 +20,7 @@
  *   Linux:  the ABSTRACT namespace (leading NUL). No filesystem entry exists,
  *           so there is nothing to delete and the delete-the-lock leak cannot
  *           happen rather than being defended against.
- *   Others: a loopback TCP port. A filesystem socket was tried and rejected —
+ *   Others: ONE loopback TCP port. A filesystem socket was tried and rejected —
  *           its pathname can be unlinked while it is still bound, after which a
  *           second process binds the same path and both serve, and recovering
  *           from a stale one means probe-then-unlink, which is itself a race.
@@ -28,6 +28,29 @@
  *           entry, kernel-released. It also avoids Windows, where a filesystem
  *           path is not a valid IPC address at all (\\.\pipe\... is) and the
  *           bind would simply fail, stranding a free credential.
+ *
+ * WHY ONE PORT AND NOT EIGHT — A REAL BUG, NOT A TIDY-UP
+ *
+ * This used to derive EIGHT candidate ports and walk them, on the reasoning
+ * that a single derived port is a guess about a shared resource and an
+ * unrelated occupant should not read as "held". The reasoning was right; the
+ * range was not. The candidates landed in 49152-65535, which is exactly the
+ * DEFAULT EPHEMERAL RANGE ON macOS (net.inet.ip.portrange.first = 49152), so
+ * any outbound connection on the machine transiently owned one of them.
+ *
+ * The walk then did what it was told. Claim 1 finds candidate 0 momentarily
+ * taken by somebody's outbound socket, gets no protocol answer, and binds
+ * candidate 1. The ephemeral socket closes. Claim 2 starts at candidate 0,
+ * finds it free, and binds it. TWO LIVE HOLDERS OF ONE CREDENTIAL — the exact
+ * condition this module exists to prevent, arrived at by spreading the claim
+ * across eight addresses instead of one. It showed up as two flaky macOS CI
+ * assertions that were gated off as unexplained for a release.
+ *
+ * So: one port, derived into 20000-32767, which is below the ephemeral range on
+ * macOS and Windows both. A stranger there is now a HARD ERROR naming the port
+ * rather than a silent move to another address, because an operator can fix a
+ * port conflict they are told about and cannot fix a second holder they are
+ * not.
  *
  * THE HOLDER ANSWERS FOR ITSELF
  *
@@ -49,6 +72,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import net from 'node:net';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -67,7 +91,22 @@ export interface Claim {
   reason?: string;
 }
 
-const IS_LINUX = process.platform === 'linux';
+/**
+ * Which primitive claims the credential.
+ *
+ * Overridable so the PORT path is reachable from Linux CI. It was not, which is why a
+ * concurrency bug in it survived four rounds of review on the abstract-socket path and was
+ * found only by a CI job on a platform nobody could reproduce on.
+ */
+export type LockStrategy = 'abstract' | 'port';
+
+export function lockStrategy(): LockStrategy {
+  const override = process.env.WUNDERVAULT_LOCK_STRATEGY;
+  if (override === 'abstract' || override === 'port') return override;
+  if (override) throw new Error(`WUNDERVAULT_LOCK_STRATEGY must be 'abstract' or 'port'.`);
+  // The abstract namespace is a Linux feature. Everywhere else, the port.
+  return process.platform === 'linux' ? 'abstract' : 'port';
+}
 
 export function agentName(): string {
   return process.env.WUNDERVAULT_AGENT_NAME || '';
@@ -107,35 +146,51 @@ function addressKey(): string {
 }
 
 /**
- * Deterministic loopback ports, as a CANDIDATE LIST rather than one number.
+ * ONE deterministic loopback port, in 20000-32767.
  *
- * A single derived port is a guess about a shared resource: the dynamic range
- * is 16,384 wide and anything on the machine may already own our number. Read
- * as "held", that turns an unrelated service into a permanent outage for a
- * credential nobody holds. So we try several, and EADDRINUSE alone never
- * settles it — the occupant is asked to identify itself, and only a real
- * holder stops the search.
+ * The range is the fix. 49152-65535 is the default ephemeral range on macOS and on
+ * Windows, and Linux's is 32768-60999 — so a port derived below 32768 is not handed out to
+ * unrelated outbound connections on any of the three. What remains is a collision with a
+ * SERVICE that binds the same number, which is stable, diagnosable, and reported rather
+ * than worked around.
+ *
+ * WUNDERVAULT_LOCK_PORT exists for that case, and for tests that need two claims on one
+ * machine not to exclude each other.
  */
-const PORT_CANDIDATES = 8;
-
-function addressPorts(): number[] {
+function addressPort(): number {
+  const override = process.env.WUNDERVAULT_LOCK_PORT;
+  if (override) {
+    const n = Number(override);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) {
+      throw new Error(`WUNDERVAULT_LOCK_PORT=${JSON.stringify(override)} is not a port number.`);
+    }
+    return n;
+  }
+  // The port range is MACHINE-global, not per-user, so the uid belongs in the digest:
+  // without it two OS accounts on one box exclude each other over credentials they do not
+  // share.
   const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
   const digest = createHash('sha256').update(`wundervault-mcp:${uid}:${agentName()}`).digest();
-  const ports: number[] = [];
-  for (let i = 0; i < PORT_CANDIDATES; i++) {
-    ports.push(49152 + (digest.readUInt16BE(i * 2) % 16384));
-  }
-  return ports;
+  return 20000 + (digest.readUInt16BE(0) % 12768);
 }
+
+/** Exported for the test that asserts the range over a sample of names, not one name. */
+export { addressPort as _addressPortForTests };
 
 let held: net.Server | null = null;
 let identityLine = '';
-let heldPort: number | undefined;
 
-function listenOptions(port?: number): net.ListenOptions {
-  return IS_LINUX
+function listenOptions(): net.ListenOptions {
+  return lockStrategy() === 'abstract'
     ? { path: `\0wundervault-mcp-${addressKey()}` }
-    : { host: '127.0.0.1', port: port ?? addressPorts()[0] };
+    : { host: '127.0.0.1', port: addressPort() };
+}
+
+/** How to name the address in a message a person has to act on. */
+function addressLabel(): string {
+  return lockStrategy() === 'abstract'
+    ? `the abstract socket wundervault-mcp-${addressKey()}`
+    : `127.0.0.1:${addressPort()}`;
 }
 
 type BindResult =
@@ -143,7 +198,7 @@ type BindResult =
   | { status: 'in-use' }
   | { status: 'error'; message: string };
 
-function tryBind(port?: number): Promise<BindResult> {
+function tryBind(): Promise<BindResult> {
   return new Promise((resolve) => {
     const server = net.createServer();
     server.once('error', (err: NodeJS.ErrnoException) => {
@@ -153,7 +208,7 @@ function tryBind(port?: number): Promise<BindResult> {
           : { status: 'error', message: err.code || err.message },
       );
     });
-    server.listen(listenOptions(port), () => {
+    server.listen(listenOptions(), () => {
       server.unref();
       resolve({ status: 'bound', server });
     });
@@ -167,7 +222,7 @@ function closed(server: net.Server): Promise<void> {
 }
 
 /** Ask whoever holds the address who they are. */
-function askHolder(port?: number): Promise<Holder | null> {
+function askHolder(): Promise<Holder | null> {
   return new Promise((resolve) => {
     let buf = '';
     let settled = false;
@@ -177,7 +232,7 @@ function askHolder(port?: number): Promise<Holder | null> {
       try { sock.destroy(); } catch { /* ignore */ }
       resolve(h);
     };
-    const sock = net.connect(listenOptions(port) as net.NetConnectOpts);
+    const sock = net.connect(listenOptions() as net.NetConnectOpts);
     sock.setEncoding('utf8');
     sock.on('data', (d: string) => {
       buf += d;
@@ -210,15 +265,41 @@ interface CompatFile {
   start: string | null;
 }
 
-/** /proc/<pid>/stat field 22: start time in clock ticks since boot. */
+/**
+ * An identifier for THIS INCARNATION of a pid, so a recycled pid is not mistaken for the
+ * process that wrote the lock file.
+ *
+ * Linux: /proc/<pid>/stat field 22, start time in clock ticks since boot.
+ * macOS: `ps -o lstart=`, the process's start time to the second. There is no /proc, and
+ *        this returned null there — so on a Mac the recycling check was INERT and a
+ *        recycled pid refused a free credential until someone deleted the file by hand.
+ *        Second granularity is enough: a pid is not recycled and re-bound inside one
+ *        second, and a false MATCH is the safe direction anyway (we stand down).
+ *
+ * Anything else returns null, which the caller treats as "cannot tell" and fails closed.
+ */
 function procStart(pid: number): string | null {
-  if (!IS_LINUX) return null;
-  try {
-    const stat = readFileSync(path.join('/proc', String(pid), 'stat'), 'utf8');
-    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] ?? null;
-  } catch {
-    return null;
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(path.join('/proc', String(pid), 'stat'), 'utf8');
+      return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] ?? null;
+    } catch {
+      return null;
+    }
   }
+
+  if (process.platform === 'darwin') {
+    try {
+      const out = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+        encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      return out || null;
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
 }
 
 function readCompatFile(): CompatFile | null {
@@ -313,62 +394,84 @@ function legacyHolder(): Holder | null {
 
 /** Who holds the credential right now, asked of the holder first. */
 export async function whoHolds(): Promise<Holder> {
-  const ports = IS_LINUX ? [undefined] : addressPorts();
-  for (const port of ports) {
-    const h = await askHolder(port as number | undefined);
-    if (h) return h;
-  }
+  const h = await askHolder();
+  // Same collision check as acquireCredential: an answer from a different agent is not an
+  // answer about OUR credential, and reporting it as one would name the wrong process to
+  // whoever is trying to work out what is holding theirs.
+  if (h && (!h.agent || !agentName() || h.agent === agentName())) return h;
   return holderFromFile();
 }
 
 export async function acquireCredential(version: string): Promise<Claim> {
-  const candidates: (number | undefined)[] = IS_LINUX ? [undefined] : addressPorts();
+  const result = await tryBind();
   let bound: net.Server | null = null;
-  let boundPort: number | undefined;
 
-  for (const port of candidates) {
-    const result = await tryBind(port);
+  if (result.status === 'bound') {
+    bound = result.server;
+  } else if (result.status === 'in-use') {
+    // EADDRINUSE on OUR one address. Ask who is there.
+    const who = await askHolder();
 
-    if (result.status === 'bound') {
-      bound = result.server;
-      boundPort = port;
-      break;
+    // A wundervault holder for a DIFFERENT agent is a hash collision, not our holder.
+    //
+    // One derived port means 12,768 possible addresses, and the birthday bound bites long
+    // before that: around a hundred distinct agent names on one machine already gives
+    // roughly a one-in-three chance that two of them derive the same port. Reporting that
+    // as "your credential is in use" would be a plain falsehood — a different credential
+    // is in use — and the operator would go looking for a duplicate agent that does not
+    // exist. Two unrelated agents must never be able to exclude each other silently.
+    if (who && who.agent && agentName() && who.agent !== agentName()) {
+      return {
+        ok: false,
+        holder: holderFromFile(),
+        reason:
+          `${addressLabel()} is already held by a different agent (${who.agent}). Two ` +
+          `agent names can derive the same lock port; this is a collision, NOT your ` +
+          `credential being in use. Set WUNDERVAULT_LOCK_PORT for one of them.`,
+      };
     }
 
-    if (result.status === 'in-use') {
-      // EADDRINUSE is not proof that OUR credential is taken — on a shared
-      // loopback range the occupant is usually somebody else entirely. Ask.
-      // Only a process that speaks our protocol is a holder; anything else is
-      // just in the way, so we move to the next candidate rather than
-      // reporting a free credential as held.
-      const who = await askHolder(port);
-      if (who) return { ok: false, holder: who };
-      continue;
-    }
+    if (who) return { ok: false, holder: who };
 
-    // Some other bind error on this candidate; try the next one.
+    // A stranger. This used to move to another candidate port, and moving is what
+    // allowed two live holders — the second claim simply landed somewhere else and
+    // reported success. Refusing is the only answer that keeps one-agent-per-credential,
+    // and it is actionable in a way the silent move never was.
+    return {
+      ok: false,
+      holder: holderFromFile(),
+      reason:
+        `${addressLabel()} is occupied by something that is not a wundervault holder, ` +
+        `so the credential cannot be claimed safely. Free that address, or set ` +
+        `WUNDERVAULT_LOCK_PORT to move this agent's lock.`,
+    };
   }
 
   if (!bound) {
     return {
       ok: false,
       holder: await whoHolds(),
-      reason: IS_LINUX
-        ? 'could not claim the credential address'
-        : `every candidate port on 127.0.0.1 is occupied by something else (${addressPorts().join(', ')})`,
+      reason: `could not claim ${addressLabel()}: ${
+        result.status === 'error' ? result.message : 'unknown error'
+      }`,
     };
   }
 
+  // AWAITED, both of them. close() is asynchronous, and with eight candidate ports a
+  // caller that retried after one of these refusals simply landed on a different address.
+  // With one address it now meets our own half-closed socket, reads EADDRINUSE, gets no
+  // protocol answer from a socket that is going away, and is told the address is occupied
+  // by a stranger — a wrong and unactionable message for a machine where nothing is wrong.
   const legacy = legacyHolder();
   if (legacy) {
-    try { bound.close(); } catch { /* ignore */ }
+    await closed(bound);
     return { ok: false, holder: legacy };
   }
 
   if (!writeCompatFile(version)) {
     // An older copy gates on this file. Unwritten, it sees no lock and starts
     // alongside us — so failing to write it is failing to hold the credential.
-    try { bound.close(); } catch { /* ignore */ }
+    await closed(bound);
     return {
       ok: false,
       holder: { pid: null, since: null, agent: null, source: 'unknown' },
@@ -387,7 +490,6 @@ export async function acquireCredential(version: string): Promise<Claim> {
   });
 
   held = bound;
-  heldPort = boundPort;
   return { ok: true };
 }
 
@@ -416,7 +518,6 @@ export function releaseCredential(): Promise<void> {
 
   const server = held;
   held = null;
-  heldPort = undefined;
   if (!server) return Promise.resolve();
 
   return new Promise<void>((resolve) => {
@@ -431,9 +532,8 @@ export function releaseCredential(): Promise<void> {
 /** Is the credential free right now? */
 export async function credentialIsFree(): Promise<boolean> {
   if (held) return false;
-  const candidates: (number | undefined)[] = IS_LINUX ? [undefined] : addressPorts();
-  for (const port of candidates) {
-    const result = await tryBind(port);
+  {
+    const result = await tryBind();
     if (result.status === 'bound') {
       // Wait for the probe socket to actually be gone. close() is asynchronous,
       // and this function's whole job is to answer a question the caller acts on
@@ -443,7 +543,7 @@ export async function credentialIsFree(): Promise<boolean> {
       await closed(result.server);
       return legacyHolder() === null;
     }
-    if (result.status === 'in-use' && (await askHolder(port))) return false;
+    if (result.status === 'in-use' && (await askHolder())) return false;
   }
   return false;
 }
@@ -458,11 +558,7 @@ export function describeHolder(h: Holder): string {
 }
 
 export function addressDescription(): string {
-  if (IS_LINUX) return `abstract socket wundervault-mcp-${addressKey()}`;
-  const ports = addressPorts();
-  return heldPort !== undefined
-    ? `127.0.0.1:${heldPort}`
-    : `127.0.0.1:${ports[0]} (+${ports.length - 1} fallbacks)`;
+  return addressLabel();
 }
 
 export function lockFileExists(): boolean {

@@ -1,0 +1,197 @@
+{
+  "verdict": "revise",
+  "summary": "The package implements the amended three-directory macOS layout, a dedicated LaunchDaemon account, local-file store keys, injectable platform paths, and a target-machine verification script. It does not yet hold up as a verified release: the installer can report success without a running broker, and the verifier can exit successfully while required checks are skipped or never exercised.",
+  "spec_check": [
+    {
+      "requirement": "A1. `platformShape()` returns `'linux' | 'darwin' | 'none'`, overridable for tests by `WUNDERVAULT_PLATFORM_SHAPE`.",
+      "status": "met",
+      "evidence": "`src/paths.ts` validates the override, defaults from the real platform, and uses the shape in `systemRoot()` and `runtimeDirFor()`."
+    },
+    {
+      "requirement": "A2. `splitAvailable()` returns true only when the real `process.platform` is one that supports a uid split AND the shape says so.",
+      "status": "met",
+      "evidence": "`splitAvailableFor()` requires the real platform to be in `SPLIT_CAPABLE` and the selected shape not to be `none`."
+    },
+    {
+      "requirement": "A3. A new `boundaryIsReal()` reports on observed facts, not on the platform.",
+      "status": "partial",
+      "evidence": "`boundaryIsReal()` checks the account name, euid, `SUDO_UID`, canonical pre-split-root equality, directory type, mode, and ownership. `announceBoundary()` and its tests were not included, so the required warning behavior cannot be verified from this excerpt."
+    },
+    {
+      "requirement": "B2 changed shape entirely... a traversable 0755 base holding nothing readable, `state/` at 0700, and `run/` at 0755 beside it.",
+      "status": "partial",
+      "evidence": "The installer, plist, and `src/paths.ts` consistently use `/var/lib/wundervault/state` and sibling `/var/lib/wundervault/run` with the stated directory modes. The plist's process-wide umask also affects socket nodes, and the unshown bind code must explicitly correct their modes for owner-run agents to connect."
+    },
+    {
+      "requirement": "The store key is read from `store.key` when present, `key_mode` is `local-file`, and the startup line for it says \"not sealed\" and names the disk-copy limit.",
+      "status": "partial",
+      "evidence": "`systemdCredential()` reads the Darwin `store.key`, `sealKind()` recognizes `local-file`, and the installer states the disk-copy limitation. Existing key files are not validated or repaired by the installer, and the startup-reporting implementation was not shown."
+    },
+    {
+      "requirement": "On darwin the derivation uses `IOPlatformUUID`... With no machine identity available at all, the daemon reports a distinct `derived-shared` mode and refuses enrolment.",
+      "status": "partial",
+      "evidence": "The installer and verifier query `IOPlatformUUID`, but the machine-identity parser, key-mode decision, startup behavior, and enrolment refusal are in files not included in this round."
+    },
+    {
+      "requirement": "C1. Creates group and user `_wundervault` with `dscl`, `UserShell=/usr/bin/false`, `NFSHomeDirectory=/var/empty`, `IsHidden=1`, at the first free uid/gid in 200\u2013400.",
+      "status": "met",
+      "evidence": "The new-account branch scans user and group IDs from 200 through 399 and creates the requested group and user attributes."
+    },
+    {
+      "requirement": "C2. Carries over every refusal the Linux installer makes.",
+      "status": "partial",
+      "evidence": "The script refuses an existing account matching `SUDO_UID`, refuses a usable shell, and resolves symlinks before refusing executable paths under home directories. The required refusal tests were not included."
+    },
+    {
+      "requirement": "C3. `UserName`/`GroupName` are `_wundervault` directly, `RunAtLoad`, `KeepAlive`, and `EnvironmentVariables` carrying `WUNDERVAULT_SYSTEM_ROOT`.",
+      "status": "met",
+      "evidence": "The plist contains all of these keys and points `WUNDERVAULT_SYSTEM_ROOT` at the private `state` directory."
+    },
+    {
+      "requirement": "C4. The installer verifies, after `launchctl bootstrap`, that the running process is not root and that the state directory is mode 0700 owned by the account \u2014 by asking the daemon over the management socket.",
+      "status": "unmet",
+      "evidence": "A missing management reply only prints a warning, an empty process match is accepted, and `launchctl print` is treated as sufficient even when the job has no running process. The ping is not shown to report the daemon's euid or observed state ownership and mode."
+    },
+    {
+      "requirement": "C5. What macOS does not give us, written into the plist as a comment and into `/limitations`.",
+      "status": "partial",
+      "evidence": "The plist contains a detailed warning that launchd lacks the systemd sandboxing layer. The `/limitations` content was not included."
+    },
+    {
+      "requirement": "12. `--uninstall` removes the job and leaves the account and the state directory.",
+      "status": "partial",
+      "evidence": "The script preserves the account and directories and removes the plist, but it ignores every `launchctl bootout` failure and does not verify that the loaded job was actually removed."
+    },
+    {
+      "requirement": "13. Re-running the installer leaves the machine as one run does, including after the plist template changes.",
+      "status": "partial",
+      "evidence": "The normal path performs `bootout` followed by `bootstrap`, but malformed or partially created key files are accepted on later runs rather than repaired."
+    },
+    {
+      "requirement": "17\u201320. The port strategy must reject a second holder, report lock-file state without a holder, hard-fail on a stranger occupying the port, and honor `WUNDERVAULT_LOCK_PORT`.",
+      "status": "partial",
+      "evidence": "The lock implementation and unit tests were not shown. The macOS verifier exercises only the second in-process acquisition and derived range, not `whoHolds()` without a holder, stranger-port behavior, or differing overrides."
+    },
+    {
+      "requirement": "No shipped file claims the broker is Linux-only, and no shipped file claims macOS has launchd hardening equivalent to the systemd unit.",
+      "status": "partial",
+      "evidence": "The shown source and plist correctly describe the macOS boundary and weaker sandboxing. The README, release highlights, limitations document, agent documentation, and handoff deletion were not included."
+    },
+    {
+      "requirement": "`packaging/verify-macos.sh` ... asserts checks 6, 7, 9, 12, 13, 14 and 17\u201320 against the real install and prints a pass/fail line for each.",
+      "status": "unmet",
+      "evidence": "Required checks can be marked SKIP while the script exits zero, checks 18\u201320 are absent, and the 64-character socket-path check relies on a command not supplied by stock macOS."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "packaging/install-daemon-macos.sh",
+      "line": null,
+      "claim": "The post-bootstrap verification is not tied to the launched job and accepts both an unanswered management socket and no matching process as a successful install.",
+      "failure_scenario": "If the daemon exits immediately because of a runtime or configuration error, `launchctl print system/com.wundervault.agent` still succeeds for the loaded KeepAlive job, `REPLY` and `RUNNING_UID` are empty, and the installer prints that the broker is loaded and the state is protected before exiting zero. Conversely, invoking the documented `--exec /path/to/wundervault-agent` form can make the global `ps` substring search match the root installer command itself before the daemon and falsely report that the broker is running as root.",
+      "suggested_direction": "Require a successful, validated management response; obtain the PID belonging to this launchd job and inspect that exact process; and fail unless the response confirms the expected euid, state-root owner, and state-root mode."
+    },
+    {
+      "id": "F2",
+      "severity": "major",
+      "file": "packaging/com.wundervault.agent.plist",
+      "line": null,
+      "claim": "Unless the unshown socket-bind code explicitly chmods every socket after binding, the plist's umask creates socket nodes accessible only to `_wundervault`.",
+      "failure_scenario": "With `Umask` set to decimal 63, Node creates a pathname Unix socket with its normal mode masked to 0700; an agent running as the owner can traverse the 0755 base and run directories but receives EACCES when connecting to `/var/lib/wundervault/run/<agent>.sock` or the management socket.",
+      "suggested_direction": "Verify the behavior in the omitted bind code and on a real Mac, and explicitly set and verify connectable modes on both management and per-agent socket nodes after each bind while retaining restrictive modes for key and state files."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "file": "packaging/install-daemon-macos.sh",
+      "line": null,
+      "claim": "Any nonempty existing `store.key` is accepted without checking its size, owner, or mode, so rerunning the installer does not recover from a partially completed key installation.",
+      "failure_scenario": "If the first run is interrupted after `dd` writes 32 bytes but before `chown`, the key remains root-owned and 0600; the next run takes the `-s` branch, prints that the key is already present, and starts a daemon that cannot read it and therefore refuses or falls back to a derived mode. A short nonempty file from an interrupted write is likewise accepted even though `systemdCredential()` ignores keys shorter than 32 bytes.",
+      "suggested_direction": "Validate an existing key's exact expected length or accepted format, regular-file status, owner, and 0600 mode; repair safe metadata failures and stop with a clear recovery instruction for invalid content."
+    },
+    {
+      "id": "F4",
+      "severity": "blocker",
+      "file": "packaging/verify-macos.sh",
+      "line": null,
+      "claim": "The verifier can exit successfully while required acceptance checks were skipped, so its exit status cannot establish that phase 7 passed on macOS.",
+      "failure_scenario": "Run the read-only verifier without passwordless sudo and without `../dist`: the private key checks and the entire real-platform lock test are marked SKIP, `FAIL` can remain zero, and the script exits zero even though checks 9 and 17\u201320 were not asserted.",
+      "suggested_direction": "Distinguish an informational read-only audit from the acceptance run, and make the acceptance mode fail when any mandatory prerequisite or mandatory check is skipped."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "file": "packaging/verify-macos.sh",
+      "line": null,
+      "claim": "Even when the lock test runs, it does not exercise acceptance checks 18, 19, or 20 despite labeling the section as covering checks 17\u201320.",
+      "failure_scenario": "A build in which `whoHolds()` reports the wrong source, a stranger-occupied port silently moves to another candidate, or `WUNDERVAULT_LOCK_PORT` is ignored still prints PASS because the verifier only performs two in-process acquisitions and checks the derived port range.",
+      "suggested_direction": "Add real-platform probes for no-live-holder reporting, a non-protocol listener occupying the selected port, and separate processes using equal and differing port overrides."
+    },
+    {
+      "id": "F6",
+      "severity": "major",
+      "file": "packaging/verify-macos.sh",
+      "line": null,
+      "claim": "The socket-length check depends on `seq`, which stock macOS does not provide, allowing the 64-character test to collapse to an empty agent name and pass vacuously.",
+      "failure_scenario": "On a Mac without GNU coreutils, `seq 1 64` fails, `LONGEST` becomes only `/var/lib/wundervault/run/.sock`, and the script reports PASS for a short path without ever measuring the required 64-character name.",
+      "suggested_direction": "Construct the test name using utilities guaranteed by macOS or shell-only operations, and fail rather than continue if the generated name is not exactly 64 bytes."
+    },
+    {
+      "id": "F7",
+      "severity": "major",
+      "file": "packaging/verify-macos.sh",
+      "line": null,
+      "claim": "Full verification can uninstall a valid custom-path deployment after its reinstall probe fails, then leave it uninstalled because it discards the installed executable path.",
+      "failure_scenario": "Install successfully with `--exec /opt/wundervault/bin/wundervault-agent` where that binary is not on root's PATH, then run `sudo sh verify-macos.sh --full`; the first reinstall omits `--exec` and fails, but the script continues to uninstall, and the final reinstall fails for the same reason, leaving the broker stopped and its plist removed.",
+      "suggested_direction": "Read and preserve the installed ProgramArguments path, pass it to every reinstall, and stop before destructive checks if the initial reinstall cannot be completed."
+    },
+    {
+      "id": "F8",
+      "severity": "minor",
+      "file": "packaging/verify-macos.sh",
+      "line": null,
+      "claim": "The verifier treats FileVault being off as a phase-7 implementation failure even though the specification requires disclosure rather than FileVault enablement.",
+      "failure_scenario": "A correctly installed broker with a random local-file key, accurate disk-copy warning, and FileVault disabled receives a FAIL and nonzero result despite meeting the stated boundary and making no hardware-sealing claim.",
+      "suggested_direction": "Report FileVault-off as an explicit limitation or warning while reserving FAIL for an incorrect or missing disclosure or a false sealing claim."
+    },
+    {
+      "id": "F9",
+      "severity": "major",
+      "file": "packaging/install-daemon-macos.sh",
+      "line": null,
+      "claim": "Uninstall suppresses every `launchctl bootout` error and reports removal without checking whether the job is still loaded.",
+      "failure_scenario": "If `launchctl bootout system/com.wundervault.agent` returns nonzero while the job remains loaded, the script deletes the plist, prints `Removed the job`, and exits zero while the existing broker process continues running from launchd's loaded definition.",
+      "suggested_direction": "Ignore only the confirmed not-loaded case and otherwise verify after bootout that the system-domain job is absent before deleting the plist and reporting success."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The privileged installer writes missing broker and store keys through paths inside a directory owned and writable by the service account, without rejecting symlinks.",
+      "why_it_matters": "Before a privileged reinstall, that account can replace `broker-key.pem` or `store.key` with a dangling symlink; `openssl` or `dd` then follows it as root, creates or clobbers an arbitrary target, and the subsequent `chown` hands that target to `_wundervault`. Even if broker compromise is outside the custody guarantee, turning a routine reinstall into a root file-write primitive is an operational privilege-escalation hazard."
+    },
+    {
+      "id": "B2",
+      "concern": "KeepAlive restarts permanent startup refusals every two seconds, and the configured state log has no rotation or size bound.",
+      "why_it_matters": "If both the store key and machine identity are unavailable, or another permanent configuration error occurs, launchd repeatedly starts the daemon and appends the same failure indefinitely; this can consume CPU, obscure the original error, and eventually fill the filesystem."
+    },
+    {
+      "id": "B3",
+      "concern": "Management-socket probes have incomplete timeout handling.",
+      "why_it_matters": "The installer gives `nc` a timeout but invokes `socat` without one, while the verifier invokes `nc -U` without `-w`; a stale or wedged listener that accepts a connection but never replies can hang installation or verification indefinitely."
+    },
+    {
+      "id": "B4",
+      "concern": "Account creation is not transactional across the group record, user record, and individual `dscl` attributes.",
+      "why_it_matters": "A failure after creating only part of the account can leave a user with missing UID, group, home, or shell attributes; the next run enters the existing-account branch and may refuse permanently or fail later during `chown`, requiring manual directory-service repair."
+    }
+  ],
+  "_meta": {
+    "round": 22,
+    "at": "2026-09-18T15:41:54+00:00",
+    "package_bytes": 115310,
+    "schema_problems": []
+  }
+}

@@ -1,0 +1,53 @@
+{"round": 22, "decisions": [
+  {"id": "F1", "action": "fixed",
+   "claim": "The installer prints success when the job is loaded but nothing is running; and its own `ps` substring search can match the installer's own argv",
+   "reason": "Both confirmed, and the first is the worst sentence this installer could get wrong because it is the one people act on. `launchctl print` exits zero for a KeepAlive job whose process died instantly, so 'the broker is running, your agents cannot read the credentials it holds' could print over a machine with no broker at all. Success now requires POSITIVE evidence — a reply on the management socket, or a process owned by the service account — and their joint absence is a hard failure that dumps the log and refuses. The ps search now excludes our own pid and our parent's, matches the resolved EXEC path rather than a bare substring, and excludes anything matching 'install-daemon'; the documented `--exec /usr/local/bin/wundervault-agent` form put that exact string in the installer's own command line."},
+
+  {"id": "F2", "action": "rejected",
+   "claim": "Umask 63 makes Node create the unix sockets at 0700, so agents get EACCES connecting",
+   "reason": "The code explicitly chmods every socket to 0666 in its listen callback — src/agent.ts:941 for the per-agent sockets, :1215 for the management socket — and chmod is absolute, so umask does not apply to it. The reviewer was not shown agent.ts this round, which is exactly the case I asked it to flag rather than assume, and it was right to raise it. What is real and smaller: between listen() and the chmod there is a brief window at the umask-masked mode, which fails CLOSED (an agent connecting in that window is refused and retries), so it is not worth a startup-ordering change. The same reviewer reflex found the genuine version of this bug in the DIRECTORIES, which is fixed."},
+
+  {"id": "F3", "action": "fixed",
+   "claim": "An interrupted first run leaves a store key that is root-owned or short, and the next run's `-s` test accepts it",
+   "reason": "Confirmed. The next run would print 'already present' and start a broker that cannot read it and silently falls back to the derived key, while the install reported otherwise. The existing-key branch now checks size >= 32 AND ownership by the service account, and replaces the file when either fails, saying that an interrupted run leaves exactly this."},
+
+  {"id": "F4", "action": "fixed",
+   "claim": "The verifier exits zero with required checks skipped — no passwordless sudo and no dist means the store-key checks and the whole lock test are SKIP and FAIL stays zero",
+   "reason": "Confirmed, and it is the third instance of this failure mode in one session, which is why it is worth the extra machinery. skip() now means 'does not apply here'; a new need() records a REQUIRED check that could not be run, prints NOT RUN, and fails the script. The summary prints the count and says plainly that a check which did not run has not passed. Applied to spec checks 9, 12-14 and 17-20."},
+
+  {"id": "F5", "action": "fixed",
+   "claim": "The verifier's lock test only does two in-process acquisitions, so a build that broke whoHolds(), the stranger refusal, or the port override would still print PASS",
+   "reason": "Confirmed. The harness now also asserts whoHolds() falls back to the lock file with nobody holding (one of the two assertions macOS CI used to fail), that a stranger on the address produces a refusal NAMING the port rather than a silent move, and that WUNDERVAULT_LOCK_PORT actually moves the address. Run end to end against a real build on Linux before being committed — a verification script that cannot itself run reports nothing and looks like a pass."},
+
+  {"id": "F6", "action": "fixed",
+   "claim": "`printf 'a%.0s' $(seq 1 64)` yields an empty name where seq is missing, so the socket-length check measures a short path and reports PASS",
+   "reason": "Confirmed as a vacuous pass even though macOS does ship /usr/bin/seq — the dependency is unnecessary and the failure is silent, which is the combination worth removing. Built with awk instead, and the result is asserted to be 64 characters before it is measured."},
+
+  {"id": "F7", "action": "fixed",
+   "claim": "`--full` reinstalls without --exec, so an install done with a non-PATH binary fails, then uninstalls anyway and leaves the machine with no broker",
+   "reason": "Confirmed, and the end state is the damaging part: a verification run that leaves the machine worse than it found it. Both reinstalls now read the path out of the INSTALLED plist and pass it with --exec; if that path cannot be determined the --full checks are refused up front rather than run destructively, and a failed final reinstall says in terms that the machine now has no broker."},
+
+  {"id": "F8", "action": "fixed",
+   "claim": "FileVault being off fails the whole verification even though the build makes no hardware-sealing claim",
+   "reason": "Agreed. FileVault is the owner's setting, not a verdict on this build, and the store key is honestly described as unsealed either way. Failing red over it trains people to ignore a red result. Now a WARN with the consequence spelled out."},
+
+  {"id": "F9", "action": "fixed",
+   "claim": "`--uninstall` deletes the plist even when bootout failed and the job is still loaded",
+   "reason": "Confirmed. launchd keeps running from the definition it already holds, so the broker carries on serving credentials from a configuration nobody can read any more and the next bootstrap has nothing to replace. It now asks launchctl what is actually true after bootout and refuses to remove the plist while the job is still loaded."},
+
+  {"id": "B1", "action": "fixed",
+   "claim": "Blind spot: the privileged installer writes the key paths inside a directory the service account owns, without rejecting symlinks",
+   "reason": "Real, and the most serious thing in this round: a root-write primitive. That account can place a dangling symlink at store.key or broker-key.pem before a reinstall, root's openssl or dd follows it, and the chown afterwards hands the target to the service account. Both paths are now refused if they are symlinks, tested with -h (which asks about the link) rather than -f (which follows it and answers about the target). Same rule that keeps --destinations from resolving a path through the agent's home."},
+
+  {"id": "B2", "action": "fixed",
+   "claim": "Blind spot: KeepAlive restarts permanent startup refusals every two seconds, and the log has no size bound",
+   "reason": "The restart half was fixed before this package was built and the reviewer saw the old plist: KeepAlive is now {SuccessfulExit: false}, refusals a restart cannot fix throw ConfigurationRefusal and exit 0, and a test pins both halves together. The log rotation half is NOT fixed and is recorded as open in the handoff — it wants newsyslog, and it applies to the Linux journal-less case too, so it is worth doing once rather than here."},
+
+  {"id": "B3", "action": "fixed",
+   "claim": "Blind spot: socat is invoked without a timeout in the installer, and nc without -w in the verifier",
+   "reason": "Confirmed. A wedged listener that accepts and never replies would hang either script with no output and no clue why. socat now gets -t2 and the verifier's nc gets -w 5."},
+
+  {"id": "B4", "action": "fixed",
+   "claim": "Blind spot: dscl account creation is not transactional, so an interruption leaves a partial account the next run mishandles",
+   "reason": "Real — dscl writes one attribute per call. A half-made account sends the next run into the existing-account branch, where a blank UserShell either refuses permanently or fails later at chown. The installer now reads back UniqueID, PrimaryGroupID and UserShell after creating them and refuses with the two dscl commands needed to clean up, rather than leaving a half-made account behind. It is a check, not a transaction; macOS does not offer one."}
+]}

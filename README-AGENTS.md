@@ -96,11 +96,11 @@ broker-mode secret to anyone who did not sign. A copy of the credential on its o
 being enough.
 
 **An agent with no paired broker is authenticated on its credential alone**, exactly as
-before. That is every agent on **macOS and Windows** today, and every Linux agent until it
-has been repaired onto a broker. For those, a broker-mode secret is refused outright —
-there is nothing on that machine that could use one — and everything still in the legacy
-mode is served to whoever holds the credential. Nothing here is a claim about macOS or
-Windows; support for those is not built.
+before. That is every agent on **Windows** today, and every Linux or macOS agent until it
+has been repaired onto a broker — installing the broker does not migrate anything by
+itself. For those, a broker-mode secret is refused outright — there is nothing on that
+machine that could use one — and everything still in the legacy mode is served to whoever
+holds the credential. Nothing here is a claim about Windows; support for it is not built.
 
 ## Environment Variables Reference
 

@@ -680,21 +680,78 @@ describe('a damaged destination log is not an empty one', () => {
   });
 });
 
-describe('migration is Linux-only, and saying so prevents data loss', () => {
-  it('refuses off Linux, where source and destination are the same file', async () => {
-    // The platform gate made systemRoot() return userRoot() off Linux — which means
-    // profilesPath() and legacy.profiles() resolve to THE SAME FILE. Every agent then looks
-    // "already across", nothing is pending, and --migrate --finish shreds the store the
-    // running daemon is using. A cleanup step deleting the live credential file because it
-    // mistook it for a leftover, reported as a successful migration.
+describe('migration needs a split to migrate to, and saying so prevents data loss', () => {
+  // Without one, systemRoot() returns userRoot() — which means profilesPath() and
+  // legacy.profiles() resolve to THE SAME FILE. Every agent then looks "already across",
+  // nothing is pending, and --migrate --finish shreds the store the running daemon is
+  // using. A cleanup step deleting the live credential file because it mistook it for a
+  // leftover, reported as a successful migration.
+  //
+  // This used to be asserted by grepping migrate.ts for the function name and for a
+  // sentence in a comment, which is a test of the source text rather than of the
+  // behaviour: renaming the function broke it and deleting the CALL would not have. The
+  // shape override makes the refusal drivable, so now it is driven.
+  const saved: Record<string, string | undefined> = {};
+  const setEnv = (k: string, v: string | undefined) => {
+    if (!(k in saved)) saved[k] = process.env[k];
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  };
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    for (const k of Object.keys(saved)) delete saved[k];
+  });
+
+  it('refuses to REPORT on a machine with no split', async () => {
+    setEnv('WUNDERVAULT_PLATFORM_SHAPE', 'none');
+    const migrate = await import('../src/migrate.js');
+    await expect(migrate.status()).rejects.toThrow(/cannot\s+have one yet|nothing to move/);
+  });
+
+  it('refuses to DELETE on a machine with no split', async () => {
+    // The dangerous half. status() being safe would not save anything if cleanup() ran.
+    setEnv('WUNDERVAULT_PLATFORM_SHAPE', 'none');
+    const migrate = await import('../src/migrate.js');
+    await expect(migrate.cleanup()).rejects.toThrow(/cannot\s+have one yet|nothing to move/);
+  });
+
+  it('refuses when the destination IS the source, on a platform that CAN split', async () => {
+    // Capability is not an actual split. Point WUNDERVAULT_SYSTEM_ROOT at the owner's own
+    // ~/.wundervault on Linux — a hand-started daemon, a misconfigured unit — and
+    // splitAvailable() is still true while profilesPath() and legacy.profiles() are once
+    // again THE SAME FILE. cleanup() would then find every agent "already across",
+    // conclude the source is a leftover, and delete the live store.
+    setEnv('WUNDERVAULT_PLATFORM_SHAPE', 'linux');
+    const same = path.join(dir, 'same-place');
+    fs.mkdirSync(same, { recursive: true });
+    setEnv('WUNDERVAULT_SYSTEM_ROOT', same);
+    setEnv('WUNDERVAULT_USER_ROOT', same);
+    const migrate = await import('../src/migrate.js');
+    await expect(migrate.status()).rejects.toThrow(/same place/);
+    await expect(migrate.cleanup()).rejects.toThrow(/same place/);
+  });
+
+  it('keeps the redundant guard on cleanup(), which no behavioural test can see', () => {
+    // cleanup() calls status(), which refuses on its own — so deleting cleanup()'s OWN
+    // guard changes no observable behaviour and the two tests above stay green. Verified
+    // by doing exactly that. The guard is still worth keeping, for the day status() stops
+    // being the first thing cleanup() calls, and the only way to assert something that
+    // cannot be observed is to look at the source. Labelled as the weaker check it is,
+    // rather than dressed up as coverage.
     const src = fs.readFileSync(path.join(ROOT, 'src', 'migrate.ts'), 'utf8');
-    expect(src).toMatch(/function refuseOffLinux/);
-    expect(src).toMatch(/Migration is Linux-only/);
-    // Both entry points, not just the reading one.
-    const statusFn = src.slice(src.indexOf('export async function status'));
-    expect(statusFn.slice(0, 200)).toMatch(/refuseOffLinux\(\)/);
     const cleanupFn = src.slice(src.indexOf('export async function cleanup'));
-    expect(cleanupFn.slice(0, 200)).toMatch(/refuseOffLinux\(\)/);
+    expect(cleanupFn.slice(0, 200)).toMatch(/refuseWithoutSplit\(\)/);
+  });
+
+  it('does not refuse where there IS a split', async () => {
+    setEnv('WUNDERVAULT_PLATFORM_SHAPE', 'linux');
+    const migrate = await import('../src/migrate.js');
+    // It may fail for other reasons on this box; what it must not do is refuse for THIS one.
+    await migrate.status().catch((e: Error) => {
+      expect(e.message).not.toMatch(/cannot\s+have one yet/);
+    });
   });
 });
 
@@ -743,7 +800,7 @@ describe('the store key claim matches the store key', () => {
     // sealed blob using nothing but files from that filesystem. The code printed "a copy of
     // the disk does not open it" for both.
     const src = fs.readFileSync(path.join(ROOT, 'src', 'agent.ts'), 'utf8');
-    expect(src).toMatch(/'sealed-tpm' \| 'sealed-host' \| 'derived'/);
+    expect(src).toMatch(/'sealed-tpm' \| 'sealed-host' \| 'local-file' \| 'derived' \| 'derived-shared'/);
     // The strong sentence must appear only on the TPM branch.
     const tpmIdx = src.indexOf("SEALED TO THIS MACHINE");
     const hostIdx = src.indexOf("sealed to systemd\\'s HOST KEY");
@@ -752,6 +809,16 @@ describe('the store key claim matches the store key', () => {
     const hostBranch = src.slice(hostIdx, hostIdx + 700);
     expect(hostBranch).toMatch(/WOULD open the store/);
     expect(hostBranch).not.toMatch(/does not open it/);
+
+    // macOS gets its own sentence for the same reason, and it must not borrow the TPM one:
+    // the key is random rather than derived, which is the improvement, but it is not sealed
+    // to anything, which is the limit.
+    const localIdx = src.indexOf('a random key in a 0600 file');
+    expect(localIdx).toBeGreaterThan(-1);
+    const localBranch = src.slice(localIdx, localIdx + 700);
+    expect(localBranch).toMatch(/NOT sealed to hardware/);
+    expect(localBranch).toMatch(/WOULD open the store/);
+    expect(localBranch).not.toMatch(/does not open it/);
   });
 
   it('does not let a cleared TPM stop the broker starting', () => {
