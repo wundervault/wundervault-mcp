@@ -372,8 +372,86 @@ SeBatchLogonRight = $($kept -join ',')
     Write-Host "  (probe account and task removed)" -ForegroundColor DarkGray
 }
 
-# -- the daemon's own opinion --------------------------------------------------
-section "What the broker says about itself"
+section "The boundary against YOUR OWN account, which is the case that matters"
+
+# WHY THIS EXISTS, AND WHY THE SECTION ABOVE IS NOT ENOUGH.
+#
+# Everything above proves the boundary against an account that is not yours. That is the
+# easy case. On Windows the common case is quite different: most people are administrators
+# of their own machine, so their agents run as an account that IS in the state directory's
+# ACL -- and whether it can actually open the directory comes down to whether the process
+# is ELEVATED.
+#
+# A non-elevated process belonging to an administrator carries the Administrators SID as
+# DENY-ONLY under UAC token filtering, and a deny-only SID cannot be used to grant access.
+# So the boundary holds -- but that is a claim about Windows token semantics, and a claim
+# is not a measurement. This measures it, with the account running the verifier.
+#
+# `runas /trustlevel:0x20000` (SAFER normal-user) is not byte-identical to a UAC-filtered
+# token: it removes the Administrators SID rather than marking it deny-only. For an ALLOW
+# ace the access check is the same either way, so the result transfers -- and it is the
+# closest thing available without a second interactive logon.
+$selfOut = Join-Path $env:TEMP ("wv-self-" + [guid]::NewGuid().ToString('N') + ".txt")
+$selfScript = Join-Path $env:TEMP ("wv-self-" + [guid]::NewGuid().ToString('N') + ".ps1")
+@"
+`$lines = @()
+`$id = [Security.Principal.WindowsIdentity]::GetCurrent()
+`$p = New-Object Security.Principal.WindowsPrincipal(`$id)
+`$lines += "user=`$(`$id.Name)"
+`$lines += "elevated=`$(`$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+try { Get-ChildItem -LiteralPath '$State' -ErrorAction Stop | Out-Null; `$lines += 'state_list=ALLOWED' }
+catch { `$lines += 'state_list=DENIED' }
+# THE EXCEPTION TYPE, not Test-Path. Test-Path on a file inside a directory you cannot
+# traverse returns False, so an UNREACHABLE key reported as 'missing' -- the absent/denied
+# conflation this was written to avoid, arriving from the other side. Only the exception
+# knows which of the two actually happened.
+`$k = Join-Path '$State' 'store.key'
+try { [IO.File]::ReadAllBytes(`$k) | Out-Null; `$lines += 'key_read=ALLOWED' }
+catch [UnauthorizedAccessException] { `$lines += 'key_read=DENIED' }
+catch [IO.DirectoryNotFoundException] { `$lines += 'key_read=DENIED' }
+catch [IO.FileNotFoundException] { `$lines += 'key_read=MISSING' }
+catch { `$lines += "key_read=OTHER:`$(`$_.Exception.GetType().Name)" }
+try { Get-ChildItem -LiteralPath '$Run' -ErrorAction Stop | Out-Null; `$lines += 'run_list=ALLOWED' }
+catch { `$lines += 'run_list=DENIED' }
+`$lines | Set-Content -LiteralPath '$selfOut'
+"@ | Out-File -FilePath $selfScript -Encoding UTF8
+
+try {
+    Native 'runas' @('/trustlevel:0x20000',
+        "powershell -NoProfile -ExecutionPolicy Bypass -File `"$selfScript`"") | Out-Null
+    $deadline = (Get-Date).AddSeconds(40)
+    while (-not (Test-Path -LiteralPath $selfOut) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+
+    if (-not (Test-Path -LiteralPath $selfOut)) {
+        # NOT a skip. A check that did not run is not a check that passed -- if this cannot
+        # be measured here, the most important boundary claim on this machine is unproven.
+        need "an unelevated process of YOUR account cannot open the broker's state" {
+            throw "could not run the unelevated probe (runas produced no result within 40s)"
+        }
+    } else {
+        $self = @{}
+        foreach ($l in Get-Content -LiteralPath $selfOut) {
+            $kv = $l -split '=', 2
+            if ($kv.Count -eq 2) { $self[$kv[0]] = $kv[1] }
+        }
+        Write-Host "  (probe ran as '$($self['user'])', elevated=$($self['elevated']))" -ForegroundColor DarkGray
+
+        need "the unelevated probe really was unelevated" { $self['elevated'] -eq 'False' }
+        need "an unelevated process of YOUR account cannot list the broker's state" { $self['state_list'] -eq 'DENIED' }
+        need "an unelevated process of YOUR account cannot read the store key"      { $self['key_read'] -eq 'DENIED' }
+        need "your agents can still reach the run directory"                        { $self['run_list'] -eq 'ALLOWED' }
+    }
+} finally {
+    Remove-Item -LiteralPath $selfScript, $selfOut -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ""
+Write-Host "  Note: an ELEVATED process of an administrator account CAN open the state" -ForegroundColor DarkGray
+Write-Host "  directory. That is by design and is the same as root on Linux -- but on Windows" -ForegroundColor DarkGray
+Write-Host "  it includes anything launched from an SSH session, which gets a full token." -ForegroundColor DarkGray
+
+section "What the broker says about itself"------------------------------------------------
+
 
 # TALKS TO THE BROKER DIRECTLY, rather than through the CLI.
 #

@@ -279,6 +279,15 @@ marked **[win199]** must be observed on the real box; the rest must pass in CI o
 11. **[win199]** With the broker installed, a **non-administrator** account that is not the
     service account is denied read and list on `%ProgramData%\wundervault\state`. Two
     accounts, one denied, observed — not inferred from the ACL text.
+11a. **[win199]** **THE CASE THAT ACTUALLY MATTERS, added 2026-09-18 after the owner asked.**
+    An **unelevated process of the verifying user's own account** — an administrator, which
+    is what most people are on their own machine — is denied read and list on the state
+    directory, and **can still reach the run directory**. Check 11 proves the boundary
+    against somebody else; this proves it against *you*, which is who the agents actually
+    run as. Measured on the box in all three cases: a non-admin account DENIED, an
+    unelevated administrator DENIED, an **elevated** administrator ALLOWED — the last by
+    design, the same as root on Linux, and it includes anything launched over SSH, because
+    Windows OpenSSH hands administrators a full token.
 12. **[win199]** That same non-administrator account **can** read the run directory,
     connect to the daemon, and complete a tool call with its own token.
 13. `boundaryIsReal()` returns **false** on Windows when: the state root is the pre-split

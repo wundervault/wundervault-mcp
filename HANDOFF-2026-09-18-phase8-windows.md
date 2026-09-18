@@ -216,12 +216,30 @@ and it turned out to be **true of the test machine**.
 
 ## 8. Proof, on the actual platform
 
-`packaging\verify-windows.ps1` on win199: **27 passed, 0 failed, 0 not applicable, exit 0.**
+`packaging\verify-windows.ps1` on win199: **31 passed, 0 failed, 0 not applicable, exit 0.**
 Including, from a throwaway non-administrator account the script creates and destroys:
 
 - cannot list `%ProgramData%\wundervault\state`; cannot read `store.key`;
 - **can** list the run directory, **cannot** write it;
 - **can** reach the broker and gets an answer it can check.
+
+**And, separately, against the verifying user's OWN account — which is the case that
+matters and which the first version of this verifier did not cover.** Most people are
+administrators of their own Windows machine, so their agents run as an account that IS in
+the state directory's ACL; whether it can open the directory comes down to elevation.
+Measured in all three cases:
+
+| the agent's process | `store.key` | run directory |
+|---|---|---|
+| a non-administrator account | **denied** | readable |
+| the owner's account, **unelevated** | **denied** | readable |
+| the owner's account, **elevated** | **allowed** | readable |
+
+The third row is by design and is the same as root on Linux. **It also includes anything
+launched over SSH**, because Windows OpenSSH hands an administrator a full token rather
+than the filtered one an interactive logon gets — so every command in this phase's own
+testing ran *inside* the boundary. The verifier now measures the middle row with
+`runas /trustlevel:0x20000` and fails if it cannot, rather than skipping.
 
 And separately, by hand on the box:
 
