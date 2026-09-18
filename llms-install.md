@@ -26,8 +26,21 @@ npm ls -g @wundervault/mcp-server
 The server starts and lists its tools with no configuration, but real vault access needs an agent identity:
 
 1. The user creates a free account at https://wundervault.com and clicks **NEW AGENT** on the dashboard.
-2. The dashboard shows a **single setup command** with an embedded one-time setup URL. The user pastes it to you (or runs it themselves).
-3. Run that command. It installs/updates this package, configures the agent's credentials locally, and **prints the exact MCP config snippet for your client** — use that snippet in Step 3.
+2. The dashboard gives the user what their machine needs. **Which of two things it is matters to you:**
+   - a **claim code**, where the machine runs a paired secret broker. It opens nothing on
+     its own. The broker fetches and decrypts the credentials inside its own account, and
+     they never enter your process.
+   - a **one-time setup link**, otherwise. This one *is* a credential: it decrypts to the
+     agent's keys, which unwrap the vault key, which opens every secret in the vault.
+3. **Do not ask the user to put a setup link in a command, and do not accept one if they
+   offer.** A command line is readable by every other process on the machine, so passing
+   it that way publishes the one credential this whole design assumes you cannot obtain.
+   The installer refuses a link given as an argument for that reason and reads it from a
+   prompt instead. The user runs the command; the user pastes the link at the prompt. You
+   do not need to see it, and you should say so rather than accepting it.
+4. The command installs/updates this package, registers the credentials with the local
+   broker, and **prints the exact MCP config snippet for your client** — use that snippet
+   in Step 3.
 
 Full flow documentation: https://wundervault.com/quickstart
 
@@ -67,4 +80,11 @@ To exercise the tools without any Wundervault account, set `WUNDERVAULT_MOCK=1` 
 
 - You will never receive plaintext secrets. Tools inject secrets into subprocesses or files and return only confirmations.
 - Do not attempt shell escape patterns (`$()`, backticks, `bash -c`, `sh -c`, `eval`) in `vault_exec` commands — they are rejected before decryption.
-- Treat the one-time setup URL as sensitive: use it immediately, never log or store it.
+- Treat a one-time setup URL as a live credential, not as a token to be handled carefully:
+  it decrypts to the agent's keys and through them to every secret in the vault. Never
+  accept one in a command, never log it, never store it, never repeat it back. Where the
+  machine has a paired broker you will be given a claim code instead, which opens nothing.
+- On Linux and macOS the credentials are held by a broker running as its own account, in a
+  directory your account cannot open. Its socket serves **operations, not credentials** —
+  you can ask it to use a secret; you cannot ask it for one. On Windows it runs as the
+  same account you do, and says so at every start.

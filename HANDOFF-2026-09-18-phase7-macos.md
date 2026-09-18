@@ -98,7 +98,22 @@ owner's home, and must not be "fixed" to.
 
 ## 4. Deploy order — one step added
 
-1. **Re-sign `onboard.py`.** Still step one. Key vaulted as `OnboardSigningKey`.
+1. **Re-sign `onboard.py` — and it is THREE artifacts, not one.** Still step one, and the
+   handoffs before this one under-described it. Verified today:
+
+   - `burnbox/app/static/onboard.py` is the served copy, was edited in phase 5 (it now
+     reads the setup link from **stdin** instead of argv), and **its signature does not
+     verify**. That is the check working, exactly as the phase-5 handoff predicted.
+   - `wundervault-mcp/installer/onboard.py` is the GitHub mirror a customer diffs at
+     `/verify#installer`. **It is 303 lines behind** and still takes the link as
+     `sys.argv[1]` — the precise pattern phase 5 exists to stop. Its signature verifies,
+     because it is the old file.
+
+   So: re-sign the burnbox copy with the vault key `OnboardSigningKey`, copy it over the
+   mirror, and commit the matching `.sig` alongside it. Doing only the first two fails
+   CI's "committed signature must verify" step; doing only the first fails CI's mirror
+   diff **and** tells every customer who checks to refuse the install, which is the alarm
+   behaving correctly rather than a bug.
 2. **Publish the npm package.** `packaging/` is in `files`, so the new installer, plist and
    verify script ship with it.
 3. **Deploy burnbox**, running the four migrations from the phase-6 handoff. Not

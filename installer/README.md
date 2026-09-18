@@ -73,13 +73,21 @@ service it enables, then exits having done none of them.
 ## What it installs, in short
 
 - The npm package `@wundervault/mcp-server`, globally, at an exact pinned version.
-- A background daemon, with a systemd user unit (`Restart=always`) on Linux, so it
-  starts at login and survives reboot.
-- Credentials under `~/.wundervault/`, mode 0600. The key for that store is derived
-  from the machine ID and your uid, with the salt stored alongside it — that protects
-  the file if the disk or a backup leaves the machine, and **not** from a process
-  already running as your user, which can re-derive it. On the local machine, your
-  user account is what protects those credentials.
+- A background daemon. On Linux this script installs a systemd user unit
+  (`Restart=always`) so it starts at login and survives reboot. On macOS it installs no
+  service of its own — the broker from the privileged step is what launchd keeps running.
+- Credentials under `~/.wundervault/`, mode 0600 — **unless you have taken the one
+  privileged step**, in which case they live under `/var/lib/wundervault`, owned by an
+  account your agents do not run as and cannot read. That directory mode is the boundary;
+  see `packaging/install-daemon.sh` (Linux) or `packaging/install-daemon-macos.sh` (macOS),
+  which are short enough to read before you run them.
+
+  Without that step, the store is encrypted with a key derived from the machine ID, your
+  uid and a salt kept beside the ciphertext. **An earlier version of this file said that
+  protects the store "if the disk or a backup leaves the machine". It does not, and saying
+  so was wrong:** all three inputs are on that same disk, so anyone holding a copy
+  recomputes the key. It protects against nothing that has the file. Your user account is
+  what protects those credentials, and the privileged step is what changes that.
 
 To undo everything:
 

@@ -7,13 +7,23 @@
  * leave the process that holds it: ssh asks for a signature over the session data, the
  * agent answers, and the key stays put.
  *
- * SCOPE, stated plainly: this daemon runs as the agent's own uid, so this is NOT yet a
- * confidentiality boundary — a same-uid process can still reach the key in memory, and
- * while the socket is alive it could ask this agent to sign for a host the command was
- * never authorised for. What this buys today is that the key stops touching the disk,
- * every signature becomes an audit event, and the socket lives only as long as one
- * command. When the daemon moves to its own uid, the same interface becomes a real
- * boundary with no further API change.
+ * SCOPE, stated plainly — and this paragraph was out of date for three phases, which is
+ * worth more than the correction itself.
+ *
+ * It used to read: "this daemon runs as the agent's own uid, so this is NOT yet a
+ * confidentiality boundary… when the daemon moves to its own uid, the same interface
+ * becomes a real boundary with no further API change." The daemon HAS moved. `startAgent`
+ * is called from broker-ops.ts, which runs in the broker, under an account the agent
+ * cannot read or attach to; the ssh CLIENT still runs in the agent's process and is
+ * pointed at this socket, so it asks for signatures and never holds the key. That is the
+ * boundary the old paragraph was waiting for, and it arrived without the API change it
+ * predicted.
+ *
+ * WHAT IS STILL TRUE AND MUST NOT BE DROPPED: the signing socket is world-connectable, so
+ * while a session is open any process running as the owner can ask for a signature —
+ * including for a host the command was never authorised for. The key is out of reach; the
+ * USE of it, for the lifetime of one command, is not. Sessions are capped and short-lived
+ * for exactly that reason, and that is a mitigation, not a fix.
  */
 import { createPrivateKey, createPublicKey, sign as cryptoSign, createHash, KeyObject } from 'node:crypto';
 import { createServer, Server, Socket } from 'node:net';

@@ -77,8 +77,12 @@ agent = Agent(
 
 There is no credentials file and no key in your MCP config. `onboard.py` registers the
 agent and the local `wundervault-agent` broker holds the API key and the encryption key.
-The MCP server talks to it over a unix socket at `~/.wundervault/agents/<name>.sock`,
-authenticated with the agent token in `~/.wundervault/agents/<name>.token`.
+The MCP server talks to it over a unix socket — `/run/wundervault/<name>.sock` on Linux,
+`/var/lib/wundervault/run/<name>.sock` on macOS, and `~/.wundervault/agents/<name>.sock`
+where no broker account has been installed — authenticated with the agent token in
+`~/.wundervault/agents/<name>.token`. The token stays in your own home on purpose: it is
+the agent's identity, and moving it into the broker's directory would make it unreadable
+by the only party that needs it.
 
 **The socket serves operations, not credentials.** The broker does not hand the keys over:
 it lists entries, performs a brokered HTTP call, answers a signature request. What crosses
