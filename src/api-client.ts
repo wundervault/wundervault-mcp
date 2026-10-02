@@ -225,9 +225,6 @@ export class AgentVaultAPI {
     session_lock_uses: number;
     require_approval: boolean;
     approval_scope: string;
-    audit_log_enabled: boolean;
-    audit_log_retention_days: number;
-    audit_log_detail: string;
     allow_arbitrary_commands: boolean;
   }> {
     try {
@@ -238,9 +235,6 @@ export class AgentVaultAPI {
         session_lock_uses: 3,
         require_approval: false,
         approval_scope: 'high_impact',
-        audit_log_enabled: true,
-        audit_log_retention_days: 90,
-        audit_log_detail: 'label',
         allow_arbitrary_commands: false,
       };
     }
