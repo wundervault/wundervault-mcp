@@ -17,6 +17,7 @@ import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
 import type { OperationDefinition, CredentialBinding } from './opdef.js';
 import { filterResponse } from './opdef.js';
 import { renderCredential, secretForms } from './delivery.js';
+import { VERSION } from './version.js';
 
 export interface CallResult {
   ok: boolean;
@@ -224,6 +225,30 @@ export function resolvePinned(host: string, allowInternal = false): Promise<{ ad
   });
 }
 
+/**
+ * The reply as text, or null when it is not text.
+ *
+ * Decoded strictly: a reply that is not valid UTF-8, or that carries a NUL byte, is
+ * binary whatever its content-type claims, and returning it as a string would hand the
+ * caller mangled bytes that look like an answer.
+ */
+export function asText(raw: Buffer, contentType: string | undefined): string | null {
+  const type = (contentType ?? '').toLowerCase();
+  if (/^(image|audio|video|font)\//.test(type) || type.startsWith('application/octet-stream')) return null;
+  if (raw.includes(0)) return null;
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** `type/subtype` from a content-type header, or "unknown type". Parameters are dropped. */
+export function mediaType(contentType: string | string[] | undefined): string {
+  const t = String(Array.isArray(contentType) ? contentType[0] : contentType ?? '').split(';')[0].trim().toLowerCase();
+  return /^[a-z0-9!#$&^_.+-]{1,64}\/[a-z0-9!#$&^_.+-]{1,64}$/.test(t) ? t : 'unknown type';
+}
+
 function decompressor(encoding: string | undefined) {
   switch ((encoding || '').toLowerCase()) {
     case 'gzip': return createGunzip();
@@ -241,7 +266,8 @@ function decompressor(encoding: string | undefined) {
  */
 export async function performOperation(
   def: OperationDefinition,
-  args: Record<string, unknown>,
+  /** Typed arguments, sent as JSON — or, for an agent-described request only, a string sent as written. */
+  args: Record<string, unknown> | string,
   secret: string,
   /** Exact origins the owner approved for this entry; nothing else lifts the filter. */
   approvedPrivateOrigins?: string[],
@@ -258,16 +284,22 @@ export async function performOperation(
   }
 
   const headers: Record<string, string> = { ...(def.static_headers ?? {}) };
+  const has = (name: string) => Object.keys(headers).some((k) => k.toLowerCase() === name);
+  // Node sends no User-Agent of its own, and GitHub refuses every request without one.
+  if (!has('user-agent')) headers['user-agent'] = `wundervault-broker/${VERSION}`;
   let body: string | undefined;
   if (def.route.method !== 'GET' && def.route.method !== 'HEAD') {
-    body = JSON.stringify(args ?? {});
+    // A string is a body the agent wrote itself — form-encoded for Stripe or Twilio, XML,
+    // plain text — and goes as written. Anything else is JSON, as before.
+    const isText = typeof args === 'string';
+    body = isText ? args : JSON.stringify(args ?? {});
     const maxReq = def.limits?.request_bytes ?? DEFAULT_REQUEST_BYTES;
     if (Buffer.byteLength(body) > maxReq) {
       return { ok: false, error: `Request body exceeds this operation's limit of ${maxReq} bytes.` };
     }
     headers['content-length'] = String(Buffer.byteLength(body));
-    if (!Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) {
-      headers['content-type'] = 'application/json';
+    if (!has('content-type')) {
+      headers['content-type'] = isText ? 'text/plain; charset=utf-8' : 'application/json';
     }
   }
 
@@ -285,9 +317,27 @@ export async function performOperation(
 
   const maxRes = def.limits?.response_bytes ?? DEFAULT_RESPONSE_BYTES;
 
+  // A request that changes something (anything but GET and HEAD) and fails once the
+  // connection is up may already have taken effect upstream. Saying only "failed" invites
+  // the caller to send it again: a second email, a second order, a second payment.
+  const changesSomething = def.route.method !== 'GET' && def.route.method !== 'HEAD';
+  let connected = false;
+  const mayHaveRun = ' The request may already have reached the service and taken effect; check before sending it again.';
+
   return await new Promise<CallResult>((resolve) => {
     let settled = false;
-    const finish = (r: CallResult) => { if (!settled) { settled = true; resolve(r); } };
+    const finish = (r: CallResult) => {
+      if (settled) return;
+      settled = true;
+      // Unknown outcome only: with a status the caller already knows the request arrived.
+      if (!r.ok && r.status === undefined && connected && changesSomething) r = { ...r, error: `${r.error}${mayHaveRun}` };
+      resolve(r);
+    };
+    // A 2xx whose reply is too big to return still happened. Reported as a success with
+    // nothing shown, not as a failure.
+    const tooBig = (status: number, what: string): CallResult => (status >= 200 && status < 300
+      ? { ok: true, status, body: `[the reply exceeded ${maxRes} bytes${what}, so none of it is shown; the request itself succeeded]` }
+      : { ok: false, status, error: `Upstream returned HTTP ${status}, and its reply exceeded ${maxRes} bytes${what}.` });
 
     const req = httpsRequest({
       host,
@@ -343,7 +393,7 @@ export async function performOperation(
           // Settle HERE. Destroying the request may leave the decompressor with neither
           // 'end' nor 'error', and the promise would hang for the whole total timeout —
           // error handling was attached to the gunzip stream, not to this source.
-          finish({ ok: false, status, error: `Response exceeded ${maxRes} bytes on the wire.` });
+          finish(tooBig(status, ' on the wire'));
         }
       });
       res.on('error', (e: Error) => finish({ ok: false, status, error: `Response error: ${e.message}` }));
@@ -356,26 +406,56 @@ export async function performOperation(
         chunks.push(c);
       });
       (stream as NodeJS.ReadableStream).on('end', () => {
-        if (over) return finish({ ok: false, status, error: `Response exceeded ${maxRes} bytes.` });
-        const text = Buffer.concat(chunks).toString('utf8');
-        let parsed: unknown;
-        try { parsed = JSON.parse(text); } catch { parsed = undefined; }
+        if (over) return finish(tooBig(status, ''));
+        const ok = status >= 200 && status < 300;
+        const scrub = (v: unknown) => forms.reduce<unknown>((acc, f) => scrubSecret(acc, f), v);
+        // Without this a 4xx came back as a bare ok:false with no explanation at all.
+        // The upstream's own message is not repeated, whatever its type: it holds the
+        // credential and could put it in the body. No body at all, here — not left to
+        // the caller to drop.
+        if (!ok) {
+          return finish({
+            ok: false, status,
+            error: `Upstream returned HTTP ${status}. Any detail it sent is not repeated here, because an upstream holding the credential can place it in the response.`,
+          });
+        }
+        const raw = Buffer.concat(chunks);
+        // Decoded STRICTLY before anything parses it. A lenient decode turned invalid bytes
+        // into U+FFFD and JSON.parse then accepted them, so bytes the text rules refuse came
+        // back as data (round 2, F2). Bytes that are not text are never parsed as JSON.
+        const text = raw.length > 0 ? asText(raw, res.headers['content-type']) : '';
+        // An empty reply is an answer, not a parse failure: a DELETE that returns 204 did
+        // what it was asked. Reporting it as a failure invites the caller to send it again.
+        let parsed: unknown = null;
+        if (text === null) parsed = undefined;
+        else if (text.length > 0) {
+          try { parsed = JSON.parse(text); } catch { parsed = undefined; }
+        }
         if (parsed === undefined) {
-          return finish({ ok: false, status, error: 'Upstream returned a body this operation could not parse as JSON.' });
+          // The upstream chose this header and holds the key, so it is reduced to a bare
+          // media type and scrubbed before it is repeated in a description.
+          const kind = scrub(mediaType(res.headers['content-type'])) as string;
+          // A signed definition's allowlist names JSON fields. A reply it cannot parse
+          // cannot be filtered, so none of it is returned — but the request went
+          // through, and ok says so: a caller told a payment failed pays again.
+          if (def.response !== undefined) {
+            return finish({
+              ok: true, status,
+              body: `[${raw.length} bytes of ${kind}, not JSON; this operation returns only named JSON fields, so none of the reply is shown]`,
+            });
+          }
+          // An agent-described request has no allowlist: plain text, CSV and HTML come
+          // back as text, scrubbed like everything else. Bytes that are not text are
+          // described, never returned.
+          return finish({
+            ok: true, status,
+            body: text === null ? `[${raw.length} bytes of ${kind}, not text, so not shown]` : scrub(text),
+          });
         }
         // Only the fields the definition allows reach the caller — and even then the
         // secret is scrubbed, because an upstream can echo it in an ALLOWED field and
         // the allowlist alone would pass it through.
-        const filtered = filterResponse(def, parsed);
-        const ok = status >= 200 && status < 300;
-        finish({
-          ok, status,
-          body: forms.reduce<unknown>((v, f) => scrubSecret(v, f), filtered),
-          // Without this a 4xx came back as a bare ok:false with no explanation at all.
-          // The upstream's own message is not repeated: it holds the credential and
-          // could put it in the body.
-          error: ok ? undefined : `Upstream returned HTTP ${status}. Any detail it sent is not repeated here, because an upstream holding the credential can place it in the response.`,
-        });
+        finish({ ok: true, status, body: scrub(filterResponse(def, parsed)) });
       });
       (stream as NodeJS.ReadableStream).on('error', (e: Error) => finish({ ok: false, status, error: `Response error: ${e.message}` }));
     });
@@ -383,6 +463,7 @@ export async function performOperation(
     const total = setTimeout(() => { req.destroy(); finish({ ok: false, error: `Operation timed out after ${TOTAL_TIMEOUT_MS / 1000}s.` }); }, TOTAL_TIMEOUT_MS);
     req.on('close', () => clearTimeout(total));
     req.on('timeout', () => { req.destroy(); finish({ ok: false, error: 'Connection timed out.' }); });
+    req.on('socket', (sock) => { sock.once('secureConnect', () => { connected = true; }); });
     req.on('error', (e) => finish({ ok: false, error: `Request failed: ${e.message}` }));
 
     if (body) req.write(body);
@@ -406,6 +487,12 @@ export interface AgentRequest {
   path: string;
   body?: unknown;
   query?: Record<string, string>;
+  /**
+   * Headers the agent sets — a User-Agent, an API version, a content-type for a body it
+   * wrote. Checked in the broker (delivery.ts validateAgentHeaders) before they arrive
+   * here; the credential is written after them and its header name is refused.
+   */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -433,6 +520,7 @@ export function definitionFromAgentRequest(
     origin: req.origin,
     route: { method: (req.method || 'GET').toUpperCase(), path },
     credential_binding: binding,
+    ...(req.headers && Object.keys(req.headers).length > 0 ? { static_headers: { ...req.headers } } : {}),
     // No allowlist: an unsigned request has nothing describing its response, so the
     // caller gets the body. `response.allow` with a single '*' would be a lie; the
     // executor treats an absent allow-list as "return everything", and scrubSecret still

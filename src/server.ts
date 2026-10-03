@@ -48,6 +48,13 @@ export { DIRECTIVE } from './directive.js';
 const MOCK_MODE = process.env.WUNDERVAULT_MOCK === '1' || process.env.WUNDERVAULT_MOCK === 'true';
 const MOCK_NOTE = '\n\n[DEMO MODE — WUNDERVAULT_MOCK is set; no real vault was contacted and no real secret was used.]';
 
+/** A call's reply for the agent: text as written, an empty reply said in words, JSON indented. */
+export function renderBody(body: unknown): string {
+  if (body === null || body === undefined) return '(empty reply)';
+  if (typeof body === 'string') return body;
+  return JSON.stringify(body, null, 2);
+}
+
 function mockToolResult(name: string, args: Record<string, any>) {
   switch (name) {
     case 'vault_entries_list':
@@ -121,9 +128,12 @@ export function createServer(args: { url?: string } = {}) {
             args: { type: 'object', description: 'Typed arguments for operation_id, checked against its schema.' },
             request: {
               type: 'object',
-              description: 'Describe the call yourself: {origin:{scheme,host,port}, method, path, body?, query?}. '
+              description: 'Describe the call yourself: {origin:{scheme,host,port}, method, path, body?, query?, headers?}. '
+                + 'body: an object or array is sent as JSON; a string is sent as written (set content-type in '
+                + 'headers, e.g. application/x-www-form-urlencoded). headers: your own, such as user-agent or an '
+                + 'API version; the header that carries the key, and framing headers, are refused. '
                 + 'Tier 1 secrets proceed and are logged. Tier 2 secrets are refused until the owner approves '
-                + 'this exact origin, method and path.',
+                + 'this exact origin, method and path; the approval covers whatever headers and body it carries.',
             },
             purpose: { type: 'string', description: 'Why this is needed (audit log).' },
           },
@@ -236,7 +246,7 @@ export function createServer(args: { url?: string } = {}) {
         return CallToolResultSchema.parse({
           content: [{ type: 'text', text:
             `✅ ${r.label} → HTTP ${r.status} (tier ${r.tier}). The credential was used here, not returned to you.\n`
-            + `${JSON.stringify(r.body, null, 2)}${r.notice ? `\n\n${r.notice}` : ''}` }],
+            + `${renderBody(r.body)}${r.notice ? `\n\n${r.notice}` : ''}` }],
         });
       }
 

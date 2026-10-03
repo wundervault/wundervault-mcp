@@ -439,6 +439,51 @@ describe('a brokered call keeps the credential', () => {
   }, 20_000);
 });
 
+describe("the agent's own headers, checked by the broker", () => {
+  // SPEC-replies.md §B. Driven through the socket, as a hostile agent would, so the check
+  // proved is the broker's and not the MCP server's.
+  const call = (headers: unknown) => speak(sock(), {
+    token: TOKEN, op: 'call', entry_id: 'http1', purpose: 'p',
+    request: { origin: { scheme: 'https', host: 'api.example', port: 443 }, method: 'GET', path: '/', headers },
+  });
+
+  it("refuses the header that carries the entry's key, in any case, and sends nothing", async () => {
+    for (const name of ['authorization', 'Authorization', 'AUTHORIZATION']) {
+      const r = await call({ [name]: 'Bearer mine' });
+      expect(r.json.code, name).toBe('BAD_REQUEST');
+      expect(r.json.error, name).toMatch(/authorization carries this entry's key/);
+      expect(r.raw).not.toContain(SECRETS.http1.value);
+    }
+  });
+
+  it('refuses framing headers and anything addressed to a proxy', async () => {
+    for (const name of ['host', 'content-length', 'transfer-encoding', 'accept-encoding', 'proxy-anything', 'Expect']) {
+      const r = await call({ [name]: 'x' });
+      expect(r.json.code, name).toBe('BAD_REQUEST');
+    }
+  });
+
+  it('refuses a header value with a line break rather than sending half of it', async () => {
+    const r = await call({ 'x-api-version': '1\r\nx-injected: yes' });
+    expect(r.json.code).toBe('BAD_REQUEST');
+    expect(r.json.error).toMatch(/printable text/);
+  });
+
+  it('refuses a name given twice in different case, and headers that are not an object', async () => {
+    expect((await call({ 'User-Agent': 'a', 'user-agent': 'b' })).json.code).toBe('BAD_REQUEST');
+    expect((await call(['user-agent', 'x'])).json.code).toBe('BAD_REQUEST');
+    expect((await call('user-agent: x')).json.code).toBe('BAD_REQUEST');
+  });
+
+  it('lets ordinary headers through to the request', async () => {
+    // api.example does not resolve, so the call fails AFTER the header check — which is
+    // the point: it is not refused for its headers.
+    const r = await call({ 'user-agent': 'my-agent/1.0', 'anthropic-version': '2023-06-01', accept: 'text/csv' });
+    expect(r.json.code).not.toBe('BAD_REQUEST');
+    expect(String(r.json.error)).not.toMatch(/request\.headers/);
+  }, 20_000);
+});
+
 describe('one getSecret per operation', () => {
   it('does not add an access-log row for metadata', async () => {
     // There is deliberately no metadata probe. A convenient "just tell me the mode" call

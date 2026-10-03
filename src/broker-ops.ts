@@ -58,7 +58,7 @@ import { verifyOperationDefinition, validateArguments } from './opdef.js';
 import { recordDestination, newDestinationNotice, emitToStderr } from './network-store.js';
 import { runtimeDir } from './paths.js';
 import type { VaultEntry } from './types.js';
-import { bindingFromExecConfig, looksLikePrivateKey } from './delivery.js';
+import { bindingFromExecConfig, looksLikePrivateKey, validateAgentHeaders } from './delivery.js';
 
 export interface OpError { error: string; code?: string }
 
@@ -158,6 +158,16 @@ export class BrokerOps {
     }
     const binding = bound.binding;
 
+    // The agent's own headers and body, checked before the key is decrypted. A refused
+    // header refuses the call; it is never dropped and the rest sent, because the agent
+    // would then be reading a reply to a request it did not make.
+    let agentHeaders: Record<string, string> = {};
+    if (agentReq) {
+      const h = validateAgentHeaders(agentReq.headers, binding);
+      if (!h.ok) return err(`Refused: ${h.field}: ${h.reason}. Nothing was sent.`, 'BAD_REQUEST');
+      agentHeaders = h.headers;
+    }
+
     const vaultKey = await this.api.ensureVaultKey();
     const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
     try {
@@ -193,7 +203,7 @@ export class BrokerOps {
         if (!r?.origin?.host || !r.origin.scheme || !r.origin.port) {
           return err('request.origin needs scheme, host and port.');
         }
-        def = definitionFromAgentRequest(r, binding);
+        def = definitionFromAgentRequest({ ...r, headers: agentHeaders }, binding);
         label = `${def.route.method} ${originString(r.origin)}${r.path || '/'}`;
       }
 
@@ -260,7 +270,9 @@ export class BrokerOps {
       }
 
       const result = await performOperation(
-        def, operationId ? callArgs : ((agentReq?.body ?? {}) as Record<string, unknown>),
+        def, operationId ? callArgs : (typeof agentReq?.body === 'string'
+          ? agentReq.body
+          : ((agentReq?.body ?? {}) as Record<string, unknown>)),
         secret, approvedOrigins,
       );
       if (!result.ok && /internal or reserved address/.test(result.error ?? '')

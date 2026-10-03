@@ -121,13 +121,76 @@ export function renderCredential(binding: CredentialBinding, secret: string): st
 }
 
 /**
+ * Headers an agent may never set on a brokered request, whatever the entry's binding.
+ *
+ * The framing set above, plus the ones that would change how the broker reads the reply
+ * (`accept-encoding`, `content-encoding`: the size caps and decompression assume they own
+ * these) or that address a proxy. The credential's own header is added per call.
+ */
+const AGENT_FORBIDDEN_HEADERS: ReadonlySet<string> = new Set([
+  ...FORBIDDEN_HEADERS, 'expect', 'keep-alive', 'accept-encoding', 'content-encoding',
+]);
+const MAX_AGENT_HEADERS = 20;
+const MAX_AGENT_HEADER_VALUE = 1024;
+
+export type HeaderCheck =
+  | { ok: true; headers: Record<string, string> }
+  | { ok: false; field: string; reason: string };
+
+/**
+ * The headers an agent asked to send, checked and lowercased — or why not.
+ *
+ * Without these, a brokered call could not reach GitHub at all (it refuses a request
+ * with no User-Agent) or Anthropic (anthropic-version is required). What the agent still
+ * cannot do is touch the key: the credential's header is refused by name, and the
+ * credential is written after these in any case, so nothing here can shadow it. Values are
+ * literal — nothing in them is a placeholder.
+ */
+export function validateAgentHeaders(raw: unknown, binding: CredentialBinding): HeaderCheck {
+  const bad = (field: string, reason: string): HeaderCheck => ({ ok: false, field, reason });
+  // Absent and null both mean "no headers of my own" — JSON has no other way to say it.
+  if (raw === undefined || raw === null) return { ok: true, headers: {} };
+  if (typeof raw !== 'object' || Array.isArray(raw)) return bad('request.headers', 'headers must be an object of name: value');
+  const entries = Object.entries(raw as Record<string, unknown>);
+  if (entries.length > MAX_AGENT_HEADERS) return bad('request.headers', `at most ${MAX_AGENT_HEADERS} headers`);
+  const credentialHeader = binding.in === 'header' ? binding.name.toLowerCase() : '';
+  // A Map, not an object literal: `out['__proto__'] = v` sets nothing on a plain object,
+  // so a valid header would have been checked and then silently not sent (round 2, F3).
+  const out = new Map<string, string>();
+  for (const [name, value] of entries) {
+    if (!HEADER_NAME.test(name)) return bad('request.headers', `"${name.slice(0, 64)}" is not a header name`);
+    const lower = name.toLowerCase();
+    if (AGENT_FORBIDDEN_HEADERS.has(lower) || lower.startsWith('proxy-')) {
+      return bad('request.headers', `the ${lower} header is set by the broker, not the caller`);
+    }
+    if (lower === credentialHeader) {
+      return bad('request.headers', `${lower} carries this entry's key; the entry sets it, not the caller`);
+    }
+    if (out.has(lower)) return bad('request.headers', `${lower} is given twice`);
+    if (typeof value !== 'string') return bad('request.headers', `the value of ${lower} must be a string`);
+    if (value.length > MAX_AGENT_HEADER_VALUE || !/^[\x20-\x7e\t]*$/.test(value)) {
+      return bad('request.headers', `the value of ${lower} must be printable text, ${MAX_AGENT_HEADER_VALUE} characters at most`);
+    }
+    out.set(lower, value);
+  }
+  return { ok: true, headers: Object.fromEntries(out) };
+}
+
+/**
  * Every form of the key a response could echo back: the key itself, and for basic sign-in
  * the encoded pair, which is what the upstream actually received.
  */
 export function secretForms(binding: CredentialBinding, secret: string): string[] {
   const forms = [secret];
   if (binding.template.includes('{basic}')) forms.push(basicToken(binding.username ?? '', secret));
-  return forms.filter((f) => f.length > 0);
+  // A query key travels percent-encoded, and an upstream that echoes the request line (an
+  // error page, a debug field) echoes it in that form, which a verbatim scrub misses. Three
+  // spellings, because servers normalise: as sent, with lowercase escapes, and form-style
+  // (`+` for a space). Still exact matching — defence in depth, not a guarantee.
+  const encoded = encodeURIComponent(secret);
+  forms.push(encoded, encoded.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()));
+  forms.push(new URLSearchParams([['k', secret]]).toString().slice(2));
+  return [...new Set(forms)].filter((f) => f.length > 0);
 }
 
 /**
