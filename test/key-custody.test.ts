@@ -36,6 +36,8 @@ let daemon: any;
 let server: http.Server | null = null;
 let baseUrl = '';
 let getSecretCalls: string[] = [];
+/** The query string of every entry fetch, to prove the agent's purpose is not on it. */
+let getSecretQueries: string[] = [];
 /**
  * Private origins the http1 entry approves, set per test.
  *
@@ -64,7 +66,9 @@ function wrappedVaultKey(): string {
   return Buffer.concat([nonce, c.update(VAULT_KEY), c.final(), c.getAuthTag()]).toString('base64');
 }
 
-const SECRETS: Record<string, { mode: string; value: string; tier?: string }> = {
+const SECRETS: Record<string, { mode: string; value: string; tier?: string; cfg?: unknown }> = {
+  // A row the 1.0 migration has not reached. The server refuses to serve it; this fake
+  // serves it anyway, so the tests below prove the BROKER fails closed on its own.
   legacy1: { mode: 'LEGACY_EXEC', value: 'sk-legacy-plaintext-value' },
   http1: { mode: 'BROKER_HTTP', value: 'sk-brokered-http-credential' },
   ssh1: { mode: 'BROKER_SSH_AGENT', value: 'not-a-real-key' },
@@ -72,6 +76,7 @@ const SECRETS: Record<string, { mode: string; value: string; tier?: string }> = 
 
 function startVault(): Promise<void> {
   getSecretCalls = [];
+  getSecretQueries = [];
   approvedOrigins = [];
   return new Promise((resolve) => {
     server = http.createServer((req, res) => {
@@ -91,11 +96,13 @@ function startVault(): Promise<void> {
         const s = SECRETS[m[1]];
         if (!s) return json(404, { detail: 'no such entry' });
         getSecretCalls.push(m[1]);
+        getSecretQueries.push(url.search);
         const enc = gcm(VAULT_KEY, Buffer.from(s.value, 'utf8'));
         return json(200, {
           name: m[1], entry_mode: s.mode, access_tier: s.tier ?? '1',
           encrypted_content: enc.ct, content_nonce: enc.nonce,
           allowed_private_origins: JSON.stringify(approvedOrigins),
+          ...(s.cfg !== undefined ? { exec_config: JSON.stringify(s.cfg) } : {}),
         });
       }
       if (url.pathname === '/agent/vault/operation-check') {
@@ -177,39 +184,43 @@ afterEach(() => {
 const sock = () => path.join(dir, 'run', 'A.sock');
 
 describe('the broker enforces the mode, not the client', () => {
-  it('refuses get_entry on a BROKER_HTTP entry even when the MCP server is bypassed', async () => {
+  it('answers get_entry with an error for every mode, and fetches nothing', async () => {
     // Talking to the socket directly IS the threat model: an agent that does not want to
-    // be gated does not run the gate. Before this phase the same connection returned the
-    // encryption key and the whole vault came with it.
-    const r = await speak(sock(), { token: TOKEN, op: 'get_entry', entry_id: 'http1', purpose: 'p' });
-    expect(r.json.code).toBe('WRONG_MODE');
-    expect(r.json.plaintext).toBeUndefined();
-    expect(r.raw).not.toContain(SECRETS.http1.value);
+    // be gated does not run the gate. Until 1.0 get_entry returned a plaintext for a
+    // hand-over entry; hand-over is retired and the operation with it. Asserted for every
+    // mode including the retired one, on the RAW bytes, and with no fetch at all — an
+    // operation that still fetched and then refused would spend an access-log row.
+    for (const id of ['http1', 'ssh1', 'legacy1']) {
+      for (const extra of [{}, { include_plaintext: true }]) {
+        const r = await speak(sock(), { token: TOKEN, op: 'get_entry', entry_id: id, purpose: 'p', ...extra });
+        expect(r.json.code, id).toBe('UNKNOWN_OP');
+        expect(r.json.plaintext, id).toBeUndefined();
+        expect(r.raw, id).not.toContain(SECRETS[id].value);
+      }
+    }
+    expect(getSecretCalls).toEqual([]);
   });
 
-  it('refuses get_entry on a BROKER_SSH_AGENT entry', async () => {
-    const r = await speak(sock(), { token: TOKEN, op: 'get_entry', entry_id: 'ssh1', purpose: 'p' });
-    expect(r.json.code).toBe('WRONG_MODE');
-    expect(r.raw).not.toContain(SECRETS.ssh1.value);
+  it('no longer answers profile_flags or settings either', async () => {
+    for (const op of ['profile_flags', 'settings']) {
+      const r = await speak(sock(), { token: TOKEN, op });
+      expect(r.json.code, op).toBe('UNKNOWN_OP');
+    }
   });
 
-  it('serves a LEGACY_EXEC entry, because that is what the mode means', async () => {
-    const r = await speak(sock(), { token: TOKEN, op: 'get_entry', entry_id: 'legacy1', purpose: 'p' });
-    expect(r.json.error).toBeUndefined();
-    expect(r.json.plaintext).toBe(SECRETS.legacy1.value);
-    expect(r.json.entry_mode).toBe('LEGACY_EXEC');
-  });
-
-  it('withholds the plaintext when the caller says it does not need one', async () => {
-    // vault_entry_get verifies a signature and reports a verdict; it never shows the
-    // secret. A plaintext that is going to be discarded should not cross the socket.
+  it('refuses a call on a hand-over entry the migration has not reached', async () => {
+    // Fails CLOSED: the retired mode is neither web nor SSH, so neither path takes it.
     const r = await speak(sock(), {
-      token: TOKEN, op: 'get_entry', entry_id: 'legacy1', purpose: 'p', include_plaintext: false,
+      token: TOKEN, op: 'call', entry_id: 'legacy1', purpose: 'p',
+      request: { origin: { scheme: 'https', host: 'api.example', port: 443 }, method: 'GET', path: '/' },
     });
-    expect(r.json.error).toBeUndefined();
-    expect(r.json.name).toBe('legacy1');
-    expect(r.json.plaintext).toBeUndefined();
+    expect(r.json.code).toBe('WRONG_MODE');
     expect(r.raw).not.toContain(SECRETS.legacy1.value);
+    const s2 = await speak(sock(), {
+      token: TOKEN, op: 'ssh_agent_open', entry_id: 'legacy1', purpose: 'p',
+      op_spec: { kind: 'ssh', destination: 'h.example', remoteArgv: ['true'] },
+    });
+    expect(s2.json.code).toBe('WRONG_MODE');
   });
 
   it('refuses ssh_agent_open for a host the entry does not list', async () => {
@@ -290,6 +301,102 @@ describe('a brokered call keeps the credential', () => {
     }
   }, 20_000);
 
+  it("frames the key the way the ENTRY says, and refuses one it would not accept", async () => {
+    // Check 9, through the broker. The stub captures the binding the broker decided on;
+    // the wire itself is asserted in binding.test.ts against a real https server.
+    let sentBinding: any = null;
+    let calls = 0;
+    vi.doMock('../src/http-broker.js', async (importOriginal) => {
+      const real = await importOriginal<typeof import('../src/http-broker.js')>();
+      return {
+        ...real,
+        performOperation: async (def: any) => {
+          calls += 1;
+          sentBinding = def.credential_binding;
+          return { ok: true, status: 200, body: {} };
+        },
+      };
+    });
+    const { AgentDaemon: Mocked } = await import('../src/agent.js');
+    const d: any = new Mocked();
+    d.registerProfile({
+      agent_name: 'C', api_key: 'wv_agent_C|secret-api-key', enc_key: ENC_KEY_B64,
+      vault_url: baseUrl, socket_token: TOKEN,
+    });
+    d.start();
+    const request = { origin: { scheme: 'https', host: 'api.example', port: 443 }, method: 'GET', path: '/' };
+    const ask = () => speak(path.join(dir, 'run', 'C.sock'), {
+      token: TOKEN, op: 'call', entry_id: 'http1', purpose: 'p', request,
+    });
+    try {
+      SECRETS.http1.cfg = { delivery: 'http', credential_binding: { in: 'header', name: 'X-Api-Key', template: 'Key {secret}' } };
+      let r = await ask();
+      expect(r.json.error).toBeUndefined();
+      expect(sentBinding).toEqual({ in: 'header', name: 'x-api-key', template: 'Key {secret}' });
+
+      SECRETS.http1.cfg = { delivery: 'http', credential_binding: { in: 'header', name: 'authorization', template: 'Basic {basic}', username: 'deploy' } };
+      r = await ask();
+      expect(sentBinding.username).toBe('deploy');
+
+      // A server that rewrote the binding into something the owner could not have set.
+      const before = calls;
+      for (const bad of [
+        { in: 'header', name: 'host', template: '{secret}' },
+        { in: 'header', name: 'x-key', template: '{secret}{secret}' },
+        { in: 'header', name: 'x-key', template: 'no placeholder' },
+        { in: 'header', name: 'x-key', template: '{secret}\r\nx-evil: 1' },
+        'Bearer {secret}',
+        null,   // round 1, F2: an explicit null is not "absent"
+      ]) {
+        SECRETS.http1.cfg = { delivery: 'http', credential_binding: bad };
+        r = await ask();
+        expect(r.json.code, JSON.stringify(bad)).toBe('BAD_BINDING');
+        expect(r.raw).not.toContain(SECRETS.http1.value);
+      }
+      expect(calls).toBe(before);   // nothing was sent, and no bearer fallback
+    } finally {
+      delete SECRETS.http1.cfg;
+      try { d.shutdown(); } catch { /* already down */ }
+      vi.doUnmock('../src/http-broker.js');
+    }
+  }, 20_000);
+
+  it('never sends a private key to a web service (round 2, B3)', async () => {
+    // A hand-over SSH key converted to "web, bearer" by the migration, before its owner has
+    // switched it to SSH. Without this the broker would send the private key as a bearer
+    // token to whatever host the agent named.
+    let sent = 0;
+    vi.doMock('../src/http-broker.js', async (importOriginal) => {
+      const real = await importOriginal<typeof import('../src/http-broker.js')>();
+      return { ...real, performOperation: async () => { sent += 1; return { ok: true, status: 200, body: {} }; } };
+    });
+    const { AgentDaemon: Mocked } = await import('../src/agent.js');
+    const d: any = new Mocked();
+    d.registerProfile({
+      agent_name: 'D', api_key: 'wv_agent_D|secret-api-key', enc_key: ENC_KEY_B64,
+      vault_url: baseUrl, socket_token: TOKEN,
+    });
+    d.start();
+    const pem = '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n';
+    SECRETS.pk1 = { mode: 'BROKER_HTTP', value: pem };
+    try {
+      for (const binding of [undefined, { in: 'query', name: 'k', template: '{secret}' }]) {
+        SECRETS.pk1.cfg = binding ? { delivery: 'http', credential_binding: binding } : undefined;
+        const r = await speak(path.join(dir, 'run', 'D.sock'), {
+          token: TOKEN, op: 'call', entry_id: 'pk1', purpose: 'p',
+          request: { origin: { scheme: 'https', host: 'api.example', port: 443 }, method: 'GET', path: '/' },
+        });
+        expect(r.json.code).toBe('WRONG_KIND');
+        expect(r.raw).not.toContain('b3BlbnNzaC1rZXktdjEAAAAA');
+      }
+      expect(sent).toBe(0);
+    } finally {
+      delete SECRETS.pk1;
+      try { d.shutdown(); } catch { /* already down */ }
+      vi.doUnmock('../src/http-broker.js');
+    }
+  }, 20_000);
+
   it('carries no plaintext on the refusal paths either', async () => {
     // The paths where a naive implementation leaks: the broker is holding the decrypted
     // credential when each of these fails, and the temptation is to include context.
@@ -337,8 +444,26 @@ describe('one getSecret per operation', () => {
     // There is deliberately no metadata probe. A convenient "just tell me the mode" call
     // would add a row to the owner's access log for every tool call and give tier 2 a
     // second chance to fire.
-    await speak(sock(), { token: TOKEN, op: 'get_entry', entry_id: 'legacy1', purpose: 'p' });
-    expect(getSecretCalls).toEqual(['legacy1']);
+    await speak(sock(), {
+      token: TOKEN, op: 'call', entry_id: 'http1', purpose: 'p',
+      request: { origin: { scheme: 'http', host: 'api.example', port: 80 }, method: 'GET', path: '/' },
+    });
+    expect(getSecretCalls).toEqual(['http1']);
+  });
+
+  it("sends the agent's purpose with no fetch, web or SSH", async () => {
+    // Network-shape decision, 2026-09-15: the reason stays in the broker's local log.
+    // The parameter is still present (the route requires it), and empty.
+    const secretPurpose = 'rotate creds after suspected breach at acme';
+    await speak(sock(), {
+      token: TOKEN, op: 'call', entry_id: 'http1', purpose: secretPurpose,
+      request: { origin: { scheme: 'http', host: 'api.example', port: 80 }, method: 'GET', path: '/' },
+    });
+    await speak(sock(), {
+      token: TOKEN, op: 'ssh_agent_open', entry_id: 'ssh1', purpose: secretPurpose,
+      op_spec: { kind: 'ssh', destination: 'h.example', remoteArgv: ['true'] },
+    });
+    expect(getSecretQueries).toEqual(['?purpose=', '?purpose=']);
   });
 
   it('list_entries touches no secret at all', async () => {
@@ -534,7 +659,8 @@ describe('the MCP server cannot decrypt anything', () => {
   // Grep, not behaviour, and deliberately: the failure this guards against is a future
   // change that reintroduces local decryption because it was the convenient fix. A
   // behavioural test would pass right up until someone added the import.
-  const MCP_SIDE = ['src/server.ts', 'src/broker-client.ts', 'src/index.ts', 'src/exec.ts'];
+  // src/exec.ts was here until 1.0; it ran hand-over commands and is gone with them.
+  const MCP_SIDE = ['src/server.ts', 'src/broker-client.ts', 'src/index.ts', 'src/ssh-agent.ts'];
   const FORBIDDEN = ['decryptVaultKey', 'decryptSecretContent', 'loadEncryptionKey'];
 
   for (const file of MCP_SIDE) {

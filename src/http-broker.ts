@@ -14,8 +14,9 @@ import { request as httpsRequest } from 'node:https';
 import { lookup as dnsLookup } from 'node:dns';
 import { isIP } from 'node:net';
 import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
-import type { OperationDefinition } from './opdef.js';
+import type { OperationDefinition, CredentialBinding } from './opdef.js';
 import { filterResponse } from './opdef.js';
+import { renderCredential, secretForms } from './delivery.js';
 
 export interface CallResult {
   ok: boolean;
@@ -273,11 +274,13 @@ export async function performOperation(
   // The credential goes in last, so nothing in the definition's static headers can
   // shadow it. validateShape already refuses a definition that names both.
   let path = def.route.path;
+  const credential = renderCredential(def.credential_binding, secret);
+  const forms = secretForms(def.credential_binding, secret);
   if (def.credential_binding.in === 'header') {
-    headers[def.credential_binding.name] = def.credential_binding.template.replace('{secret}', secret);
+    headers[def.credential_binding.name] = credential;
   } else {
     const sep = path.includes('?') ? '&' : '?';
-    path += `${sep}${encodeURIComponent(def.credential_binding.name)}=${encodeURIComponent(def.credential_binding.template.replace('{secret}', secret))}`;
+    path += `${sep}${encodeURIComponent(def.credential_binding.name)}=${encodeURIComponent(credential)}`;
   }
 
   const maxRes = def.limits?.response_bytes ?? DEFAULT_RESPONSE_BYTES;
@@ -367,7 +370,7 @@ export async function performOperation(
         const ok = status >= 200 && status < 300;
         finish({
           ok, status,
-          body: scrubSecret(filtered, secret),
+          body: forms.reduce<unknown>((v, f) => scrubSecret(v, f), filtered),
           // Without this a 4xx came back as a bare ok:false with no explanation at all.
           // The upstream's own message is not repeated: it holds the credential and
           // could put it in the body.
@@ -416,7 +419,7 @@ export interface AgentRequest {
  */
 export function definitionFromAgentRequest(
   req: AgentRequest,
-  binding: { in: 'header' | 'query'; name: string; template: string },
+  binding: CredentialBinding,
   limits?: { request_bytes?: number; response_bytes?: number },
 ): OperationDefinition {
   let path = req.path || '/';

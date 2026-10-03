@@ -6,30 +6,21 @@ import {
   CallToolResultSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
-import { parseArgs } from 'node:util';
-import os from 'node:os';
-import path from 'node:path';
-import { readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmdirSync, existsSync as fsExistsSync, statSync } from 'node:fs';
 import { BrokerClient, brokerClient } from './broker-client.js';
 import { runSshWithAgent, type BrokeredOp } from './ssh-agent.js';
 import type { AgentRequest } from './http-broker.js';
-import { runWithSecret, runWithSecretStdin, runWithSecretAskpass, runWithSecretRemote, runRsync, coerceExecConfig, resolveDeliveryConfig, isValidEnvKey, commandInvokesSudo } from './exec.js';
-import { getRecipe, recipeIds } from './recipes.js';
-import type { VaultEntry, RemoteHost } from './types.js';
-import { STRIP_FROM_CHILD_ENV, resolveInjectTarget, writeInjectedLine } from './templates.js';
+import type { VaultEntry } from './types.js';
 import { VERSION } from './version.js';
-import { DIRECTIVE } from './directive.js';
-// ── Constants ─────────────────────────────────────────────────────────────────
 
 export { DIRECTIVE } from './directive.js';
 
-const SHELL_ESCAPE_PATTERNS = [
-  /\$\(/,
-  /`/,
-  /\bbash\s+-c\b/,
-  /\bsh\s+-c\b/,
-  /\beval\b/,
-];
+// ── Three tools, and none of them returns a key ──────────────────────────────
+//
+// 1.0 is brokered only. vault_exec, vault_entry_get, vault_entry_inject_env, vault_rsync
+// and vault_entry_forget handed the agent a key's value — in a command's environment, a
+// file, or the tool result — and are retired with the hand-over mode on the server. What
+// is left: list the entries, make a web call with a key (vault_call), or run ssh/rsync
+// with a key the broker signs for (vault_ssh_exec). A removed name is "Unknown tool".
 
 // ── Talking to the broker ─────────────────────────────────────────────────────
 //
@@ -62,21 +53,6 @@ function mockToolResult(name: string, args: Record<string, any>) {
     case 'vault_entries_list':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `Vault entries (2):\n  [demo-0001]  DEMO_API_KEY  (tier: read)\n  [demo-0002]  DEMO_SSH_KEY  (tier: 1)${MOCK_NOTE}` }] });
-    case 'vault_entry_get':
-      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
-        `✅ Secret retrieved and burned. (Entry: ${args.entry_id ?? 'demo-0001'}, Directive integrity: valid)${MOCK_NOTE}` }] });
-    case 'vault_entry_forget':
-      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
-        `Discarded local reference to '${args.entry_id ?? 'demo-0001'}'. (No-op on the server.)${MOCK_NOTE}` }] });
-    case 'vault_entry_inject_env':
-      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
-        `✅ ${args.env_key ?? 'DEMO_KEY'} injected into ${args.file_path ?? '~/.env'}\nSecret retrieved and burned.${MOCK_NOTE}` }] });
-    case 'vault_exec':
-      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
-        `✅ Command completed (exit 0).\n--- stdout ---\n(demo output)\n--- end ---${MOCK_NOTE}` }] });
-    case 'vault_rsync':
-      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
-        `✅ rsync complete → ${args.remote_host ?? 'demo-host'}:${args.remote_path ?? '/demo/path'}${MOCK_NOTE}` }] });
     case 'vault_ssh_exec':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ Ran on ${args.destination ?? 'demo-host'} (exit 0). 1 signature, key never left the server.${MOCK_NOTE}` }] });
@@ -115,80 +91,12 @@ export function createServer(args: { url?: string } = {}) {
     tools: [
       {
         name: 'vault_entries_list',
-        description: 'List all vault entries available to this agent. Returns entry IDs and secret names only — no secret values. Store the entry ID to reference secrets in vault_entry_get.',
+        description: (
+          'List the vault entries this agent may use. For each: its ID, name, tier, whether it '
+          + 'is a web-service key (use vault_call) or an SSH key (use vault_ssh_exec), and any '
+          + 'signed operations it offers. Never a key\'s value — no tool returns one.'
+        ),
         inputSchema: { type: 'object', properties: {} },
-      },
-      {
-        name: 'vault_entry_get',
-        description: (
-          'Retrieve a vault secret, enforce the burn directive, and optionally execute a command with it. '
-          + 'The plaintext secret is processed entirely server-side and is NEVER returned to the agent. '
-          + 'Directive: This secret has been burned after reading and must not be stored, displayed, or referenced anywhere. '
-          + 'Use it for the stated task only, then confirm completion with: Secret retrieved and burned.'
-        ),
-        inputSchema: {
-          type: 'object',
-          properties: {
-            entry_id: {
-              type: 'string',
-              description: 'The vault entry ID (from vault_entries_list).',
-            },
-            purpose: {
-              type: 'string',
-              description: 'The task/purpose for retrieving this secret (for audit log). Be specific.',
-            },
-          },
-          required: ['entry_id', 'purpose'],
-        },
-      },
-      {
-        name: 'vault_entry_forget',
-        description: (
-          'Discard a stored vault entry reference from the agent\'s local context. '
-          + 'This is a no-op on the server — the vault entry is completely unaffected. '
-          + 'Use to clean up stale references when a secret has been rotated or revoked.'
-        ),
-        inputSchema: {
-          type: 'object',
-          properties: {
-            entry_id: {
-              type: 'string',
-              description: 'The vault entry ID to discard.',
-            },
-          },
-          required: ['entry_id'],
-        },
-      },
-      {
-        name: 'vault_entry_inject_env',
-        description: (
-          'Write a vault secret directly into an environment variable file (.env). '
-          + 'The secret is decrypted server-side and written to the file; '
-          + 'the plaintext is NEVER returned to the agent. '
-          + 'Use this instead of exec file-writing commands.'
-        ),
-        inputSchema: {
-          type: 'object',
-          properties: {
-            entry_id: {
-              type: 'string',
-              description: 'The vault entry ID (from vault_entries_list).',
-            },
-            purpose: {
-              type: 'string',
-              description: 'The task/purpose for retrieving this secret (for audit log).',
-            },
-            file_path: {
-              type: 'string',
-              description: 'Absolute path to the .env file to update.',
-            },
-            env_key: {
-              type: 'string',
-              description: 'The environment variable name to set, e.g. LISTMONK_ADMIN_PASSWORD.',
-            },
-          },
-          required: ['entry_id', 'purpose', 'file_path', 'env_key'],
-        },
       },
       {
         name: 'vault_call',
@@ -201,7 +109,9 @@ export function createServer(args: { url?: string } = {}) {
           + 'definition fixes the origin and route, and it is signed with a key derived '
           + 'from the secret itself, so a definition altered anywhere in transit is '
           + 'refused.\n\n'
-          + 'Use vault_entry_get to discover which operations an entry offers.'
+          + 'vault_entries_list shows which operations an entry offers. Or describe the request '
+          + 'yourself with `request`; the entry decides how the key is attached (header, query '
+          + 'parameter or username and password) — you never choose that, and never see the key.'
         ),
         inputSchema: {
           type: 'object',
@@ -217,7 +127,7 @@ export function createServer(args: { url?: string } = {}) {
             },
             purpose: { type: 'string', description: 'Why this is needed (audit log).' },
           },
-          required: ['entry_id', 'operation_id', 'purpose'],
+          required: ['entry_id', 'purpose'],
         },
       },
       {
@@ -253,110 +163,6 @@ export function createServer(args: { url?: string } = {}) {
           required: ['entry_id', 'destination', 'purpose'],
         },
       },
-      {
-        name: 'vault_exec',
-        description: (
-          'Execute a shell command with a vault secret delivered to it safely. '
-          + 'The secret is never returned to the agent, and is scrubbed from output and '
-          + 'zeroed after the process runs.\n\n'
-          + 'Tier 1 and Tier 2 secrets execute automatically based on server-side access policy.\n\n'
-          + 'HOW THE SECRET IS DELIVERED is chosen by the entry\'s credential_type (its recipe) — '
-          + 'you do not pick a channel:\n'
-          + '  • generic (default) → injected as a named env var (set env_key)\n'
-          + '  • sudo → piped to `sudo -S` over stdin, never in the environment\n'
-          + '  • git / ssh-passphrase → via a GIT_ASKPASS / SSH_ASKPASS helper reading a private pipe\n'
-          + 'The credential_type is normally set on the entry in the dashboard; override per-call with '
-          + 'inject_as if needed. For LOCAL exec a recipe or env_key is required; for REMOTE exec it is optional '
-          + '(remote currently supports the generic/env path only).\n\n'
-          + 'To run a remote command using only a vaulted SSH key (no secret injected), omit '
-          + 'entry_id and pass remote_host with ssh_key_entry_id.\n\n'
-          + 'NEVER use shell escape patterns in command ($(), backticks, bash -c, sh -c, eval) — '
-          + 'these are rejected before the secret is decrypted.'
-        ),
-        inputSchema: {
-          type: 'object',
-          properties: {
-            entry_id: { type: 'string', description: 'Vault entry ID (from vault_entries_list) of the secret to inject. Optional: omit it to run a remote command using only a vaulted SSH key (remote_host.ssh_key_entry_id) with no secret injected.' },
-            purpose: { type: 'string', description: 'Why this secret is needed (audit log).' },
-            command: { type: 'string', description: 'Full shell command to run (no escape patterns).' },
-            working_dir: { type: 'string', description: 'Optional working directory for the command.' },
-            inject_as: {
-              type: 'object',
-              description: 'Override the entry\'s delivery config for this call. Omit to use the entry\'s exec_config / credential_type.',
-              properties: {
-                credential_type: { type: 'string', description: 'How to deliver the secret — the vault picks the safe channel: generic | sudo | git | ssh-passphrase.' },
-                env_key: { type: 'string', description: 'For generic secrets: env var name to inject the secret as.' },
-                pre_command: { type: 'string', description: 'Setup command (runs before main command).' },
-                post_command: { type: 'string', description: 'Teardown command (always runs after main command).' },
-                mechanism: { type: 'string', enum: ['env', 'stdin', 'askpass'], description: 'Advanced: force a delivery channel directly instead of a credential_type.' },
-                askpass_var: { type: 'string', description: 'Advanced: askpass env var (e.g. SUDO_ASKPASS) when mechanism is askpass.' },
-              },
-            },
-            remote_host: {
-              type: 'object',
-              description: (
-                'Run the command on a remote machine via SSH. '
-                + 'The secret is injected inside the remote shell via SSH stdin — '
-                + 'no AcceptEnv/SendEnv configuration required on the remote host. '
-                + 'Use ssh_key_entry_id (preferred) to load the SSH key from the vault '
-                + 'so it is never exposed on the filesystem. '
-                + 'Use ssh_key as a fallback path if the key is already on disk.'
-              ),
-              properties: {
-                host: { type: 'string', description: 'Remote hostname or IP address.' },
-                user: { type: 'string', description: 'SSH username on the remote host.' },
-                ssh_key: { type: 'string', description: 'Path to SSH private key on disk (e.g. ~/.ssh/id_ed25519). Prefer ssh_key_entry_id.' },
-                ssh_key_entry_id: { type: 'string', description: 'Vault entry ID containing the SSH private key. The key is fetched, used, and never written to disk.' },
-              },
-              required: ['host', 'user'],
-            },
-          },
-          required: ['purpose', 'command'],
-        },
-      },
-      {
-        name: 'vault_rsync',
-        description: (
-          'Sync a local directory to a remote host using rsync over SSH, with the SSH key fetched from the vault. '
-          + 'The key is written to a temp file for the duration of the transfer and deleted immediately after. '
-          + 'Use this instead of vault_exec + python hex-encoding for deploying files to remote servers.'
-        ),
-        inputSchema: {
-          type: 'object',
-          properties: {
-            ssh_key_entry_id: {
-              type: 'string',
-              description: 'Vault entry ID containing the SSH private key.',
-            },
-            purpose: {
-              type: 'string',
-              description: 'Why this transfer is happening (audit log).',
-            },
-            local_path: {
-              type: 'string',
-              description: 'Local source path. Trailing slash syncs contents; no trailing slash syncs the directory itself.',
-            },
-            remote_user: {
-              type: 'string',
-              description: 'SSH username on the remote host.',
-            },
-            remote_host: {
-              type: 'string',
-              description: 'Remote hostname or IP address.',
-            },
-            remote_path: {
-              type: 'string',
-              description: 'Destination path on the remote host.',
-            },
-            extra_args: {
-              type: 'array',
-              items: { type: 'string' },
-              description: 'Additional rsync flags, e.g. ["--delete", "--exclude=*.pyc"]. Optional.',
-            },
-          },
-          required: ['ssh_key_entry_id', 'purpose', 'local_path', 'remote_user', 'remote_host', 'remote_path'],
-        },
-      },
     ],
   }));
 
@@ -386,97 +192,13 @@ export function createServer(args: { url?: string } = {}) {
         }
         const lines = [`Vault entries (${entries.length}):\n`];
         for (const e of entries) {
-          lines.push(`  [${e.id}]  ${e.secret_name}  (tier: ${e.access_tier ?? 'read'})`);
+          const use = e.entry_mode === 'BROKER_SSH_AGENT' ? 'SSH key → vault_ssh_exec'
+            : e.entry_mode === 'BROKER_HTTP' ? 'web key → vault_call'
+            : 'not usable until the owner sets how it is used';
+          const ops = e.operations?.length ? `; operations: ${e.operations.join(', ')}` : '';
+          lines.push(`  [${e.id}]  ${e.secret_name}  (tier: ${e.access_tier ?? 'read'}; ${use}${ops})`);
         }
         return CallToolResultSchema.parse({ content: [{ type: 'text', text: lines.join('\n') }] });
-      }
-
-      if (request.params.name === 'vault_entry_get') {
-        const { entry_id, purpose } = request.params.arguments as {
-          entry_id: string;
-          purpose: string;
-        };
-
-        // NOTE, because it surprises everyone who reads it: this tool does NOT return the
-        // secret. It fetches, burns, verifies the directive signature, and reports the
-        // verdict. Putting the plaintext in a tool result would put it in the model's
-        // context and in the transcript, which is the thing the whole product is against.
-        //
-        // So it asks the broker NOT to send one. The broker has to decrypt either way —
-        // the signature is keyed by the plaintext — but a secret that is not needed here
-        // should not cross the socket to be discarded.
-        const r = await broker.send('get_entry', {
-          entry_id, purpose: purpose.slice(0, 200), include_plaintext: false,
-        });
-        if (r.error) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `${r.code === 'WRONG_MODE' ? '' : '⚠️ '}${r.error}` }],
-            isError: true,
-          });
-        }
-
-        return CallToolResultSchema.parse({
-          content: [{ type: 'text', text: `✅ Secret retrieved and burned. (Entry: ${r.name}, Directive integrity: ${r.integrity})` }],
-        });
-      }
-
-      if (request.params.name === 'vault_entry_inject_env') {
-        const { entry_id, purpose, file_path, env_key } = request.params.arguments as {
-          entry_id: string;
-          purpose: string;
-          file_path: string;
-          env_key: string;
-        };
-
-        // A key is interpolated into a config line, so a newline in it writes extra
-        // lines of someone else's choosing. Check before a secret is fetched or burned.
-        if (!isValidEnvKey(env_key)) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `❌ vault_entry_inject_env: '${String(env_key)}' is not a valid environment variable name (letters, digits and underscore; not starting with a digit).` }],
-          });
-        }
-
-        // Resolve BEFORE anything else: the allowlist judges a name, and a name
-        // says nothing about where a symlink actually points.
-        const resolved = resolveInjectTarget(file_path);
-        if (!resolved.ok) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `❌ vault_entry_inject_env: ${resolved.error} Use vault_exec for command execution.` }],
-          });
-        }
-        const injectTarget = resolved.target;
-        const safePath = injectTarget.path;
-
-        // Asked before the fetch, and it is a separate operation for that reason: the
-        // account may forbid this entirely, and finding that out after the secret has
-        // been fetched would spend a burn-on-read secret to deliver a refusal.
-        const flags = await broker.sendOrThrow('profile_flags');
-        if (!flags.allow_env_inject) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `❌ vault_entry_inject_env is disabled for this account. Go to Settings > Agent Capabilities on the Wundervault dashboard to enable it.` }],
-          });
-        }
-
-        // This one DOES need the plaintext — it is writing it to a file on this machine.
-        // That is what LEGACY_EXEC means, and the broker refuses any other mode.
-        const r = await broker.send('get_entry', { entry_id, purpose: purpose.slice(0, 200) });
-        if (r.error) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `${r.code === 'WRONG_MODE' ? '' : '⚠️ '}${r.error}` }],
-            isError: true,
-          });
-        }
-
-        const written = writeInjectedLine(injectTarget, env_key, String(r.plaintext ?? ''));
-        if (!written.ok) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `❌ vault_entry_inject_env: ${written.error}` }],
-          });
-        }
-
-        return CallToolResultSchema.parse({
-          content: [{ type: 'text', text: `✅ ${env_key} injected into ${safePath}\nSecret retrieved and burned.` }],
-        });
       }
 
       if (request.params.name === 'vault_call') {
@@ -596,370 +318,6 @@ export function createServer(args: { url?: string } = {}) {
         });
       }
 
-      if (request.params.name === 'vault_exec') {
-        const { entry_id, purpose, command, working_dir, inject_as, remote_host } = request.params.arguments as {
-          entry_id?: string;
-          purpose: string;
-          command: string;
-          working_dir?: string;
-          inject_as?: { credential_type?: string; env_key?: string; pre_command?: string; post_command?: string; mechanism?: 'env' | 'stdin' | 'askpass'; askpass_var?: string };
-          remote_host?: RemoteHost;
-        };
-
-        // Safety check BEFORE fetching entry or decrypting
-        for (const pat of SHELL_ESCAPE_PATTERNS) {
-          if (pat.test(command)) {
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `❌ vault_exec rejected: command contains a disallowed shell escape pattern. Remove $(), backticks, bash -c, sh -c, or eval.` }],
-            });
-          }
-        }
-
-        // env_key ends up inside `export <key>='<secret>'` in the remote script, so an
-        // unchecked key is remote command execution. The shell-escape screen above only
-        // looks at `command`. Check both sources before anything is decrypted.
-        for (const [label, k] of [['inject_as.env_key', inject_as?.env_key]] as const) {
-          if (k !== undefined && !isValidEnvKey(k)) {
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `❌ vault_exec: ${label} '${String(k)}' is not a valid environment variable name (letters, digits and underscore; not starting with a digit).` }],
-            });
-          }
-        }
-
-        // Validate working_dir BEFORE fetching and decrypting: a bad path should not
-        // consume a burn-on-read secret. spawnSync stays the authority — this only
-        // catches the obvious mistakes early. '' would otherwise reach spawnSync as an
-        // empty cwd, which is not the same as "unset".
-        const workingDir = working_dir && working_dir.trim() ? working_dir : undefined;
-        if (workingDir && !remote_host) {
-          if (!path.isAbsolute(workingDir)) {
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `❌ vault_exec: working_dir must be an absolute path; got '${workingDir}'.` }],
-            });
-          }
-          let wdStat;
-          try { wdStat = statSync(workingDir); } catch {
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `❌ vault_exec: working_dir '${workingDir}' does not exist.` }],
-            });
-          }
-          if (!wdStat.isDirectory()) {
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `❌ vault_exec: working_dir '${workingDir}' is not a directory.` }],
-            });
-          }
-        }
-
-        // entry_id is optional: omit it to run a remote command using only a vaulted
-        // SSH key (no secret injected). Require at least a secret to inject OR an SSH key.
-        const hasSshKey = !!(remote_host && (remote_host.ssh_key_entry_id || remote_host.ssh_key));
-        if (!entry_id && !hasSshKey) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `❌ Provide entry_id (a secret to inject) and/or a remote_host with ssh_key_entry_id (to run remotely with a vaulted SSH key).` }],
-          });
-        }
-
-        let plaintext = '';
-        let tier = '-';
-        let entryName: string | undefined;
-        let cfg: { credential_type?: string; env_key?: string; pre_command?: string; post_command?: string; mechanism?: 'env' | 'stdin' | 'askpass'; askpass_var?: string } | undefined = inject_as;
-        let overrideNote = '';
-
-        let entryExecConfig: unknown;
-        if (entry_id) {
-          // One operation, and the broker does the fetch, the mode check, the decrypt and
-          // the directive verification. A refusal for the wrong mode or a bad signature
-          // arrives as `error` and never carries a plaintext with it — an invalid
-          // signature used to be reported alongside a secret this process had already
-          // decrypted, which made the warning advisory.
-          const r = await broker.send('get_entry', { entry_id, purpose: purpose.slice(0, 200) });
-          if (r.error) {
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `${r.code === 'WRONG_MODE' ? '' : '⚠️ '}${r.error}` }],
-              isError: true,
-            });
-          }
-          tier = String(r.access_tier ?? '1');
-          entryName = String(r.name ?? entry_id);
-          plaintext = String(r.plaintext ?? '');
-          entryExecConfig = r.exec_config;
-
-          // Resolve injection config. The entry's exec_config is set by the OWNER in
-          // the dashboard; inject_as is chosen by the CALLING AGENT. Where the owner has
-          // named a delivery channel, that channel is a ceiling, not a default: an agent
-          // asking for `env` must not be able to pull a secret the owner scoped to stdin
-          // into the process environment, where /proc/<pid>/environ and every child can
-          // read it.
-          //
-          // There are two ways to name a channel — credential_type (a recipe) and the
-          // lower-level mechanism escape hatch — and the dispatch below prefers the
-          // former. Pinning BOTH from the server config is what closes the second door:
-          // overriding only credential_type would leave `mechanism` free to weaken
-          // delivery whenever the owner's config used the escape hatch.
-          //
-          // Required for LOCAL exec (the point is to inject a secret); OPTIONAL for REMOTE
-          // exec, where entry_id may be supplied only to use it as the SSH key without
-          // injecting it as an env var.
-          const delivery = resolveDeliveryConfig(coerceExecConfig(entryExecConfig), inject_as);
-          if (!delivery.ok) {
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `❌ vault_exec: ${delivery.error}` }],
-            });
-          }
-          cfg = delivery.cfg;
-          if (delivery.ignoredOverride) {
-            const { asked, enforced } = delivery.ignoredOverride;
-            overrideNote = `\n⚠️ Requested delivery '${asked}' was ignored: this entry is configured for '${enforced}' by its owner.`;
-          }
-          if (!cfg && !remote_host) {
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `❌ No injection config. Set exec_config on the vault entry in the dashboard, or provide inject_as in the call.` }],
-            });
-          }
-        }
-
-        const envKey = cfg?.env_key ?? '';
-        if (envKey && !isValidEnvKey(envKey)) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `❌ vault_exec: this entry's exec_config sets env_key '${envKey}', which is not a valid environment variable name. Fix it in the dashboard.` }],
-          });
-        }
-
-        // Resolve the delivery mechanism from the recipe (credential_type), an
-        // advanced override, or the legacy env_key (generic). Callers pick intent,
-        // not a channel.
-        let mechanism: 'env' | 'stdin' | 'askpass' = 'env';
-        let askpassVar: string | undefined;
-        let wrap: 'setsid' | undefined;
-        let appendNewline: boolean | undefined;
-        let deliveryNote = '';
-
-        if (cfg?.credential_type) {
-          const recipe = getRecipe(cfg.credential_type);
-          if (!recipe) {
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `❌ Unknown credential_type '${cfg.credential_type}'. Known types: ${recipeIds().join(', ')}.` }],
-            });
-          }
-          mechanism = recipe.mechanism;
-          askpassVar = recipe.askpassVar;
-          wrap = recipe.wrap;
-          appendNewline = recipe.appendNewline;
-          deliveryNote = recipe.delivery;
-        } else if (cfg?.mechanism) {
-          // Advanced escape hatch: force a channel directly.
-          mechanism = cfg.mechanism;
-          askpassVar = cfg.askpass_var;
-        }
-
-        // Validate the mechanism has what it needs (SSH-only no-secret remote runs skip this).
-        if (mechanism === 'env' && !envKey && !remote_host && (entry_id || cfg)) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `❌ No delivery config. Set a credential_type (${recipeIds().join(', ')}) on the entry, or pass env_key for a generic secret.` }],
-          });
-        }
-        if (mechanism === 'askpass' && !askpassVar) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `❌ askpass delivery needs an askpass_var — use a credential_type (git, ssh-passphrase) instead of a bare mechanism.` }],
-          });
-        }
-
-        // Build full command: pre_command && main_command; post_command
-        let fullCommand = command;
-        if (cfg?.pre_command) {
-          fullCommand = `${cfg.pre_command} && ${command}`;
-        }
-        if (cfg?.post_command) {
-          fullCommand = `${fullCommand}; ${cfg.post_command}`;
-        }
-
-        let execResult: ReturnType<typeof runWithSecret>;
-        let keyFingerprint: string | null = null;
-        if (remote_host) {
-          if (mechanism !== 'env') {
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `❌ credential_type '${cfg?.credential_type ?? mechanism}' is not supported for remote exec yet — remote delivery is env-only. Run it locally, or use a generic secret for the remote host.` }],
-            });
-          }
-          // Resolve ssh_key_entry_id: fetch SSH key from vault, write to a temp file,
-          // use for the connection, then delete immediately after.
-          let resolvedRemote = { ...remote_host };
-          let tempKeyPath: string | null = null;
-          try {
-            if (remote_host.ssh_key_entry_id) {
-              // This path writes the key to a temp file for `ssh -i`, so it is
-              // LEGACY_EXEC by definition and the broker refuses any other mode — an
-              // entry converted to BROKER_SSH_AGENT is refused here and belongs in
-              // vault_ssh_exec, where the key stays with the broker.
-              const sshKeyRes = await broker.send('get_entry', {
-                entry_id: remote_host.ssh_key_entry_id,
-                purpose: `ssh key for vault_exec to ${remote_host.host}`,
-              });
-              if (sshKeyRes.error) {
-                return CallToolResultSchema.parse({
-                  content: [{ type: 'text', text: `${sshKeyRes.code === 'WRONG_MODE' ? '' : '⚠️ '}${sshKeyRes.error}` }],
-                  isError: true,
-                });
-              }
-              let sshKeyPlaintext = String(sshKeyRes.plaintext ?? '');
-              // Normalize line endings (web UIs often introduce CRLF)
-              sshKeyPlaintext = sshKeyPlaintext.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
-              // If the dashboard stripped newlines + PEM headers, reconstruct proper OpenSSH PEM format.
-              // This happens because some UIs collapse multi-line secrets into a single line.
-              if (!sshKeyPlaintext.startsWith('-----') && /^[A-Za-z0-9+/]+=*$/.test(sshKeyPlaintext)) {
-                const chunks = sshKeyPlaintext.match(/.{1,70}/g) ?? [];
-                sshKeyPlaintext = '-----BEGIN OPENSSH PRIVATE KEY-----\n' + chunks.join('\n') + '\n-----END OPENSSH PRIVATE KEY-----\n';
-              } else {
-                if (!sshKeyPlaintext.endsWith('\n')) sshKeyPlaintext += '\n';
-              }
-              const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'wv-ssh-'));
-              tempKeyPath = path.join(tmpDir, 'key');
-              writeFileSync(tempKeyPath, sshKeyPlaintext, { mode: 0o600 });
-              // Validate key is parseable and capture fingerprint before attempting SSH connection
-              const { spawnSync: spawnSyncVal } = await import('node:child_process');
-              const keyCheck = spawnSyncVal('ssh-keygen', ['-l', '-f', tempKeyPath], { encoding: 'utf8' });
-              const lineCount = sshKeyPlaintext.split('\n').length;
-              const hasHeader = sshKeyPlaintext.includes('-----BEGIN');
-              if (keyCheck.status !== 0) {
-                return CallToolResultSchema.parse({ content: [{ type: 'text', text: `❌ SSH key validation failed (ssh-keygen exit ${keyCheck.status}): ${(keyCheck.stderr || keyCheck.stdout || '').trim()}\nKey diagnostic: lines=${lineCount}, hasHeader=${hasHeader}` }] });
-              }
-              keyFingerprint = (keyCheck.stdout || '').trim();
-              resolvedRemote = { ...remote_host, ssh_key: tempKeyPath, ssh_key_entry_id: undefined };
-            }
-            // pre_command/post_command are local hooks — not forwarded to remote execution.
-            execResult = runWithSecretRemote(plaintext, fullCommand, envKey, resolvedRemote);
-          } finally {
-            if (tempKeyPath) {
-              try { unlinkSync(tempKeyPath); } catch { /* ignore */ }
-              try { rmdirSync(path.dirname(tempKeyPath)); } catch { /* ignore */ }
-            }
-          }
-        } else {
-          // working_dir is passed per-child rather than via process.chdir(). chdir
-          // moves the WHOLE daemon: a throw between the two calls would strand every
-          // later command in the wrong directory, and the restore was not in a finally.
-          // spawnSync's own cwd has neither problem and needs no restoring. It is
-          // validated up top, before the secret is fetched, so a typo cannot burn one.
-          if (mechanism === 'stdin') {
-            // The server decides whether this account may pipe a secret into sudo, and
-            // says so by storing credential_type "sudo" on the entry. A caller-chosen
-            // stdin mechanism cannot buy that capability for itself.
-            // cfg.credential_type is set by resolveDeliveryConfig ONLY from the
-            // server-side exec_config — a caller-supplied credential_type is discarded
-            // there. So this reads the owner's decision, never the caller's request.
-            const serverSaysSudo =
-              String(cfg?.credential_type ?? '').trim().toLowerCase() === 'sudo';
-            if (commandInvokesSudo(fullCommand) && !serverSaysSudo) {
-              return {
-                content: [{
-                  type: 'text',
-                  text: 'Refused: piping a vault secret into `sudo` is disabled for this '
-                      + 'entry. It hands the caller arbitrary root, and a `sudo` earlier on '
-                      + 'PATH would capture the password.\n\nGrant the specific commands in '
-                      + '/etc/sudoers with NOPASSWD instead — no password is transmitted, and '
-                      + 'the blast radius is an explicit allowlist rather than full root.',
-                }],
-                isError: true,
-              };
-            }
-            execResult = runWithSecretStdin(plaintext, fullCommand, { appendNewline, cwd: workingDir });
-          } else if (mechanism === 'askpass') {
-            execResult = runWithSecretAskpass(plaintext, fullCommand, { askpassVar: askpassVar as string, wrap, cwd: workingDir });
-          } else if (mechanism === 'env') {
-            execResult = runWithSecret(plaintext, fullCommand, envKey, { cwd: workingDir });
-          } else {
-            // Unreachable for validated input. Kept as an error rather than a default
-            // so a new mechanism added later cannot quietly deliver over `env`.
-            return CallToolResultSchema.parse({
-              content: [{ type: 'text', text: `❌ vault_exec: unsupported delivery mechanism '${String(mechanism)}'.` }],
-            });
-          }
-        }
-        const { exitCode, stdout, stderr } = execResult;
-
-        const resultLines = [
-          `✅ vault_exec complete.`,
-          ``,
-          `  Entry:   ${entryName ?? '(none — SSH-only, no secret injected)'}`,
-          `  Tier:    ${tier}`,
-          `  Command: ${command}`,
-          ...(deliveryNote ? [`  Delivery: ${deliveryNote}`] : []),
-          ...(remote_host ? [`  Remote:  ${remote_host.user}@${remote_host.host}${remote_host.ssh_key_entry_id ? ' (vaulted key)' : ''}`] : []),
-          ...(keyFingerprint ? [`  Key:     ${keyFingerprint}`] : []),
-          `  Exit:    ${exitCode}`,
-          `  stdout:  ${(stdout || '(empty)').trim()}`,
-        ];
-        if (stderr) resultLines.push(`  stderr:  ${stderr.trim()}`);
-        if (overrideNote) resultLines.push(overrideNote);
-        resultLines.push(`\nSecret injected and buffer zeroed. Not returned to agent.`);
-
-        return CallToolResultSchema.parse({ content: [{ type: 'text', text: resultLines.join('\n') }] });
-      }
-
-      if (request.params.name === 'vault_rsync') {
-        const { ssh_key_entry_id, purpose, local_path, remote_user, remote_host, remote_path, extra_args } = request.params.arguments as {
-          ssh_key_entry_id: string;
-          purpose: string;
-          local_path: string;
-          remote_user: string;
-          remote_host: string;
-          remote_path: string;
-          extra_args?: string[];
-        };
-
-        // Same as the vault_exec remote path: the key is written to a temp file for
-        // `ssh -i`, so this is LEGACY_EXEC and the broker refuses anything else.
-        const sshKeyRes = await broker.send('get_entry', { entry_id: ssh_key_entry_id, purpose: purpose.slice(0, 200) });
-        if (sshKeyRes.error) {
-          return CallToolResultSchema.parse({
-            content: [{ type: 'text', text: `${sshKeyRes.code === 'WRONG_MODE' ? '' : '⚠️ '}${sshKeyRes.error}` }],
-            isError: true,
-          });
-        }
-        let sshKeyPlaintext = String(sshKeyRes.plaintext ?? '');
-        sshKeyPlaintext = sshKeyPlaintext.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
-        if (!sshKeyPlaintext.startsWith('-----') && /^[A-Za-z0-9+/]+=*$/.test(sshKeyPlaintext)) {
-          const chunks = sshKeyPlaintext.match(/.{1,70}/g) ?? [];
-          sshKeyPlaintext = '-----BEGIN OPENSSH PRIVATE KEY-----\n' + chunks.join('\n') + '\n-----END OPENSSH PRIVATE KEY-----\n';
-        } else {
-          if (!sshKeyPlaintext.endsWith('\n')) sshKeyPlaintext += '\n';
-        }
-
-        const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'wv-ssh-'));
-        const tempKeyPath = path.join(tmpDir, 'key');
-        let rsyncResult: ReturnType<typeof runRsync>;
-        try {
-          writeFileSync(tempKeyPath, sshKeyPlaintext, { mode: 0o600 });
-          const { spawnSync: spawnSyncVal } = await import('node:child_process');
-          const keyCheck = spawnSyncVal('ssh-keygen', ['-l', '-f', tempKeyPath], { encoding: 'utf8' });
-          if (keyCheck.status !== 0) {
-            return CallToolResultSchema.parse({ content: [{ type: 'text', text: `❌ SSH key validation failed: ${(keyCheck.stderr || keyCheck.stdout || '').trim()}` }] });
-          }
-          rsyncResult = runRsync(tempKeyPath, local_path, remote_user, remote_host, remote_path, extra_args ?? []);
-        } finally {
-          try { unlinkSync(tempKeyPath); } catch {}
-          try { rmdirSync(path.dirname(tempKeyPath)); } catch {}
-        }
-
-        const lines = [
-          `${rsyncResult.exitCode === 0 ? '✅' : '❌'} vault_rsync ${rsyncResult.exitCode === 0 ? 'complete' : 'failed'}.`,
-          ``,
-          `  From: ${local_path}`,
-          `  To:   ${remote_user}@${remote_host}:${remote_path}`,
-          `  Exit: ${rsyncResult.exitCode}`,
-        ];
-        if (rsyncResult.stdout) lines.push(`  Output:\n${rsyncResult.stdout.trim()}`);
-        if (rsyncResult.stderr) lines.push(`  Stderr:\n${rsyncResult.stderr.trim()}`);
-
-        return CallToolResultSchema.parse({ content: [{ type: 'text', text: lines.join('\n') }] });
-      }
-
-      if (request.params.name === 'vault_entry_forget') {
-        const { entry_id } = request.params.arguments as { entry_id: string };
-        return CallToolResultSchema.parse({
-          content: [{ type: 'text', text: `✔️ Reference [${entry_id}] discarded from local context. Vault entry unchanged.` }],
-        });
-      }
 
       return CallToolResultSchema.parse({ content: [{ type: 'text', text: `Unknown tool: ${request.params.name}` }] });
 

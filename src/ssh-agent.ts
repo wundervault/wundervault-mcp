@@ -1,11 +1,11 @@
 /**
  * An ssh-agent that holds the key instead of handing it over.
  *
- * `vault_rsync` and remote `vault_exec` currently write the private key to a temp file
- * for the duration of the transfer. Anything running as the same user can read it while
- * it is there. The ssh-agent protocol exists precisely so a private key never has to
- * leave the process that holds it: ssh asks for a signature over the session data, the
- * agent answers, and the key stays put.
+ * `vault_rsync` and remote `vault_exec` used to write the private key to a temp file for
+ * the duration of the transfer, where anything running as the same user could read it.
+ * Both are retired in 1.0. The ssh-agent protocol exists precisely so a private key never
+ * has to leave the process that holds it: ssh asks for a signature over the session data,
+ * the agent answers, and the key stays put.
  *
  * SCOPE, stated plainly — and this paragraph was out of date for three phases, which is
  * worth more than the correction itself.
@@ -668,45 +668,33 @@ export async function runSshBrokered(opts: {
 
 export const BROKER_SSH_AGENT = 'BROKER_SSH_AGENT';
 export const BROKER_HTTP = 'BROKER_HTTP';
-export const LEGACY_EXEC = 'LEGACY_EXEC';
 
 /**
- * Which tool an entry may be used through.
+ * Which tool an entry may be used through: a web-service key through vault_call, an SSH
+ * key through vault_ssh_exec. Checked in the broker before the key is decrypted.
  *
- * Enforced here, in the client, because the server cannot currently tell the two apart:
- * the MCP daemon is the client for both vault_exec and vault_ssh_exec and fetches the
- * same ciphertext either way. Server-side enforcement needs the daemon to authenticate
- * as itself. Until then this is an authoritative value checked at the point of use —
- * which stops an entry being used the wrong way by accident or by a confused caller,
- * and does not stop someone who has already replaced this code.
- *
- * Unknown modes fail CLOSED for the broker and OPEN for legacy, so a server that starts
- * returning a mode this build has never heard of does not silently hand a brokered key
- * to the generic exec path.
+ * Anything else — an unknown mode, a missing one, or the retired LEGACY_EXEC (hand-over),
+ * which the 1.0 server converts and refuses to serve — matches neither, so it fails CLOSED.
+ * There is no path left that a mode could fall back to.
  */
-export function modeAllowsLegacyExec(mode: string | undefined): boolean {
-  const m = (mode || LEGACY_EXEC).trim().toUpperCase();
-  return m === LEGACY_EXEC;
-}
-
 export function modeAllowsSshBroker(mode: string | undefined): boolean {
-  return (mode || LEGACY_EXEC).trim().toUpperCase() === BROKER_SSH_AGENT;
+  return (mode || '').trim().toUpperCase() === BROKER_SSH_AGENT;
 }
 
 export function modeAllowsHttpBroker(mode: string | undefined): boolean {
-  return (mode || LEGACY_EXEC).trim().toUpperCase() === BROKER_HTTP;
+  return (mode || '').trim().toUpperCase() === BROKER_HTTP;
 }
 
-export function wrongModeMessage(mode: string | undefined, wanted: 'exec' | 'ssh' | 'http'): string {
-  const m = (mode || LEGACY_EXEC).trim().toUpperCase();
-  if (wanted === 'exec') {
-    return `Refused: this entry is in ${m} mode, so its secret is not handed to a command. `
-      + 'Use vault_ssh_exec, which keeps the key inside this server and returns only the '
-      + 'result. To move it back, change the entry mode in the dashboard — that is an '
-      + 'owner action and it is logged as a downgrade.';
+export function wrongModeMessage(mode: string | undefined, wanted: 'ssh' | 'http'): string {
+  const m = (mode || '').trim().toUpperCase() || 'no';
+  if (m !== BROKER_SSH_AGENT && m !== BROKER_HTTP) {
+    return `Refused: this entry is in ${m} mode, which 1.0 does not use — keys are no longer `
+      + 'handed to agents. The owner needs to choose in the dashboard whether it is a '
+      + 'web-service key or an SSH key.';
   }
-  const want = wanted === 'ssh' ? BROKER_SSH_AGENT : BROKER_HTTP;
-  return `Refused: this entry is in ${m} mode, not ${want}. `
-    + 'Convert it in the dashboard first; brokering a secret that is still marked legacy '
-    + 'would claim a protection the entry does not have.';
+  const tool = m === BROKER_SSH_AGENT ? 'vault_ssh_exec' : 'vault_call';
+  const kind = m === BROKER_SSH_AGENT ? 'an SSH key' : 'a web-service key';
+  const want = wanted === 'ssh' ? 'an SSH key' : 'a web-service key';
+  return `Refused: this entry is ${kind}, not ${want}. Use ${tool} with it, or the owner `
+    + 'can change how it is used in the dashboard.';
 }

@@ -18,15 +18,16 @@
  * could not reach the agent's files, but the real reason is worse than inconvenience: a
  * broker that executes an agent-supplied command hands that agent code execution as the
  * uid that owns /var/lib/wundervault, which is every credential on the machine. So the
- * operations here are exactly three shapes, and no more:
+ * operations here are exactly two shapes, and no more:
  *
- *   - hand back a plaintext, ONLY for an entry whose mode says that is what it is for;
- *   - perform a typed HTTP request and return the scrubbed response;
+ *   - perform an HTTP request with the key attached and return the scrubbed response;
  *   - answer ssh-agent signature requests on a socket, holding the private key.
  *
- * `vault_exec`, `vault_rsync` and `vault_ssh_exec` keep running in the agent's process.
- * They are the agent's own commands on the agent's own machine; what changed is where
- * their key material comes from and what the broker will agree to release.
+ * There used to be a third — hand back a plaintext, for an entry in the hand-over mode
+ * (`get_entry`, behind `vault_exec`, `vault_entry_inject_env` and `vault_rsync`). 1.0 is
+ * brokered only: that mode is retired on the server and the operation is gone here, so
+ * no path through this socket returns a key's value. `vault_ssh_exec` still runs in the
+ * agent's process — it is the agent's own command — and gets signatures, not the key.
  *
  * ONE getSecret PER OPERATION, DELIBERATELY
  *
@@ -34,15 +35,19 @@
  * That keeps the server's access log and the tier-2 gate seeing precisely what they saw
  * before. A separate "just the metadata" probe would have been convenient here and would
  * have added an access-log row per call and a second chance to trip tier 2.
+ *
+ * None of them sends the agent's `purpose` with that fetch. The reason stays in the local
+ * destination log; the server hears it only for a tier-2 web call, on the approval the
+ * owner is being asked to make (see `call`).
  */
 import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { AgentVaultAPI } from './api-client.js';
 import { signerFromIdentity, type BrokerSigner } from './broker-sign.js';
-import { decryptSecretContent, verifyDirectiveSignature, loadEncryptionKey } from './crypto.js';
+import { decryptSecretContent, loadEncryptionKey } from './crypto.js';
 import {
-  modeAllowsLegacyExec, modeAllowsSshBroker, modeAllowsHttpBroker, wrongModeMessage,
+  modeAllowsSshBroker, modeAllowsHttpBroker, wrongModeMessage,
   loadOpenSshEd25519, startAgent, checkSshDestination, type AgentHandle, type BrokeredOp,
 } from './ssh-agent.js';
 import {
@@ -52,8 +57,8 @@ import {
 import { verifyOperationDefinition, validateArguments } from './opdef.js';
 import { recordDestination, newDestinationNotice, emitToStderr } from './network-store.js';
 import { runtimeDir } from './paths.js';
-import type { ExecConfig, VaultEntry } from './types.js';
-import { DIRECTIVE } from './directive.js';
+import type { VaultEntry } from './types.js';
+import { bindingFromExecConfig, looksLikePrivateKey } from './delivery.js';
 
 export interface OpError { error: string; code?: string }
 
@@ -117,71 +122,6 @@ export class BrokerOps {
     return { entries: data.entries ?? [] };
   }
 
-  // ── profile_flags ──────────────────────────────────────────────────────────
-  /**
-   * Account-level flags the agent needs before it does local work.
-   *
-   * Separate from get_entry because `vault_entry_inject_env` has to know the account
-   * forbids it BEFORE a secret is fetched and burned — refusing after the fetch would
-   * spend a use of the secret to deliver a refusal.
-   */
-  async profileFlags(): Promise<{ allow_env_inject: boolean }> {
-    const p = await this.api.getProfile();
-    return { allow_env_inject: p.allow_env_inject ?? false };
-  }
-
-  // ── get_entry ──────────────────────────────────────────────────────────────
-  /**
-   * The one operation that returns a plaintext, and the one the mode gate exists for.
-   *
-   * The mode check happens HERE. It used to happen in the MCP server, which is the
-   * agent's own process — `types.ts` said "enforced client-side" and meant it. An agent
-   * that did not want to be gated simply did not run the check, or never used the MCP
-   * server at all and read the credentials off the socket directly.
-   */
-  async getEntry(entryId: string, purpose: string, includePlaintext = true): Promise<{
-    plaintext?: string; name: string; integrity: 'valid' | 'invalid' | 'unsigned';
-    exec_config: ExecConfig | undefined; entry_mode: string; access_tier: string;
-  } | OpError> {
-    const s = await this.api.getSecret(entryId, purpose.slice(0, 200));
-    if (!modeAllowsLegacyExec(s.entry_mode)) {
-      return err(wrongModeMessage(s.entry_mode, 'exec'), 'WRONG_MODE');
-    }
-    const vaultKey = await this.api.ensureVaultKey();
-    const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
-    try {
-      const directive = s.directive || DIRECTIVE;
-      let integrity: 'valid' | 'invalid' | 'unsigned' = 'unsigned';
-      if (s.directive_signature) {
-        integrity = verifyDirectiveSignature(directive, s.directive_signature, bytes)
-          ? 'valid' : 'invalid';
-      }
-      // An invalid signature is reported, not thrown, and the plaintext is NOT included.
-      // The caller aborts on it; sending the secret alongside a warning would make the
-      // warning advisory.
-      if (integrity === 'invalid') {
-        return err(
-          `Security warning: directive signature is invalid for '${s.name ?? entryId}'. Aborting.`,
-          'BAD_SIGNATURE',
-        );
-      }
-      return {
-        // Omitted when the caller says it does not need one. `vault_entry_get` verifies a
-        // signature and reports a verdict; it never shows the secret. Sending a plaintext
-        // that is going to be thrown away puts it on a socket for no reason.
-        ...(includePlaintext ? { plaintext: new TextDecoder().decode(bytes) } : {}),
-        name: s.name ?? entryId,
-        integrity,
-        exec_config: (typeof s.exec_config === 'string'
-          ? JSON.parse(s.exec_config) : s.exec_config) as ExecConfig | undefined,
-        entry_mode: (s.entry_mode || 'LEGACY_EXEC'),
-        access_tier: String(s.access_tier ?? '1'),
-      };
-    } finally {
-      bytes.fill(0);
-    }
-  }
-
   // ── call ───────────────────────────────────────────────────────────────────
   /**
    * Perform a typed HTTP request with the credential, and return the response.
@@ -200,24 +140,32 @@ export class BrokerOps {
     const callArgs = args.callArgs ?? {};
     const agentReq = args.request;
 
-    const s = await this.api.getSecret(entryId, purpose.slice(0, 200));
+    const s = await this.api.getSecret(entryId);
     if (!modeAllowsHttpBroker(s.entry_mode)) {
       return err(wrongModeMessage(s.entry_mode, 'http'), 'WRONG_MODE');
     }
+
+    // The credential binding always comes from the ENTRY. An agent may choose where a
+    // request goes; it never chooses how the secret is framed on the way out. Checked
+    // before the key is decrypted: a binding the server sent that this broker would not
+    // have accepted from the owner refuses the call. It is not repaired and it does not
+    // fall back to a bearer token — see delivery.ts.
+    const bound = bindingFromExecConfig(coerceCfg(s.exec_config));
+    if (!bound.ok) {
+      return err(`Refused: this entry's delivery setting is not one the broker accepts `
+        + `(${bound.field}: ${bound.reason}). Nothing was sent. The owner can set how the key `
+        + `is sent in the dashboard.`, 'BAD_BINDING');
+    }
+    const binding = bound.binding;
 
     const vaultKey = await this.api.ensureVaultKey();
     const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
     try {
       const secret = new TextDecoder().decode(bytes);
-
-      // The credential binding always comes from the ENTRY. An agent may choose where a
-      // request goes; it never chooses how the secret is framed on the way out.
-      let binding: { in: 'header' | 'query'; name: string; template: string } = {
-        in: 'header', name: 'authorization', template: 'Bearer {secret}',
-      };
-      const cfg = coerceCfg(s.exec_config) as { credential_binding?: typeof binding };
-      if (cfg?.credential_binding?.name && cfg.credential_binding.template?.includes('{secret}')) {
-        binding = cfg.credential_binding;
+      if (looksLikePrivateKey(secret)) {
+        return err('Refused: this entry holds a private key, which is never sent to a web service. '
+          + 'Nothing was sent. If it is an SSH key, the owner can set it to SSH (with the servers '
+          + 'it may sign in to) in the dashboard, and then use vault_ssh_exec.', 'WRONG_KIND');
       }
 
       let def;
@@ -266,8 +214,11 @@ export class BrokerOps {
         ? { origin: originStr, method: def.route.method, path: def.route.path, body_sha256: bodyHash }
         : {};
 
+      // The purpose goes with the destination: tier 2 only, where the owner is approving
+      // this one call and needs to read why. Tier 1 sends neither (network-shape decision).
       const verdict = await this.api.checkOperation({
-        entry_id: entryId, purpose: purpose.slice(0, 200), first_sighting: isNew, ...destination,
+        entry_id: entryId, purpose: isTier2 ? purpose.slice(0, 200) : '', first_sighting: isNew,
+        ...destination,
       });
 
       if (!verdict.allowed) {
@@ -369,7 +320,7 @@ export class BrokerOps {
       );
     }
 
-    const s = await this.api.getSecret(entryId, purpose.slice(0, 200));
+    const s = await this.api.getSecret(entryId);
     if (!modeAllowsSshBroker(s.entry_mode)) {
       return err(wrongModeMessage(s.entry_mode, 'ssh'), 'WRONG_MODE');
     }
@@ -392,6 +343,12 @@ export class BrokerOps {
     }
     const check = checkSshDestination(op, allowedHosts);
     if (!check.ok) return err(check.error, 'HOST_NOT_ALLOWED');
+
+    // The agent's reason is no longer sent with the fetch, so it is kept HERE — in the
+    // same local store as the web calls' destinations, on the owner's machine, written by
+    // the broker's account. Without this an SSH call's purpose would exist nowhere, and
+    // the owner's answer to "what was my agent doing on that server" would be a count.
+    recordDestination(entryId, `ssh://${check.auditedHost}`, undefined, purpose);
     const vaultKey = await this.api.ensureVaultKey();
     const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
     let identity;
@@ -437,11 +394,6 @@ export class BrokerOps {
     try { rec.handle.close(); } catch { /* already gone */ }
     this.ssh.delete(sessionId);
     return { closed: true, signs };
-  }
-
-  // ── settings ───────────────────────────────────────────────────────────────
-  async settings(): Promise<Record<string, unknown>> {
-    return this.api.getMcpSettings() as unknown as Record<string, unknown>;
   }
 }
 

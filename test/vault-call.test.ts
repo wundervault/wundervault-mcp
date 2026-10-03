@@ -12,7 +12,7 @@ import {
 } from '../src/opdef.js';
 import { isBlockedAddress, resolvePinned, expandIPv6, scrubSecret, pinnedLookup,
   definitionFromAgentRequest, originString, isApprovedPrivateOrigin } from '../src/http-broker.js';
-import { modeAllowsHttpBroker, modeAllowsLegacyExec, wrongModeMessage } from '../src/ssh-agent.js';
+import { modeAllowsHttpBroker, wrongModeMessage } from '../src/ssh-agent.js';
 
 const SECRET = Buffer.from('sk-ant-api03-EXAMPLE-SECRET-VALUE');
 
@@ -215,10 +215,6 @@ describe('SSRF address filtering', () => {
 });
 
 describe('mode gating for BROKER_HTTP', () => {
-  it('keeps a BROKER_HTTP entry out of the plaintext paths', () => {
-    expect(modeAllowsLegacyExec('BROKER_HTTP')).toBe(false);
-  });
-
   it('allows vault_call only for BROKER_HTTP', () => {
     expect(modeAllowsHttpBroker('BROKER_HTTP')).toBe(true);
     expect(modeAllowsHttpBroker('LEGACY_EXEC')).toBe(false);
@@ -226,8 +222,8 @@ describe('mode gating for BROKER_HTTP', () => {
     expect(modeAllowsHttpBroker(undefined)).toBe(false);
   });
 
-  it('names the mode the caller needs', () => {
-    expect(wrongModeMessage('LEGACY_EXEC', 'http')).toContain('BROKER_HTTP');
+  it('names the tool the caller needs', () => {
+    expect(wrongModeMessage('BROKER_SSH_AGENT', 'http')).toContain('vault_ssh_exec');
   });
 });
 

@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import crypto from 'node:crypto';
 import { loadEncryptionKey, hmacForApiKey, verifyDirectiveSignature } from '../src/crypto.js';
-import { runWithSecret } from '../src/exec.js';
 
 // ── Crypto: loadEncryptionKey ─────────────────────────────────────────────────
 
@@ -96,51 +95,3 @@ describe('verifyDirectiveSignature', () => {
     expect(verifyDirectiveSignature('directive', 'abc', new Uint8Array(0))).toBe(false);
   });
 });
-
-// ── exec: runWithSecret ───────────────────────────────────────────────────────
-
-describe('runWithSecret', () => {
-  it('scrubs plaintext from stdout', () => {
-    const secret = 'supersecret123';
-    const { stdout } = runWithSecret(secret, `echo ${secret}`);
-    expect(stdout).not.toContain(secret);
-    expect(stdout).toContain('[SECRET_REDACTED]');
-  });
-
-  it('scrubs plaintext from stderr', () => {
-    const secret = 'supersecret456';
-    // The disk-write guard matches ANY `>`, so `2>&1`-style redirection never reaches
-    // the shell and the command would be rejected before running — which would make
-    // this pass without scrubbing anything. Write to stderr without a redirect.
-    const { stderr } = runWithSecret(secret, `node -e 'process.stderr.write(process.env.WUNDERVault_SECRET)'`);
-    expect(stderr).not.toContain(secret);
-    expect(stderr).toContain('[SECRET_REDACTED]');
-  });
-
-  it('refuses a command that redirects the secret to disk', () => {
-    const secret = 'supersecret789';
-    const { exitCode, stderr } = runWithSecret(secret, 'echo $WUNDERVault_SECRET > /tmp/leak.txt');
-    expect(exitCode).toBe(1);
-    expect(stderr).toContain('Exec rejected');
-  });
-
-  it('returns exit code 0 for a successful command', () => {
-    const { exitCode } = runWithSecret('x', 'exit 0');
-    expect(exitCode).toBe(0);
-  });
-
-  it('returns non-zero exit code for a failing command', () => {
-    const { exitCode } = runWithSecret('x', 'exit 42');
-    expect(exitCode).toBe(42);
-  });
-
-  it('makes secret available as $WUNDERVault_SECRET env var', () => {
-    const secret = 'injected_value_abc';
-    const { stdout, exitCode } = runWithSecret(secret, 'echo $WUNDERVault_SECRET');
-    // stdout will be scrubbed, but we can verify the command ran successfully
-    // and the secret was available (it got scrubbed = it was there)
-    expect(exitCode).toBe(0);
-    expect(stdout).toContain('[SECRET_REDACTED]');
-  });
-});
-

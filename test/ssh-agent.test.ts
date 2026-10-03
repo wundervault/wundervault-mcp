@@ -17,7 +17,7 @@ import * as path from 'node:path';
 import {
   loadOpenSshEd25519, handleAgentMessage, startAgent, runSshBrokered, defaultSignAudit,
   hostOf, rsyncRemoteHost, quoteForRemoteShell,
-  modeAllowsLegacyExec, modeAllowsSshBroker, wrongModeMessage, type LoadedIdentity,
+  modeAllowsSshBroker, modeAllowsHttpBroker, wrongModeMessage, type LoadedIdentity,
 } from '../src/ssh-agent.js';
 
 let dir: string;
@@ -451,23 +451,19 @@ describe('hostOf', () => {
 });
 
 describe('entry mode gating', () => {
-  it('lets a legacy entry through the exec path', () => {
-    expect(modeAllowsLegacyExec('LEGACY_EXEC')).toBe(true);
-    expect(modeAllowsLegacyExec(undefined)).toBe(true);   // pre-migration rows
-    expect(modeAllowsLegacyExec('legacy_exec')).toBe(true);
-    expect(modeAllowsLegacyExec('  LEGACY_EXEC  ')).toBe(true);
+  it('has no hand-over path left to let anything through', async () => {
+    // 1.0 is brokered only. The export that gated the plaintext tools is gone, so nothing
+    // can call it by mistake.
+    const mod = await import('../src/ssh-agent.js');
+    expect((mod as Record<string, unknown>).modeAllowsLegacyExec).toBeUndefined();
+    expect((mod as Record<string, unknown>).LEGACY_EXEC).toBeUndefined();
   });
 
-  it('keeps a brokered entry out of every plaintext path', () => {
-    // vault_entry_get, vault_entry_inject_env and vault_exec all gate on this. A
-    // brokered key must not reach the model's context or a caller-chosen command.
-    expect(modeAllowsLegacyExec('BROKER_SSH_AGENT')).toBe(false);
-  });
-
-  it('refuses to broker an entry that is still marked legacy', () => {
-    // Otherwise the tool would report a protection the entry has not been converted to.
-    expect(modeAllowsSshBroker('LEGACY_EXEC')).toBe(false);
-    expect(modeAllowsSshBroker(undefined)).toBe(false);
+  it('refuses the retired hand-over mode on both broker paths', () => {
+    for (const m of ['LEGACY_EXEC', 'legacy_exec', undefined, '']) {
+      expect(modeAllowsSshBroker(m)).toBe(false);
+      expect(modeAllowsHttpBroker(m)).toBe(false);
+    }
   });
 
   it('accepts the broker mode for the broker', () => {
@@ -476,18 +472,19 @@ describe('entry mode gating', () => {
   });
 
   it('fails closed on a mode this build has never heard of', () => {
-    // A server returning a newer mode must not have its key handed to the generic exec
-    // path just because the name is unfamiliar.
-    expect(modeAllowsLegacyExec('BROKER_HTTP')).toBe(false);
     expect(modeAllowsSshBroker('BROKER_HTTP')).toBe(false);
+    expect(modeAllowsHttpBroker('BROKER_SSH_AGENT')).toBe(false);
+    expect(modeAllowsSshBroker('BROKER_FUTURE')).toBe(false);
+    expect(modeAllowsHttpBroker('BROKER_FUTURE')).toBe(false);
   });
 
-  it('explains what to do instead, in both directions', () => {
-    const toExec = wrongModeMessage('BROKER_SSH_AGENT', 'exec');
-    expect(toExec).toContain('vault_ssh_exec');
-    expect(toExec).toMatch(/dashboard/);
-    const toSsh = wrongModeMessage('LEGACY_EXEC', 'ssh');
-    expect(toSsh).toContain('BROKER_SSH_AGENT');
-    expect(toSsh).toMatch(/Convert it/);
+  it('explains what to do instead', () => {
+    const toSsh = wrongModeMessage('BROKER_HTTP', 'ssh');
+    expect(toSsh).toContain('vault_call');
+    expect(toSsh).toMatch(/dashboard/);
+    const retired = wrongModeMessage('LEGACY_EXEC', 'ssh');
+    expect(retired).toMatch(/no longer/);
+    expect(retired).toMatch(/dashboard/);
+    expect(wrongModeMessage(undefined, 'http')).toMatch(/no mode/);
   });
 });

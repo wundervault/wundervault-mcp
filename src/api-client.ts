@@ -9,7 +9,6 @@ const TIMEOUT = 30_000;
 export class AgentVaultAPI {
   private hmacB64: string;
   private vaultKey: Uint8Array | null = null;
-  private allowEnvInject: boolean = false;
 
   constructor(
     private apiKey: string,
@@ -147,11 +146,19 @@ export class AgentVaultAPI {
     return this.fetchJson<SecretsResponse>('/agent/vault/secrets');
   }
 
-  async getSecret(id: string, purpose: string): Promise<SecretResponse> {
+  /**
+   * Fetch one entry's ciphertext. Carries NO purpose.
+   *
+   * The agent's reason for a call stays on the owner's machine, in the broker's local
+   * destination log (2026-09-15 network-shape decision): the hosted access log records which
+   * agent used which key and when, never why. The parameter is still sent, empty, because the
+   * route requires it and a server that predates this would otherwise refuse the fetch.
+   * A tier-2 web call's reason reaches the owner through `checkOperation`, beside the
+   * destination they are being asked to approve — never on this path.
+   */
+  async getSecret(id: string): Promise<SecretResponse> {
     try {
-      return await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, {
-        purpose: purpose.slice(0, 200),
-      });
+      return await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, { purpose: '' });
     } catch (err: any) {
       // Tier-2 gate: the 403 detail carries a pending approval-request id.
       // Park here and poll it so the human's approval resolves this same
@@ -162,9 +169,7 @@ export class AgentVaultAPI {
       if (!requestId) throw err;
       const approved = await this.waitForTier2Approval(requestId);
       if (!approved) throw err;
-      return await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, {
-        purpose: purpose.slice(0, 200),
-      });
+      return await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, { purpose: '' });
     }
   }
 
@@ -220,26 +225,6 @@ export class AgentVaultAPI {
     } catch { /* the call already failed; do not fail it differently */ }
   }
 
-  async getMcpSettings(): Promise<{
-    session_lock_minutes: number;
-    session_lock_uses: number;
-    require_approval: boolean;
-    approval_scope: string;
-    allow_arbitrary_commands: boolean;
-  }> {
-    try {
-      return await this.fetchJson('/api/v1/mcp-settings');
-    } catch {
-      return {
-        session_lock_minutes: 5,
-        session_lock_uses: 3,
-        require_approval: false,
-        approval_scope: 'high_impact',
-        allow_arbitrary_commands: false,
-      };
-    }
-  }
-
   /**
    * Decrypt vault_key_for_agent blob: AES-256-GCM.
    * Blob format: 60 raw bytes = 12B nonce + 32B ciphertext + 16B GCM tag.
@@ -249,12 +234,6 @@ export class AgentVaultAPI {
     if (this.vaultKey !== null) return this.vaultKey;
     const data = await this.getProfile();
     this.vaultKey = decryptVaultKey(this.encKey, data.vault_key_for_agent);
-    this.allowEnvInject = data.allow_env_inject ?? false;
     return this.vaultKey;
-  }
-
-  /** Returns whether env inject is enabled for this account (from cached profile). */
-  async getAllowEnvInject(): Promise<boolean> {
-    return this.allowEnvInject;
   }
 }

@@ -2,6 +2,10 @@ export interface VaultEntry {
   id: string;
   secret_name: string;
   access_tier: string;
+  /** BROKER_HTTP or BROKER_SSH_AGENT. Absent from a server older than 1.0. */
+  entry_mode?: string;
+  /** Ids of the signed operations the entry offers. */
+  operations?: string[];
 }
 
 export interface Credentials {
@@ -10,44 +14,17 @@ export interface Credentials {
   agent_encryption_key: string;
 }
 
-export interface ExecResult {
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-}
-
 export interface ProfileResponse {
   vault_key_for_agent: string;
-  allow_env_inject?: boolean;
 }
 
 export interface SecretsResponse {
   entries: VaultEntry[];
 }
 
-export interface ExecConfig {
-  /** env var name for the `env`/generic mechanism (optional once a recipe drives delivery) */
-  env_key?: string;
-  pre_command?: string;
-  post_command?: string;
-  /** CIP-025: recipe id (sudo | ssh-passphrase | git | generic). Drives the delivery mechanism. */
-  credential_type?: string;
-  /** Advanced escape hatch — force a channel directly instead of a recipe. */
-  mechanism?: 'env' | 'stdin' | 'askpass';
-  /** Advanced escape hatch — askpass env var, used with mechanism: 'askpass'. */
-  askpass_var?: string;
-}
-
-export interface RemoteHost {
-  host: string;
-  user: string;
-  ssh_key?: string;
-  ssh_key_entry_id?: string;
-}
-
 export interface SecretResponse {
   /**
-   * LEGACY_EXEC | BROKER_SSH_AGENT | BROKER_HTTP — set server-side.
+   * BROKER_HTTP | BROKER_SSH_AGENT — set server-side. (LEGACY_EXEC, hand-over, is retired.)
    *
    * Enforced in the BROKER, and since phase 6 also on the server: a broker mode is served
    * only to a caller that signed with the broker key this agent is bonded to. An agent on
@@ -66,20 +43,10 @@ export interface SecretResponse {
   directive?: string;
   directive_signature?: string;
   access_tier?: string;
-  exec_config?: ExecConfig | string; // CIP-017 — backend forwards a JSON string; coerce before use
-}
-
-export interface VaultHttpPostCredential {
-  entry_id: string;
-  header: string;
-  format: string;
-}
-
-export interface VaultHttpPostParams {
-  url: string;
-  body: Record<string, unknown> | string;
-  method?: string;
-  credentials: VaultHttpPostCredential[];
-  purpose: string;
-  timeout?: number;
+  /**
+   * How the key is used, as JSON: {delivery:"http", credential_binding:{…}} or
+   * {delivery:"ssh", ssh_hosts:[…]}. The broker re-validates it (delivery.ts); it is
+   * never trusted as given.
+   */
+  exec_config?: Record<string, unknown> | string;
 }

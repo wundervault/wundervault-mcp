@@ -900,16 +900,10 @@ class AgentDaemon {
       case 'list_entries':
         return await ops.listEntries() as unknown as Record<string, unknown>;
 
-      case 'profile_flags':
-        return await ops.profileFlags() as unknown as Record<string, unknown>;
-
-      case 'get_entry': {
-        if (!entry() || !purpose()) return { error: 'get_entry needs entry_id and purpose.' };
-        // Defaults to sending one: a caller that omits the field is an older client whose
-        // tools all expect a plaintext. Only an explicit `false` withholds it.
-        const include = msg.include_plaintext !== false;
-        return await ops.getEntry(entry(), purpose(), include) as unknown as Record<string, unknown>;
-      }
+      // `get_entry` (a key's value, for the hand-over tools) and `profile_flags` (whether
+      // the account let agents write keys into files) were answered here until 1.0. Both
+      // served hand-over, which is retired; they now fall through to "unknown operation",
+      // so no request on this socket returns a plaintext.
 
       case 'call': {
         if (!entry() || !purpose()) return { error: 'call needs entry_id and purpose.' };
@@ -942,9 +936,6 @@ class AgentDaemon {
 
       case 'ssh_agent_close':
         return ops.closeSsh(String(msg.session_id ?? '')) as unknown as Record<string, unknown>;
-
-      case 'settings':
-        return await ops.settings();
 
       default:
         return { error: `Unknown operation "${op}".`, code: 'UNKNOWN_OP' };
