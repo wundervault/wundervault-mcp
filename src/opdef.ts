@@ -17,7 +17,11 @@ import { pbkdf2Sync, createHmac, timingSafeEqual, createHash } from 'node:crypto
 export interface Origin { scheme: string; host: string; port: number; }
 export interface Route { method: string; path: string; }
 export interface CredentialBinding {
-  in: 'header' | 'query'; name: string; template: string;
+  /**
+   * 'path' puts the key in the web address before the agent's path (Telegram, webhooks).
+   * Entries only: a signed definition's binding is header or query (validateShape).
+   */
+  in: 'header' | 'query' | 'path'; name: string; template: string;
   /** Only with a `{basic}` template: HTTP basic sign-in, composed in the broker. */
   username?: string;
 }

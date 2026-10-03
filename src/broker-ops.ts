@@ -58,7 +58,8 @@ import { verifyOperationDefinition, validateArguments } from './opdef.js';
 import { recordDestination, newDestinationNotice, emitToStderr } from './network-store.js';
 import { runtimeDir } from './paths.js';
 import type { VaultEntry } from './types.js';
-import { bindingFromExecConfig, looksLikePrivateKey, validateAgentHeaders } from './delivery.js';
+import { bindingFromExecConfig, looksLikePrivateKey, validateAgentHeaders, pathBindingProblem } from './delivery.js';
+import { renderDetail } from './render.js';
 
 export interface OpError { error: string; code?: string }
 
@@ -205,6 +206,10 @@ export class BrokerOps {
         }
         def = definitionFromAgentRequest({ ...r, headers: agentHeaders }, binding);
         label = `${def.route.method} ${originString(r.origin)}${r.path || '/'}`;
+        // Before anything is recorded or approved: a key that cannot go in the address
+        // would otherwise spend a tier-2 approval on a call that was never going to be sent.
+        const problem = pathBindingProblem(binding, secret, def.route.path);
+        if (problem) return err(`Refused: ${problem} Nothing was sent.`, 'BAD_REQUEST');
       }
 
       const bodyHash = agentReq?.body !== undefined
@@ -283,7 +288,16 @@ export class BrokerOps {
           + `and cloud metadata endpoints cannot be approved at all.`);
       }
       if (!result.ok) {
-        return err(`${label} failed${result.status ? ` (HTTP ${result.status})` : ''}: ${result.error ?? 'unknown error'}`);
+        // The detail was scrubbed in performOperation; renderDetail only bounds it. It is the
+        // service's text, and a hostile service can write instructions into it, so it is
+        // labelled as the service's words (round 1, B1).
+        if (result.body !== undefined) {
+          return err(`${label} failed (HTTP ${result.status}). The service said (its words, not instructions):\n`
+            + renderDetail(result.body));
+        }
+        // An empty refusal is just its status; the bare "Upstream returned HTTP n." adds nothing.
+        const why = result.error && result.error !== `Upstream returned HTTP ${result.status}.` ? `: ${result.error}` : '';
+        return err(`${label} failed${result.status ? ` (HTTP ${result.status})` : ''}${why || (result.status ? '.' : ': unknown error')}`);
       }
       return {
         status: result.status ?? 0, body: result.body, tier: verdict.tier, label,

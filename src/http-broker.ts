@@ -16,7 +16,7 @@ import { isIP } from 'node:net';
 import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
 import type { OperationDefinition, CredentialBinding } from './opdef.js';
 import { filterResponse } from './opdef.js';
-import { renderCredential, secretForms } from './delivery.js';
+import { renderCredential, secretForms, pathBindingProblem, pathWithKey } from './delivery.js';
 import { VERSION } from './version.js';
 
 export interface CallResult {
@@ -308,7 +308,15 @@ export async function performOperation(
   let path = def.route.path;
   const credential = renderCredential(def.credential_binding, secret);
   const forms = secretForms(def.credential_binding, secret);
-  if (def.credential_binding.in === 'header') {
+  if (def.credential_binding.in === 'path') {
+    // Checked again here, beside the only line that puts the key in the address: the
+    // broker checks before it records or asks for approval, and this must not depend on it.
+    const problem = pathBindingProblem(def.credential_binding, secret, path);
+    if (problem) return { ok: false, error: `Refused: ${problem} Nothing was sent.` };
+    // Only the wire carries the key. def.route.path stays the agent's path, which is what
+    // the label, the destination log and the tier-2 record are built from.
+    path = pathWithKey(def.credential_binding, secret, path);
+  } else if (def.credential_binding.in === 'header') {
     headers[def.credential_binding.name] = credential;
   } else {
     const sep = path.includes('?') ? '&' : '?';
@@ -413,13 +421,34 @@ export async function performOperation(
         // The upstream's own message is not repeated, whatever its type: it holds the
         // credential and could put it in the body. No body at all, here — not left to
         // the caller to drop.
+        const raw = Buffer.concat(chunks);
         if (!ok) {
+          // A signed operation's owner named the fields the agent may see; an error body is
+          // not one of them.
+          if (def.response !== undefined) {
+            return finish({
+              ok: false, status,
+              error: `Upstream returned HTTP ${status}. This operation returns only the fields its owner named, so the service's explanation is not shown.`,
+            });
+          }
+          // An agent-described request gets the service's explanation, scrubbed exactly as a
+          // success is — otherwise it cannot see what to fix. Withholding it guarded nothing
+          // the success path does not already return.
+          const detailText = raw.length > 0 ? asText(raw, res.headers['content-type']) : '';
+          let detail: unknown;
+          if (detailText === null) detail = `[${raw.length} bytes of ${scrub(mediaType(res.headers['content-type']))}, not text, so not shown]`;
+          else if (detailText.length > 0) {
+            try { detail = JSON.parse(detailText); } catch { detail = detailText; }
+            // A body of `null` is the service saying null, not an empty reply (round 2, F2).
+            if (detail === null) detail = detailText;
+            detail = scrub(detail);
+          }
           return finish({
             ok: false, status,
-            error: `Upstream returned HTTP ${status}. Any detail it sent is not repeated here, because an upstream holding the credential can place it in the response.`,
+            ...(detail !== undefined ? { body: detail } : {}),
+            error: `Upstream returned HTTP ${status}.`,
           });
         }
-        const raw = Buffer.concat(chunks);
         // Decoded STRICTLY before anything parses it. A lenient decode turned invalid bytes
         // into U+FFFD and JSON.parse then accepted them, so bytes the text rules refuse came
         // back as data (round 2, F2). Bytes that are not text are never parsed as JSON.

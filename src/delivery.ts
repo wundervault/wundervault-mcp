@@ -19,6 +19,8 @@ export const BEARER: CredentialBinding = Object.freeze({
 }) as CredentialBinding;
 
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}$/;
+/** RFC 3986 path characters, without `%`: nothing in a key's address is pre-encoded. */
+const PATH_CHARS = /^[A-Za-z0-9\-._~!$&'()*+,;=:@/]*$/;
 const QUERY_NAME = /^[A-Za-z0-9_.-]{1,64}$/;
 /** Headers that change how a request is framed or routed, or that are not the key's to set. */
 export const FORBIDDEN_HEADERS: ReadonlySet<string> = new Set([
@@ -50,7 +52,8 @@ export function validateBinding(raw: unknown): BindingCheck {
   const extra = Object.keys(b).filter((k) => !['in', 'name', 'template', 'username'].includes(k));
   if (extra.length) return bad('binding', `unknown binding fields: ${extra.sort().join(', ')}`);
   const where = b.in;
-  if (where !== 'header' && where !== 'query') return bad('binding.in', "binding.in must be 'header' or 'query'");
+  if (where === 'path') return validatePathBinding(b);
+  if (where !== 'header' && where !== 'query') return bad('binding.in', "binding.in must be 'header', 'query' or 'path'");
   if (typeof b.name !== 'string') return bad('binding.name', 'binding.name is required');
   let name = b.name;
   if (where === 'header') {
@@ -81,6 +84,67 @@ export function validateBinding(raw: unknown): BindingCheck {
     return bad('binding.username', 'a username only goes with {basic}');
   }
   return { ok: true, binding: out };
+}
+
+/** Is any segment of this path `.` or `..`, in any spelling a server would decode? */
+export function hasDotSegment(path: string): boolean {
+  return path.split('/').some((seg) => /^(?:\.|%2e){1,2}$/i.test(seg));
+}
+
+/**
+ * A key that goes in the web address: `{in:'path', template:'/bot{secret}'}`.
+ *
+ * The template is the address path up to and including the key; the agent's own path is
+ * appended after it. Telegram is `/bot{secret}`, a Slack webhook `/services/{secret}`.
+ */
+function validatePathBinding(b: Record<string, unknown>): BindingCheck {
+  const bad = (field: string, reason: string): BindingCheck => ({ ok: false, field, reason });
+  if (b.name !== undefined && b.name !== null && b.name !== '') return bad('binding.name', 'a key in the web address has no name');
+  if (b.username !== undefined && b.username !== null) return bad('binding.username', 'a username only goes with {basic}');
+  const template = b.template;
+  if (typeof template !== 'string' || !template) return bad('binding.template', 'binding.template is required');
+  if (template.length > 128 || !printable(template)) {
+    return bad('binding.template', 'the template must be printable text, 128 characters at most');
+  }
+  if (count(template, '{secret}') !== 1 || template.includes('{basic}')) {
+    return bad('binding.template', 'the address must contain {secret} exactly once');
+  }
+  if (!template.startsWith('/')) return bad('binding.template', 'the address path must start with /');
+  const rest = template.replace('{secret}', '');
+  if (!PATH_CHARS.test(rest)) {
+    return bad('binding.template', 'the address may use letters, digits and - . _ ~ ! $ & \' ( ) * + , ; = : @ / only');
+  }
+  if (hasDotSegment(template)) return bad('binding.template', 'the address may not contain a . or .. segment');
+  return { ok: true, binding: { in: 'path', name: '', template } };
+}
+
+/**
+ * Why a path-bound call cannot be sent, or null when it can.
+ *
+ * The KEY is checked here, at call time, because only the broker ever sees it. It goes into
+ * the address as written — a Slack key's `/` has to stay a `/` — so anything that would
+ * change the address's meaning (`?`, `#`, `%`, a space, a dot segment) refuses the call
+ * rather than being encoded into something the owner never stored. The AGENT's path may
+ * not walk out from under the key with a dot segment.
+ */
+export function pathBindingProblem(binding: CredentialBinding, secret: string, agentPath: string): string | null {
+  if (binding.in !== 'path') return null;
+  if (!secret || secret.length > 512 || !PATH_CHARS.test(secret) || hasDotSegment(secret)
+      || secret.includes('//') || secret.startsWith('/') || secret.endsWith('/')) {
+    return "this entry's key has characters that can't go in a web address, so it can't be sent that way. "
+      + 'The owner can choose another way to send it in the dashboard.';
+  }
+  const pathOnly = agentPath.split('?')[0];
+  if (hasDotSegment(pathOnly)) return 'with a key in the web address, the path may not contain a . or .. segment.';
+  return null;
+}
+
+/** The wire path for a path-bound key: the stored address, then whatever the agent added. */
+export function pathWithKey(binding: CredentialBinding, secret: string, agentPath: string): string {
+  // `/` alone, or `/` before a query, means "the stored address as is": a Slack webhook does
+  // not answer at `/services/T/B/X/`.
+  const rest = agentPath === '/' ? '' : agentPath.startsWith('/?') ? agentPath.slice(1) : agentPath;
+  return renderCredential(binding, secret) + rest;
 }
 
 /**

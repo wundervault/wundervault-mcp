@@ -20,7 +20,7 @@ import { execFileSync } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 import {
   validateBinding, bindingFromExecConfig, renderCredential, basicToken, BEARER, FORBIDDEN_HEADERS,
-  looksLikePrivateKey,
+  looksLikePrivateKey, pathBindingProblem, pathWithKey,
 } from '../src/delivery.js';
 import { performOperation, definitionFromAgentRequest } from '../src/http-broker.js';
 import type { CredentialBinding } from '../src/opdef.js';
@@ -134,6 +134,56 @@ describe('renderCredential', () => {
     for (const key of ["ab$'cd", 'ab$&cd', 'ab$`cd', 'ab$$cd']) {
       expect(renderCredential(BEARER, key)).toBe(`Bearer ${key}`);
     }
+  });
+});
+
+describe('a key in the web address — SPEC-1.0-api-keys §B', () => {
+  it('accepts the shapes real services use', () => {
+    for (const template of ['/bot{secret}', '/services/{secret}', '/api/webhooks/{secret}', '/v1/{secret}/x']) {
+      expect(validateBinding({ in: 'path', template })).toEqual({ ok: true, binding: { in: 'path', name: '', template } });
+    }
+    // A name of '' is what the broker normalises to; null is what JSON may carry.
+    expect(validateBinding({ in: 'path', name: '', template: '/bot{secret}' }).ok).toBe(true);
+  });
+
+  it('refuses anything that is not a plain path with the key once', () => {
+    const refused = (raw: Record<string, unknown>) => {
+      const r = validateBinding({ in: 'path', ...raw });
+      expect(r.ok, JSON.stringify(raw)).toBe(false);
+      return r.ok ? '' : r.field;
+    };
+    for (const template of ['bot{secret}', '/bot{secret}?x=1', '/bot{secret}#f', '/b%20{secret}', '/b {secret}',
+      '/bot{basic}', '/{secret}/{secret}', '/../{secret}', '/a/./{secret}', '/a/%2E%2E/{secret}', `/${'a'.repeat(121)}{secret}`, '/bot']) {
+      expect(refused({ template }), template).toBe('binding.template');
+    }
+    expect(refused({ name: 'k', template: '/bot{secret}' })).toBe('binding.name');
+    expect(refused({ username: 'u', template: '/bot{secret}' })).toBe('binding.username');
+  });
+
+  it('pathBindingProblem judges the key and the agent path, and nothing for other bindings', () => {
+    const b = { in: 'path', name: '', template: '/bot{secret}' } as CredentialBinding;
+    expect(pathBindingProblem(b, '123:ABC-x_y', '/sendMessage')).toBeNull();
+    expect(pathBindingProblem(b, 'T0/B0/x', '/')).toBeNull();
+    for (const key of ['', 'a b', 'a?b', 'a#b', 'a%41', 'a/../b', 'a//b', '/a', 'a/', 'é', 'k'.repeat(513)]) {
+      expect(pathBindingProblem(b, key, '/x'), JSON.stringify(key)).toMatch(/can't go in a web address/);
+    }
+    expect(pathBindingProblem(b, 'ok', '/a/../b')).toMatch(/segment/);
+    // Round 2, F1 claimed mixed spellings pass. They do not; pinned here.
+    for (const p of ['/a/.%2e/getMe', '/a/%2e./getMe', '/a/%2E%2e/x', '/%2e/x']) {
+      expect(pathBindingProblem(b, 'ok', p), p).toMatch(/segment/);
+    }
+    expect(pathBindingProblem(b, 'ok', '/a/.../b')).toBeNull();   // three dots is a name
+    expect(pathBindingProblem(b, 'ok', '/a?x=../b')).toBeNull();   // a query is not a path
+    expect(pathBindingProblem(BEARER, 'a b?#', '/../x')).toBeNull();
+  });
+
+  it('pathWithKey keeps "/" as the stored address and leaves a query in place', () => {
+    const b = { in: 'path', name: '', template: '/services/{secret}' } as CredentialBinding;
+    expect(pathWithKey(b, 'T/B/X', '/')).toBe('/services/T/B/X');
+    expect(pathWithKey(b, 'T/B/X', '/?a=1')).toBe('/services/T/B/X?a=1');
+    expect(pathWithKey(b, 'T/B/X', '/more')).toBe('/services/T/B/X/more');
+    // A key with $& is inserted as written (function replacement, as for every binding).
+    expect(pathWithKey({ ...b, template: '/x/{secret}' }, 'a$&b', '/')).toBe('/x/a$&b');
   });
 });
 

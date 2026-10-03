@@ -43,6 +43,7 @@ const routes: Record<string, (res: import('node:http').ServerResponse, url: stri
   '/400-text': (res) => { res.writeHead(400, { 'content-type': 'text/plain' }); res.end(`bad key ${KEY}`); },
   '/400-json': (res) => { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ detail: `bad key ${KEY}` })); },
   '/404-empty': (res) => { res.writeHead(404); res.end(); },
+  '/400-bytes': (res) => { res.writeHead(400, { 'content-type': 'image/png' }); res.end(Buffer.from([1, 0, 2])); },
   '/png-keyed-param': (res) => { res.writeHead(200, { 'content-type': `image/png; note=${encodeURIComponent(KEY)}` }); res.end(Buffer.from([1, 0, 2])); },
   '/png-keyed-type': (res) => { res.writeHead(200, { 'content-type': 'image/plain123' }); res.end(Buffer.from([1, 0, 2])); },
   '/record': (res) => { res.writeHead(204); res.end(); },
@@ -129,12 +130,23 @@ describe('a reply that is not a JSON object', () => {
     expect(latin1.body).toBe('[4 bytes of text/plain, not text, so not shown]');
   });
 
-  it('an error reply in text is still withheld, as JSON error bodies are', async () => {
+  it("an error reply in text is returned as the service's explanation, scrubbed", async () => {
+    // SPEC-1.0-api-keys §A: the agent sees why it was refused, never the key.
     const r = await call(def('POST', '/400-text'));
-    expect(r.ok).toBe(false);
-    expect(r.status).toBe(400);
+    expect(r).toEqual({ ok: false, status: 400, body: 'bad key [REDACTED]', error: 'Upstream returned HTTP 400.' });
+  });
+
+  it('a signed operation still withholds the explanation, and says why', async () => {
+    const signed = { ...def('POST', '/400-json'), response: { allow: ['id'] } } as OperationDefinition;
+    const r = await call(signed);
     expect(r.body).toBeUndefined();
-    expect(r.error).toMatch(/HTTP 400.*not repeated/);
+    expect(r.error).toMatch(/HTTP 400\. This operation returns only the fields its owner named/);
+    expect(JSON.stringify(r)).not.toContain('bad key');
+  });
+
+  it('an error reply in bytes is described, not returned', async () => {
+    const r = await call(def('GET', '/400-bytes'));
+    expect(r).toMatchObject({ ok: false, status: 400, body: '[3 bytes of image/png, not text, so not shown]' });
   });
 
   it('a SIGNED definition never returns text it cannot filter, and still reports success', async () => {
@@ -149,9 +161,9 @@ describe('a reply that is not a JSON object', () => {
     expect(JSON.stringify(r)).not.toContain('queued');
   });
 
-  it('a JSON error reply carries no body at all, not only a withheld message', async () => {
+  it('a JSON error reply comes back as JSON, scrubbed', async () => {
     const r = await call(def('POST', '/400-json'));
-    expect(r).toEqual({ ok: false, status: 400, error: expect.stringMatching(/HTTP 400.*not repeated/) });
+    expect(r).toEqual({ ok: false, status: 400, body: { detail: 'bad key [REDACTED]' }, error: 'Upstream returned HTTP 400.' });
   });
 
   it('an empty error reply is not mistaken for an empty success', async () => {
