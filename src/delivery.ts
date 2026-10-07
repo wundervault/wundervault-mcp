@@ -53,7 +53,15 @@ export function validateBinding(raw: unknown): BindingCheck {
   if (extra.length) return bad('binding', `unknown binding fields: ${extra.sort().join(', ')}`);
   const where = b.in;
   if (where === 'path') return validatePathBinding(b);
-  if (where !== 'header' && where !== 'query') return bad('binding.in', "binding.in must be 'header', 'query' or 'path'");
+  if (where === 'stamp') {
+    // The key is never placed anywhere, so there is nothing to name or template. Anything
+    // present is a binding this broker did not write, and is refused rather than ignored.
+    for (const f of ['name', 'template', 'username'] as const) {
+      if (b[f] !== undefined && b[f] !== null && b[f] !== '') return bad(`binding.${f}`, 'a stamped key has no ' + f);
+    }
+    return { ok: true, binding: { in: 'stamp', name: '', template: '' } };
+  }
+  if (where !== 'header' && where !== 'query') return bad('binding.in', "binding.in must be 'header', 'query', 'path' or 'stamp'");
   if (typeof b.name !== 'string') return bad('binding.name', 'binding.name is required');
   let name = b.name;
   if (where === 'header') {
@@ -177,6 +185,8 @@ export function basicToken(username: string, secret: string): string {
  * would have been sent with the template's tail spliced into the middle of it.
  */
 export function renderCredential(binding: CredentialBinding, secret: string): string {
+  // Defence in depth: the executor never calls this for a stamp, and must not start to.
+  if (binding.in === 'stamp') throw new Error('a stamped key is never rendered into a request');
   if (binding.template.includes('{basic}')) {
     const token = basicToken(binding.username ?? '', secret);
     return binding.template.replace('{basic}', () => token);
@@ -246,7 +256,7 @@ export function validateAgentHeaders(raw: unknown, binding: CredentialBinding): 
  */
 export function secretForms(binding: CredentialBinding, secret: string): string[] {
   const forms = [secret];
-  if (binding.template.includes('{basic}')) forms.push(basicToken(binding.username ?? '', secret));
+  if (binding.in !== 'stamp' && binding.template.includes('{basic}')) forms.push(basicToken(binding.username ?? '', secret));
   // A query key travels percent-encoded, and an upstream that echoes the request line (an
   // error page, a debug field) echoes it in that form, which a verbatim scrub misses. Three
   // spellings, because servers normalise: as sent, with lowercase escapes, and form-style

@@ -60,6 +60,9 @@ import { runtimeDir } from './paths.js';
 import type { VaultEntry } from './types.js';
 import { bindingFromExecConfig, looksLikePrivateKey, validateAgentHeaders, pathBindingProblem } from './delivery.js';
 import { renderDetail } from './render.js';
+import { SigningState } from './wallet.js';
+import { validateRecipe, recipeSha256, describeRecipe, computeStamp, parseStampedValue, type Recipe } from './stamp.js';
+import { pay as payOp, sign as signOp, approveStamp, type Deps, type PayResult } from './signing-ops.js';
 
 export interface OpError { error: string; code?: string }
 
@@ -85,6 +88,8 @@ function coerceCfg(raw: unknown): Record<string, unknown> {
  */
 export class BrokerOps {
   private api: AgentVaultAPI;
+  /** BUILD 2: this machine's payment record, policy versions and used approvals. */
+  private state: SigningState;
   private ssh = new Map<string, { handle: AgentHandle; timer: NodeJS.Timeout; entryId: string }>();
 
   constructor(
@@ -98,8 +103,24 @@ export class BrokerOps {
      * machine's broker identity rather than passed in by whoever constructs this.
      */
     signer: BrokerSigner | null = signerFromIdentity(),
+    state: SigningState = new SigningState(),
+    private readonly depsOverride: Partial<Deps> = {},
   ) {
     this.api = new AgentVaultAPI(apiKey, loadEncryptionKey(encKeyB64), vaultUrl, signer);
+    this.state = state;
+  }
+
+  private deps(): Deps {
+    return { api: this.api, state: this.state, ...this.depsOverride };
+  }
+
+  // ── pay / sign (build 2) ───────────────────────────────────────────────────
+  async pay(args: { entryId: string; purpose: string; paymentRequired: unknown; acceptIndex?: number }): Promise<PayResult | OpError> {
+    return payOp(this.deps(), args);
+  }
+
+  async sign(args: { entryId: string; purpose: string; data: unknown; encoding?: unknown }) {
+    return signOp(this.deps(), args);
   }
 
   /**
@@ -158,6 +179,32 @@ export class BrokerOps {
         + `is sent in the dashboard.`, 'BAD_BINDING');
     }
     const binding = bound.binding;
+
+    // BUILD 2: a stamped key. The recipe is checked, and the owner's approval of this
+    // (recipe, address) pair obtained, BEFORE the key is decrypted (spec §F29).
+    let stampRecipe: Recipe | null = null;
+    if (binding.in === 'stamp') {
+      if (operationId) return err('Refused: a stamped key is used with request and request.stamp, not a signed operation.', 'BAD_REQUEST');
+      const raw = (agentReq as { stamp?: unknown } | undefined)?.stamp;
+      if (raw === undefined) {
+        return err('Refused: this key is stamped — it never travels, and each request carries a code computed from it. '
+          + 'Describe how the service wants it in request.stamp (see the vault_call description). Nothing was sent.', 'BAD_REQUEST');
+      }
+      const rc = validateRecipe(raw);
+      if (!rc.ok) return err(`Refused: request.stamp: ${rc.reason}. Nothing was sent.`, 'BAD_REQUEST');
+      const o = agentReq!.origin;
+      if (!o?.host || !o.scheme || !o.port) return err('request.origin needs scheme, host and port.');
+      const vk = await this.api.ensureVaultKey();
+      const refused = await approveStamp(this.deps(), {
+        entryId, s, vaultKey: vk, recipe: rc.recipe, recipeSha: recipeSha256(rc.recipe),
+        origin: originString({ scheme: o.scheme, host: o.host.toLowerCase(), port: o.port }),
+        summary: describeRecipe(rc.recipe), purpose,
+      });
+      if (refused) return refused;
+      stampRecipe = rc.recipe;
+    } else if ((agentReq as { stamp?: unknown } | undefined)?.stamp !== undefined) {
+      return err('Refused: request.stamp is for stamped keys, and this one is not. Nothing was sent.', 'BAD_REQUEST');
+    }
 
     // The agent's own headers and body, checked before the key is decrypted. A refused
     // header refuses the call; it is never dropped and the rest sent, because the agent
@@ -274,11 +321,20 @@ export class BrokerOps {
         noticeForAgent = notice.toolNote;
       }
 
+      // A stamped entry may hold {"id", "secret"}; only the secret is a MAC key, and only
+      // the secret is scrubbed (the id is sent in the clear by design).
+      let stamped: { id?: string; secret: string } | null = null;
+      if (stampRecipe) {
+        try { stamped = parseStampedValue(secret); } catch (e) {
+          return err(`Refused: ${(e as Error).message}. Nothing was sent. The owner can fix it in the dashboard.`, 'WRONG_KIND');
+        }
+      }
       const result = await performOperation(
         def, operationId ? callArgs : (typeof agentReq?.body === 'string'
           ? agentReq.body
           : ((agentReq?.body ?? {}) as Record<string, unknown>)),
-        secret, approvedOrigins,
+        stamped ? stamped.secret : secret, approvedOrigins,
+        stamped ? (img) => computeStamp(stampRecipe!, img, stamped) : undefined,
       );
       if (!result.ok && /internal or reserved address/.test(result.error ?? '')
           && !isApprovedPrivateOrigin(def.origin, approvedOrigins)) {

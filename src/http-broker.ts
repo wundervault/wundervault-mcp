@@ -17,6 +17,7 @@ import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
 import type { OperationDefinition, CredentialBinding } from './opdef.js';
 import { filterResponse } from './opdef.js';
 import { renderCredential, secretForms, pathBindingProblem, pathWithKey } from './delivery.js';
+import type { RequestImage, StampResult } from './stamp.js';
 import { VERSION } from './version.js';
 
 export interface CallResult {
@@ -271,6 +272,11 @@ export async function performOperation(
   secret: string,
   /** Exact origins the owner approved for this entry; nothing else lifts the filter. */
   approvedPrivateOrigins?: string[],
+  /**
+   * For a stamped binding only: computes the stamp from the request as it will be sent.
+   * It holds the key; this function never sees it except to scrub the reply.
+   */
+  stamper?: (img: RequestImage) => StampResult,
 ): Promise<CallResult> {
   const { scheme, host, port } = def.origin;
   if (scheme !== 'https') return { ok: false, error: 'Only https origins are permitted.' };
@@ -306,9 +312,29 @@ export async function performOperation(
   // The credential goes in last, so nothing in the definition's static headers can
   // shadow it. validateShape already refuses a definition that names both.
   let path = def.route.path;
-  const credential = renderCredential(def.credential_binding, secret);
   const forms = secretForms(def.credential_binding, secret);
-  if (def.credential_binding.in === 'path') {
+  if (def.credential_binding.in === 'stamp') {
+    if (!stamper) return { ok: false, error: 'Refused: a stamped key needs a stamp. Nothing was sent.' };
+    // The image is the request exactly as it will go, BEFORE any placement (spec §F28).
+    const q = path.indexOf('?');
+    const img: RequestImage = {
+      method: def.route.method, host, path: q < 0 ? path : path.slice(0, q), query: q < 0 ? '' : path.slice(q + 1),
+      body, headers: Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v])),
+    };
+    let st: StampResult;
+    try { st = stamper(img); } catch (e) {
+      return { ok: false, error: `Refused: ${e instanceof Error ? e.message : String(e)}. Nothing was sent.` };
+    }
+    for (const [k, v] of Object.entries(st.headers)) {
+      if (has(k.toLowerCase())) return { ok: false, error: `Refused: the request already sends ${k}, and the stamp goes there too. Nothing was sent.` };
+      headers[k] = v;
+    }
+    if (st.query.length) path += (q < 0 ? '?' : '&') + st.query.join('&');
+    // The stamp in every spelling a reply could echo it in: as computed, and percent-encoded
+    // (a query placement travels encoded; base64's + / = change) (round 1, F3).
+    const enc = encodeURIComponent(st.stamp);
+    forms.push(st.stamp, enc, enc.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()));
+  } else if (def.credential_binding.in === 'path') {
     // Checked again here, beside the only line that puts the key in the address: the
     // broker checks before it records or asks for approval, and this must not depend on it.
     const problem = pathBindingProblem(def.credential_binding, secret, path);
@@ -317,10 +343,10 @@ export async function performOperation(
     // the label, the destination log and the tier-2 record are built from.
     path = pathWithKey(def.credential_binding, secret, path);
   } else if (def.credential_binding.in === 'header') {
-    headers[def.credential_binding.name] = credential;
+    headers[def.credential_binding.name] = renderCredential(def.credential_binding, secret);
   } else {
     const sep = path.includes('?') ? '&' : '?';
-    path += `${sep}${encodeURIComponent(def.credential_binding.name)}=${encodeURIComponent(credential)}`;
+    path += `${sep}${encodeURIComponent(def.credential_binding.name)}=${encodeURIComponent(renderCredential(def.credential_binding, secret))}`;
   }
 
   const maxRes = def.limits?.response_bytes ?? DEFAULT_RESPONSE_BYTES;
@@ -522,6 +548,8 @@ export interface AgentRequest {
    * here; the credential is written after them and its header name is refused.
    */
   headers?: Record<string, string>;
+  /** BUILD 2: how to stamp the request, for a stamped key only (stamp.ts validateRecipe). */
+  stamp?: unknown;
 }
 
 /**

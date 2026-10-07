@@ -94,9 +94,9 @@ export function createServer(args: { url?: string } = {}) {
       {
         name: 'vault_entries_list',
         description: (
-          'List the vault entries this agent may use. For each: its ID, name, tier, whether it '
-          + 'is a web-service key (use vault_call) or an SSH key (use vault_ssh_exec), and any '
-          + 'signed operations it offers. Never a key\'s value — no tool returns one.'
+          'List the vault entries this agent may use. For each: its ID, name, tier, what kind of key '
+          + 'it is — web-service (vault_call), SSH (vault_ssh_exec), wallet (vault_pay) or signing '
+          + 'key (vault_sign) — and any signed operations it offers. Never a key\'s value — no tool returns one.'
         ),
         inputSchema: { type: 'object', properties: {} },
       },
@@ -130,11 +130,59 @@ export function createServer(args: { url?: string } = {}) {
                 + 'If the entry keeps its key in the web address (Telegram, webhooks), path is only what comes '
                 + 'AFTER the key, e.g. /sendMessage, or / for the stored address as is. '
                 + 'Tier 1 secrets proceed and are logged. Tier 2 secrets are refused until the owner approves '
-                + 'this exact origin, method and path; the approval covers whatever headers and body it carries.',
+                + 'this exact origin, method and path; the approval covers whatever headers and body it carries. '
+                + 'STAMPED keys (AWS, SnapTrade, exchanges) never travel: add request.stamp describing how the '
+                + 'service signs requests, either {builtin:"aws-sigv4", region, service} or '
+                + '{mac:"hmac-sha256"|"hmac-sha384"|"hmac-sha512", key:"utf8"|"base64"|"hex", message:[parts], '
+                + 'encoding:"hex"|"base64"|"base64url", place:[{in:"header"|"query", name, value:"…{stamp}…"}]}. '
+                + 'Parts: {text}, {var: method|path|query|path_and_query|body|host|key_id|body_json}, {header: name}, '
+                + '{body_field: name}, {sha256:[parts]}, {sha512:[parts]}, {sha256_hex:[parts]}, {json:{name: part}} '
+                + '(sorted keys, no spaces). Parts read the request before the stamp is placed; put timestamps and '
+                + 'nonces in the request yourself. place values may use {stamp} and {key_id}. The owner approves '
+                + 'each recipe once per address; the first call waits for that.',
             },
             purpose: { type: 'string', description: 'Why this is needed (audit log).' },
           },
           required: ['entry_id', 'purpose'],
+        },
+      },
+      {
+        name: 'vault_pay',
+        description: (
+          'Pay an x402 "402 Payment Required" from a vaulted wallet whose key is never returned to you. '
+          + 'Pass the 402 reply\'s PAYMENT-REQUIRED header (or the decoded JSON, or a v1 402 body) as '
+          + 'payment_required; you get back the header to send when you retry the same request. USDC only, '
+          + 'on Base, Base Sepolia, Solana and Solana devnet. Payments inside the owner\'s rules (allowed '
+          + 'payees, a daily limit) are signed at once; anything else waits for the owner to approve, and '
+          + 'if they have not answered yet, call again with the same payment to keep waiting.'
+        ),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            entry_id: { type: 'string', description: 'Vault entry holding the wallet.' },
+            payment_required: { description: 'The PAYMENT-REQUIRED header value (base64), or the decoded object.' },
+            accept_index: { type: 'number', description: 'Which offer in accepts[] to pay, when the merchant makes more than one.' },
+            purpose: { type: 'string', description: 'Why this payment is needed. The owner sees it if they are asked.' },
+          },
+          required: ['entry_id', 'payment_required', 'purpose'],
+        },
+      },
+      {
+        name: 'vault_sign',
+        description: (
+          'Sign data with a vaulted signing key whose value is never returned to you. Every signature '
+          + 'is approved by the owner, who is shown the data (in full when it is text up to 64 KiB) and '
+          + 'its sha256. Returns the signature (base64), the public key and the algorithm. At most 256 KiB.'
+        ),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            entry_id: { type: 'string', description: 'Vault entry holding the signing key.' },
+            data: { type: 'string', description: 'The bytes to sign, as text or encoded.' },
+            encoding: { type: 'string', enum: ['utf8', 'base64', 'hex'], description: 'How data is written. Default utf8.' },
+            purpose: { type: 'string', description: 'What this signature is for. The owner sees it.' },
+          },
+          required: ['entry_id', 'data', 'purpose'],
         },
       },
       {
@@ -201,6 +249,8 @@ export function createServer(args: { url?: string } = {}) {
         for (const e of entries) {
           const use = e.entry_mode === 'BROKER_SSH_AGENT' ? 'SSH key → vault_ssh_exec'
             : e.entry_mode === 'BROKER_HTTP' ? 'web key → vault_call'
+            : e.entry_mode === 'BROKER_WALLET' ? 'wallet → vault_pay'
+            : e.entry_mode === 'BROKER_SIGN' ? 'signing key → vault_sign'
             : 'not usable until the owner sets how it is used';
           const ops = e.operations?.length ? `; operations: ${e.operations.join(', ')}` : '';
           lines.push(`  [${e.id}]  ${e.secret_name}  (tier: ${e.access_tier ?? 'read'}; ${use}${ops})`);
@@ -245,6 +295,34 @@ export function createServer(args: { url?: string } = {}) {
             `✅ ${r.label} → HTTP ${r.status} (tier ${r.tier}). The credential was used here, not returned to you.\n`
             + `${renderBody(r.body)}${r.notice ? `\n\n${r.notice}` : ''}` }],
         });
+      }
+
+      if (request.params.name === 'vault_pay' || request.params.name === 'vault_sign') {
+        const a = (request.params.arguments ?? {}) as Record<string, unknown>;
+        const fail = (text: string) => CallToolResultSchema.parse({ content: [{ type: 'text', text }], isError: true });
+        const entry_id = String(a.entry_id ?? '');
+        const purpose = String(a.purpose ?? '');
+        if (!entry_id || !purpose) return fail(`${request.params.name} needs entry_id and purpose.`);
+        if (request.params.name === 'vault_pay') {
+          if (a.payment_required === undefined) return fail('vault_pay needs payment_required.');
+          const r = await broker.send('pay', {
+            entry_id, purpose: purpose.slice(0, 200), payment_required: a.payment_required,
+            ...(a.accept_index !== undefined ? { accept_index: a.accept_index } : {}),
+          });
+          if (r.error) return fail(String(r.error));
+          return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+            `✅ Signed a payment of ${r.amount_usdc} USDC on ${r.network} to ${r.payee}`
+            + `${r.inside_rules ? ' (inside the owner\'s rules)' : ' (approved by the owner)'}. `
+            + `Retry your request with this header:\n${r.header}: ${r.value}` }] });
+        }
+        if (typeof a.data !== 'string') return fail('vault_sign needs data as a string.');
+        const r = await broker.send('sign', {
+          entry_id, purpose: purpose.slice(0, 200), data: a.data, ...(a.encoding ? { encoding: a.encoding } : {}),
+        });
+        if (r.error) return fail(String(r.error));
+        return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+          `✅ Signed (${r.algorithm}). The key was used in the broker, not returned to you.\n`
+          + `signature: ${r.signature}\npublic key: ${r.public_key}` }] });
       }
 
       if (request.params.name === 'vault_ssh_exec') {

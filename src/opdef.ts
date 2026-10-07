@@ -19,9 +19,10 @@ export interface Route { method: string; path: string; }
 export interface CredentialBinding {
   /**
    * 'path' puts the key in the web address before the agent's path (Telegram, webhooks).
+   * 'stamp' never sends the key: each request carries a code computed from it (stamp.ts).
    * Entries only: a signed definition's binding is header or query (validateShape).
    */
-  in: 'header' | 'query' | 'path'; name: string; template: string;
+  in: 'header' | 'query' | 'path' | 'stamp'; name: string; template: string;
   /** Only with a `{basic}` template: HTTP basic sign-in, composed in the broker. */
   username?: string;
 }

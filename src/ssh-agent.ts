@@ -668,33 +668,42 @@ export async function runSshBrokered(opts: {
 
 export const BROKER_SSH_AGENT = 'BROKER_SSH_AGENT';
 export const BROKER_HTTP = 'BROKER_HTTP';
+export const BROKER_WALLET = 'BROKER_WALLET';
+export const BROKER_SIGN = 'BROKER_SIGN';
 
 /**
- * Which tool an entry may be used through: a web-service key through vault_call, an SSH
- * key through vault_ssh_exec. Checked in the broker before the key is decrypted.
+ * Which tool an entry may be used through — one tool per mode, and nothing else (spec §A1a):
+ * a web-service key through vault_call, an SSH key through vault_ssh_exec, a wallet through
+ * vault_pay, a signing key through vault_sign. Checked in the broker before the key is
+ * decrypted.
  *
  * Anything else — an unknown mode, a missing one, or the retired LEGACY_EXEC (hand-over),
- * which the 1.0 server converts and refuses to serve — matches neither, so it fails CLOSED.
+ * which the 1.0 server converts and refuses to serve — matches none, so it fails CLOSED.
  * There is no path left that a mode could fall back to.
  */
-export function modeAllowsSshBroker(mode: string | undefined): boolean {
-  return (mode || '').trim().toUpperCase() === BROKER_SSH_AGENT;
+function modeIs(mode: string | undefined, want: string): boolean {
+  return (mode || '').trim().toUpperCase() === want;
 }
+export function modeAllowsSshBroker(mode: string | undefined): boolean { return modeIs(mode, BROKER_SSH_AGENT); }
+export function modeAllowsHttpBroker(mode: string | undefined): boolean { return modeIs(mode, BROKER_HTTP); }
+export function modeAllowsWallet(mode: string | undefined): boolean { return modeIs(mode, BROKER_WALLET); }
+export function modeAllowsSign(mode: string | undefined): boolean { return modeIs(mode, BROKER_SIGN); }
 
-export function modeAllowsHttpBroker(mode: string | undefined): boolean {
-  return (mode || '').trim().toUpperCase() === BROKER_HTTP;
-}
+const MODES: Record<string, { kind: string; tool: string }> = {
+  [BROKER_SSH_AGENT]: { kind: 'an SSH key', tool: 'vault_ssh_exec' },
+  [BROKER_HTTP]: { kind: 'a web-service key', tool: 'vault_call' },
+  [BROKER_WALLET]: { kind: 'a wallet', tool: 'vault_pay' },
+  [BROKER_SIGN]: { kind: 'a signing key', tool: 'vault_sign' },
+};
+const WANTED = { ssh: BROKER_SSH_AGENT, http: BROKER_HTTP, wallet: BROKER_WALLET, sign: BROKER_SIGN } as const;
 
-export function wrongModeMessage(mode: string | undefined, wanted: 'ssh' | 'http'): string {
+export function wrongModeMessage(mode: string | undefined, wanted: keyof typeof WANTED): string {
   const m = (mode || '').trim().toUpperCase() || 'no';
-  if (m !== BROKER_SSH_AGENT && m !== BROKER_HTTP) {
+  const have = MODES[m];
+  if (!have) {
     return `Refused: this entry is in ${m} mode, which 1.0 does not use — keys are no longer `
-      + 'handed to agents. The owner needs to choose in the dashboard whether it is a '
-      + 'web-service key or an SSH key.';
+      + 'handed to agents. The owner needs to choose in the dashboard what kind of key it is.';
   }
-  const tool = m === BROKER_SSH_AGENT ? 'vault_ssh_exec' : 'vault_call';
-  const kind = m === BROKER_SSH_AGENT ? 'an SSH key' : 'a web-service key';
-  const want = wanted === 'ssh' ? 'an SSH key' : 'a web-service key';
-  return `Refused: this entry is ${kind}, not ${want}. Use ${tool} with it, or the owner `
+  return `Refused: this entry is ${have.kind}, not ${MODES[WANTED[wanted]].kind}. Use ${have.tool} with it, or the owner `
     + 'can change how it is used in the dashboard.';
 }

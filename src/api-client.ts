@@ -114,6 +114,18 @@ export class AgentVaultAPI {
      * it.
      */
     first_sighting?: boolean;
+    /**
+     * BUILD 2. What is being checked: a web call (default), a payment, a signature, or a
+     * stamp recipe. For the last three, `detail` is what the owner is shown on a pending
+     * approval — the only time the server holds a payee, an amount, a recipe or a digest,
+     * and it erases it when the request is decided or expires.
+     */
+    kind?: 'call' | 'payment' | 'signature' | 'recipe';
+    detail?: Record<string, unknown>;
+    /** A payment the owner's rules already allow. Logged without detail; tier 1 only. */
+    within_rules?: boolean;
+    /** The approved request this call is spending. Single use, burned on the server. */
+    approval_id?: string;
   }): Promise<{ allowed: boolean; tier: string; request_id?: string; message?: string;
                 emailed?: boolean }> {
     // Serialised once. The bytes that are hashed for the signature must be the bytes
@@ -203,6 +215,31 @@ export class AgentVaultAPI {
     }
     await this.reportUnanswered(requestId);
     return false;
+  }
+
+  /**
+   * Poll an approval for up to `ms` and return its status and, once approved, the owner's
+   * sealed token. BUILD 2: for payments, signatures and recipes the broker does not take
+   * the server's word for `approved` — it opens the token itself (wallet.ts openOwnerToken).
+   */
+  async waitForOwnerApproval(requestId: string, ms = 90_000): Promise<{ status: string; owner_token?: unknown }> {
+    const deadline = Date.now() + ms;
+    let last = 'pending';
+    for (;;) {
+      try {
+        const res = await this.fetchJson<{ status: string; owner_token?: unknown }>(
+          `/agent/vault/tier2-requests/${requestId}`,
+        );
+        last = res.status;
+        if (res.status !== 'pending') return res;
+      } catch {
+        // transient poll error — keep waiting until the deadline
+      }
+      if (Date.now() + 5_000 > deadline) break;
+      await new Promise(r => setTimeout(r, 5_000));
+    }
+    await this.reportUnanswered(requestId);
+    return { status: last };
   }
 
   /**

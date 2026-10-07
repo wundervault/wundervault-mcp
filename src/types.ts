@@ -49,4 +49,11 @@ export interface SecretResponse {
    * never trusted as given.
    */
   exec_config?: Record<string, unknown> | string;
+  /**
+   * BUILD 2. The owner's rules for a wallet or a stamped key, encrypted in the owner's
+   * browser with this agent's vault key. The server stores and serves them; it cannot read
+   * or alter them. Checked in wallet.ts readPolicy.
+   */
+  policy_ciphertext?: string | null;
+  policy_nonce?: string | null;
 }

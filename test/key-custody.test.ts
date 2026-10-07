@@ -201,6 +201,26 @@ describe('the broker enforces the mode, not the client', () => {
     expect(getSecretCalls).toEqual([]);
   });
 
+  it('pay and sign refuse every other kind of key, and the reply never carries it (build 2)', async () => {
+    for (const id of ['http1', 'ssh1', 'legacy1']) {
+      const p = await speak(sock(), { token: TOKEN, op: 'pay', entry_id: id, purpose: 'p',
+        payment_required: { x402Version: 2, accepts: [] } });
+      expect(p.json.code, `pay ${id}`).toBe('WRONG_MODE');
+      expect(p.raw, id).not.toContain(SECRETS[id].value);
+      const g = await speak(sock(), { token: TOKEN, op: 'sign', entry_id: id, purpose: 'p', data: 'x' });
+      expect(g.json.code, `sign ${id}`).toBe('WRONG_MODE');
+      expect(g.raw, id).not.toContain(SECRETS[id].value);
+    }
+  });
+
+  it('pay refuses an accept_index that is not a whole number (round 2, F1)', async () => {
+    for (const idx of [true, '1', 1.5]) {
+      const r = await speak(sock(), { token: TOKEN, op: 'pay', entry_id: 'http1', purpose: 'p',
+        payment_required: { x402Version: 2, accepts: [] }, accept_index: idx });
+      expect(r.json.code, String(idx)).toBe('BAD_REQUEST');
+    }
+  });
+
   it('no longer answers profile_flags or settings either', async () => {
     for (const op of ['profile_flags', 'settings']) {
       const r = await speak(sock(), { token: TOKEN, op });
@@ -727,6 +747,24 @@ describe('the MCP server cannot decrypt anything', () => {
       const imports = src.split('\n').filter((l) => /^\s*import\b/.test(l)).join('\n');
       return FORBIDDEN.some((n) => imports.includes(n));
     });
-    expect(holders.sort()).toEqual(['api-client.ts', 'broker-ops.ts']);
+    // signing-ops.ts and wallet.ts (build 2) run inside the broker: payments, signatures and
+    // the owner's encrypted rules. Nothing on the MCP side imports them (next test).
+    expect(holders.sort()).toEqual(['api-client.ts', 'broker-ops.ts', 'signing-ops.ts', 'wallet.ts']);
+  });
+
+  it('the MCP side reaches none of the build-2 broker modules, even indirectly', () => {
+    const seen = new Set<string>();
+    const walk = (file: string) => {
+      if (seen.has(file)) return;
+      seen.add(file);
+      const src = readFileSync(path.join(ROOT, 'src', file), 'utf8');
+      for (const m of src.matchAll(/^\s*import\s+(?!type\b)[^;]*?from\s+'\.\/([\w-]+)\.js'/gm)) walk(`${m[1]}.ts`);
+    };
+    for (const f of ['server.ts', 'broker-client.ts', 'index.ts']) walk(f);
+    // The walker must actually walk: server.ts imports ssh-agent.ts and render.ts directly.
+    expect(seen.has('ssh-agent.ts') && seen.has('render.ts')).toBe(true);
+    for (const broker of ['signing-ops.ts', 'wallet.ts', 'broker-ops.ts', 'evm.ts', 'solana.ts', 'signing.ts', 'stamp.ts']) {
+      expect(seen.has(broker), `the MCP side imports ${broker}`).toBe(false);
+    }
   });
 });

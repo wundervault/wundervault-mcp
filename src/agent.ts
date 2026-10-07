@@ -82,6 +82,12 @@ interface SocketRequest {
   include_plaintext?: boolean;
   op_spec?: unknown;
   ttl_seconds?: number;
+  /** BUILD 2: pay */
+  payment_required?: unknown;
+  accept_index?: unknown;
+  /** BUILD 2: sign */
+  data?: unknown;
+  encoding?: unknown;
 }
 
 interface AgentProfile {
@@ -931,6 +937,28 @@ class AgentDaemon {
           // capability for, so an unbounded ttl from it would be a request to leave the
           // signing socket open for ever.
           ttlSeconds: Math.max(10, Math.min(900, ttl)),
+        }) as unknown as Record<string, unknown>;
+      }
+
+      // BUILD 2. Both answer with a signature or a refusal, never with the key.
+      case 'pay': {
+        if (!entry() || !purpose()) return { error: 'pay needs entry_id and purpose.' };
+        if (msg.payment_required === undefined) return { error: 'pay needs payment_required.' };
+        const idx = msg.accept_index;
+        // A whole number or nothing. `true` must not become offer 1 (round 2, F1).
+        if (idx !== undefined && idx !== null && !(typeof idx === 'number' && Number.isInteger(idx))) {
+          return { error: 'Refused: accept_index must be a whole number. Nothing was signed.', code: 'BAD_REQUEST' };
+        }
+        return await ops.pay({
+          entryId: entry(), purpose: purpose(), paymentRequired: msg.payment_required,
+          ...(typeof idx === 'number' ? { acceptIndex: idx } : {}),
+        }) as unknown as Record<string, unknown>;
+      }
+
+      case 'sign': {
+        if (!entry() || !purpose()) return { error: 'sign needs entry_id and purpose.' };
+        return await ops.sign({
+          entryId: entry(), purpose: purpose(), data: msg.data, encoding: msg.encoding,
         }) as unknown as Record<string, unknown>;
       }
 
