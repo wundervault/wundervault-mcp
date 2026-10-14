@@ -48,9 +48,11 @@ import {
   helloSignerFrom, usesPortFiles, anotherBrokerIsServing, endpointLabel,
   type Endpoint, type HelloSigner,
 } from './endpoint.js';
-import { loadOrCreateIdentity } from './broker-key.js';
+import { loadOrCreateIdentity, logSignerFromIdentity, brokerPublicKeyObject } from './broker-key.js';
 import { load as loadNetworkShape } from './network-store.js';
-import { BrokerOps } from './broker-ops.js';
+import { BrokerOps, type ActivitySink } from './broker-ops.js';
+import { ActivityLog } from './activity-log.js';
+import { Anchorer } from './activity-anchor.js';
 import type { BrokeredOp } from './ssh-agent.js';
 
 /**
@@ -699,6 +701,27 @@ class AgentDaemon {
    */
   private ops: Map<string, BrokerOps> = new Map();
 
+  /**
+   * The full, signed activity log (activity-log.ts), and the job that keeps the server's
+   * copy of its chain current and checks the file against it (activity-anchor.ts). Owner,
+   * 2026-10-13: a full log on the computer, signed, checked by us, kept for a year.
+   */
+  private activity = new ActivityLog(undefined, logSignerFromIdentity);
+  private anchorer = new Anchorer(this.activity, () => this.anchorClients(),
+    { minIntervalMs: 60_000, delayMs: 2_000, publicKey: brokerPublicKeyObject });
+  private activitySink: ActivitySink = {
+    record: (r) => { if (this.activity.append(r)) this.anchorer.notify(); },
+  };
+  private dailyTimer: NodeJS.Timeout | null = null;
+
+  /** Every servable agent's route to the server, so each account's chain has one. */
+  private anchorClients() {
+    return this.profiles
+      .filter((p) => !!p.socket_token)
+      .map((p) => { try { return this.opsFor(p).anchorClient(); } catch { return null; } })
+      .filter((c): c is NonNullable<typeof c> => c !== null);
+  }
+
   constructor() {
     ensureSystemRoot();
     const { key, mode } = deriveMachineKey();
@@ -977,6 +1000,7 @@ class AgentDaemon {
     const fresh = new BrokerOps(
       profile.agent_name, profile.api_key, profile.enc_key, profile.vault_url,
     );
+    fresh.activity = this.activitySink;
     this.ops.set(profile.agent_name, fresh);
     return fresh;
   }
@@ -1556,6 +1580,19 @@ class AgentDaemon {
     console.log(
       `[wundervault-agent] Started with ${this.agentServers.size} agent(s). State: ${systemRoot()}`,
     );
+    // A year of the activity log, then a check against Wundervault's copy: now (shortly
+    // after start, once the network is up) and daily. Both unref'd: bookkeeping must never
+    // be what keeps a stopping broker alive.
+    // The prune asks our server first how far it may go: no line is removed before every
+    // account's copy has held it for a year, and nothing is pruned while we can't ask.
+    const dailyCare = async () => {
+      try { this.activity.prune(undefined, await this.anchorer.pruneLimit()); } catch { /* next time */ }
+      await this.anchorer.flush({ verifyLocal: true });
+    };
+    const firstCheck = setTimeout(() => { void dailyCare(); }, 30_000);
+    (firstCheck as unknown as { unref?: () => void }).unref?.();
+    this.dailyTimer = setInterval(() => { void dailyCare(); }, 24 * 60 * 60 * 1000);
+    (this.dailyTimer as unknown as { unref?: () => void }).unref?.();
     // Said out loud, every start. A machine quietly running in the weaker mode while the
     // documentation describes the stronger one is the failure this line exists to prevent.
     if (this.keyMode === 'sealed-tpm') {
@@ -1615,6 +1652,8 @@ class AgentDaemon {
   }
 
   shutdown(): void {
+    this.anchorer.stop();
+    if (this.dailyTimer) { clearInterval(this.dailyTimer); this.dailyTimer = null; }
     // The discovery file goes with the server. A port file that outlives its daemon names
     // an address anything local may now bind, and an agent that read it would be talking
     // to a stranger — which the hello handshake catches, but only because this also
@@ -1721,9 +1760,11 @@ credentials so the agents cannot read them. It is normally started by systemd as
                 this process. A claim code is not a credential; a setup link is.
   --migrate     Show which agents still need moving to the broker, and how.
   --finish      With --migrate: delete the old store, once every agent is across.
-  --destinations  Show where your agents have sent secrets. Needs sudo: the record
-                belongs to the broker so your agents cannot read it. The page is opened
-                and then DELETED, because it is a copy your agents could otherwise read.
+  --destinations  Show the broker's log: every use of a key, where it went, why, and
+                what happened, with whether the log checks out (signed, linked, and
+                matching Wundervault's copy). Needs sudo: the log belongs to the broker
+                so your agents cannot read it. The page is opened and then DELETED,
+                because it is a copy your agents could otherwise read.
   --keep        With --destinations: leave the page on disk instead.
 
 State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
@@ -1740,8 +1781,10 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
     // refuseRoot is deliberately NOT called on this path: reading the store is the one
     // thing that requires being root, because the file belongs to the daemon's account and
     // that is what stops the agents reading it.
-    const { writeViewer, collectShape, resolveSudoUser, dropToSudoUser,
+    const { writeViewer, collectShape, collectActivity, resolveSudoUser, dropToSudoUser,
             shredViewer, openInBrowser } = await import('./log-viewer.js');
+    const { activityLogPath } = await import('./activity-log.js');
+    const { readCheck } = await import('./activity-anchor.js');
     const { defaultStorePath } = await import('./network-store.js');
     const pathMod = await import('node:path');
     const store = defaultStorePath();
@@ -1759,19 +1802,24 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
       process.exit(1);
     }
     collectShape(store)
-      .then(({ shape }) => {
+      .then(async ({ shape }) => {
+        // The full log, verified here while still root: the file and the key that checks its
+        // signatures both belong to the broker's account.
+        const activity = collectActivity(activityLogPath(), brokerPublicKeyObject(), readCheck());
         let target: string | undefined;
         if (sudoUser) {
           target = pathMod.join(sudoUser.home, '.wundervault', 'destinations.html');
           dropToSudoUser(sudoUser);
         }
-        const out = writeViewer(store, target, shape);
-        const calls = shape.seen.reduce((n: number, x: { count: number }) => n + x.count, 0);
+        const out = writeViewer(store, target, shape, activity);
         const keep = argv.includes('--keep');
+        const { verdictOf } = await import('./log-viewer.js');
+        const verdict = verdictOf(activity);
 
         console.log(
-          `\nDestination log — ${shape.seen.length} destination(s), ${calls} call(s)\n` +
-          `  store:  ${store}\n  viewer: ${out}\n`);
+          `\nYour broker's log — ${activity.total} line(s)\n` +
+          `  log:    ${activity.logPath}\n  viewer: ${out}\n\n` +
+          verdict.lines.map((l) => `  ${l}`).join('\n') + '\n');
 
         if (keep) {
           // Deliberate, and said plainly. Someone may want the page to keep or to send.

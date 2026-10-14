@@ -36,6 +36,107 @@ import { execFileSync, spawn } from 'node:child_process';
 import * as path from 'node:path';
 import { load, defaultStorePath, type NetworkShape } from './network-store.js';
 import { viewerPath } from './paths.js';
+import type { KeyObject } from 'node:crypto';
+import { forEachLineIn, Verifier, shortFingerprint, type ActivityLine, type Problem } from './activity-log.js';
+import type { CheckResult } from './activity-anchor.js';
+
+/**
+ * The full activity log, as the page shows it (2026-10-13). Read as root by the CLI, verified
+ * here, and embedded like the destination summary: the page still loads nothing.
+ */
+export interface ActivityView {
+  logPath: string;
+  /** The most recent lines, oldest first. The page holds at most `maxLines`. */
+  lines: ActivityLine[];
+  total: number;
+  problems: Problem[];
+  problemCount: number;
+  signed: number;
+  unsigned: number;
+  /** False when this computer's broker key could not be read, so signatures were not checked. */
+  keyAvailable: boolean;
+  check: CheckResult | null;
+  missing?: boolean;
+  /** The last line in the file now, to set against the last check (round 1, F9). */
+  lastSeq?: number;
+  /** For each line the last check named: does the file's line there still have that hash? */
+  checkpointsMatch?: boolean;
+}
+
+/** Verify the whole log, streaming, and keep the newest lines for the page. */
+export function collectActivity(
+  logPath: string, publicKey: KeyObject | null, check: CheckResult | null, maxLines = 20_000,
+): ActivityView {
+  const ver = new Verifier(publicKey, 200, Number.MAX_SAFE_INTEGER);
+  const keep: ActivityLine[] = [];
+  let missing = false;
+  try { statSync(logPath); } catch { missing = true; }
+  // The lines the last check vouched for, and the hashes it saw there (round 3, B3): a file
+  // rewritten since — even to the same length, even re-signed — no longer has those hashes.
+  const want = new Map<number, string>();
+  for (const st of check?.streams ?? []) {
+    if (st.matched === true && typeof st.server_seq === 'number' && st.server_head) want.set(st.server_seq, st.server_head);
+  }
+  let checkpointsMatch = true;
+  forEachLineIn(logPath, (l) => {
+    ver.push(l);
+    if (l) {
+      keep.push(l); if (keep.length > maxLines) keep.shift();
+      const h = want.get(l.seq);
+      if (h !== undefined && h !== l.hash) checkpointsMatch = false;
+    }
+  });
+  const v = ver.result;
+  return {
+    logPath, lines: keep, total: v.lines, problems: v.problems, problemCount: v.problemCount,
+    signed: v.signed, unsigned: v.unsigned, keyAvailable: publicKey !== null, check, missing,
+    lastSeq: v.lastSeq,
+    checkpointsMatch,
+  };
+}
+
+/** One plain sentence, or a few, about whether the log can be trusted. Text only. */
+export function verdictOf(a: ActivityView): { level: 'ok' | 'bad' | 'unknown'; lines: string[] } {
+  const out: string[] = [];
+  // The last check is a snapshot. If our server's copy reached further than the file does
+  // NOW, lines were removed since — whatever that check said at the time (round 1, F9).
+  const reach = Math.max(0, ...(a.check?.streams ?? []).map((s) => s.server_seq ?? 0));
+  if (reach > 0 && (a.missing || (a.lastSeq ?? 0) < reach)) {
+    return { level: 'bad', lines: [
+      a.missing
+        ? `This computer's log is gone, but Wundervault's copy reaches line ${reach}.`
+        : `This log ends at line ${a.lastSeq ?? 0}, but Wundervault's copy reaches line ${reach}: lines were removed.`,
+    ] };
+  }
+  if (a.missing) return { level: 'unknown', lines: ['There is no activity log on this computer yet. It starts with the first use of a key.'] };
+  if (a.checkpointsMatch === false) {
+    return { level: 'bad', lines: ['This log has been rewritten since it was last checked: a line no longer matches what Wundervault recorded for it.'] };
+  }
+  if (a.problemCount > 0) {
+    out.push(`This log has been changed or damaged: ${a.problemCount} problem${a.problemCount === 1 ? '' : 's'} found.`);
+    for (const p of a.problems.slice(0, 20)) out.push(`Line ${p.seq ?? `#${p.lineNo} in the file`}: ${p.what}`);
+    return { level: 'bad', lines: out };
+  }
+  const c = a.check;
+  const bad = c?.streams.find((s) => s.matched === false);
+  if (c && c.ok === false && bad) {
+    out.push(`This log does not match Wundervault's copy: ${bad.problem ?? 'they differ.'}`);
+    out.push(`Checked ${new Date(c.checked_at).toLocaleString()}.`);
+    return { level: 'bad', lines: out };
+  }
+  out.push(`All ${a.total} line${a.total === 1 ? '' : 's'} are linked to the one before${a.keyAvailable ? ', and every signed line is signed by this computer\'s broker' : ''}.`);
+  if (!a.keyAvailable) out.push("This computer's broker key could not be read, so the signatures were not checked.");
+  if (a.unsigned > 0) out.push(`${a.unsigned} line${a.unsigned === 1 ? ' was' : 's were'} written before this broker had a key, and ${a.unsigned === 1 ? 'is' : 'are'} not signed.`);
+  const good = c?.streams.find((s) => s.matched === true);
+  const unchecked = c?.streams.find((s) => s.matched === null);
+  if (c && c.ok === true && good && !unchecked) {
+    out.push(`It matches Wundervault's copy up to line ${good.server_seq ?? 0} (checked ${new Date(c.checked_at).toLocaleString()}).`);
+    return { level: 'ok', lines: out };
+  }
+  out.push(c ? `Not confirmed against Wundervault's copy: ${c.note ?? c.streams.find((s) => s.problem)?.problem ?? 'the last check could not tell.'}`
+             : "Not yet checked against Wundervault's copy. The broker checks within a minute of starting, and daily.");
+  return { level: 'unknown', lines: out };
+}
 
 /** Escape for embedding inside an HTML text node or attribute. */
 function esc(s: string): string {
@@ -62,7 +163,14 @@ function embedJson(value: unknown): string {
     .replace(/\u2029/g, '\\u2029');
 }
 
-export function renderViewer(shape: NetworkShape, storePath: string): string {
+export function renderViewer(shape: NetworkShape, storePath: string, activity?: ActivityView): string {
+  const verdict = activity ? verdictOf(activity) : null;
+  const uses = (activity?.lines ?? []).slice().reverse().map((l) => ({
+    seq: l.seq, ts: l.ts, fp: shortFingerprint(l.hash), kind: l.kind, agent: l.agent ?? '',
+    key: l.key ?? l.entry_id ?? '', method: l.method ?? '', address: l.address ?? '',
+    reason: l.reason ?? '', outcome: l.outcome, status: l.status ?? null, approval: l.approval ?? '',
+    detail: l.detail ?? '', extra: l.extra ?? {}, signed: !!l.sig,
+  }));
   const rows = shape.seen.map((s) => ({
     entryId: s.entryId,
     origin: s.origin,
@@ -81,7 +189,7 @@ export function renderViewer(shape: NetworkShape, storePath: string): string {
      pixel are all refused by the browser rather than by this page's good intentions. -->
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
-<title>Wundervault — local destination log</title>
+<title>Wundervault — your broker's log</title>
 <style>
   :root{
     --paper:#EFEEE9; --surface:#FBFAF7; --surface-2:#E6E5DE;
@@ -130,25 +238,45 @@ export function renderViewer(shape: NetworkShape, storePath: string): string {
   mark{background:var(--warn);color:var(--paper);border-radius:2px;padding:0 2px}
   .empty{padding:36px 16px;text-align:center;color:var(--muted)}
   footer{margin-top:26px;font-size:12px;color:var(--muted);line-height:1.7}
+  h2{font-size:19px;margin:34px 0 10px}
+  .verdict{border:1px solid var(--rule);border-left:3px solid var(--muted);background:var(--surface);
+    padding:12px 16px;margin:0 0 18px;font-size:14px;border-radius:0 3px 3px 0}
+  .verdict p{margin:0 0 4px}
+  .verdict.ok{border-left-color:var(--accent)} .verdict.bad{border-left-color:#B3261E;background:var(--surface-2)}
+  .fp{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted);white-space:nowrap}
+  .minor{display:block;font-size:12.5px;color:var(--muted)}
   @media (max-width:560px){table{min-width:480px}}
 </style>
 </head><body>
 <div class="wrap">
-  <h1>Where your secrets went</h1>
-  <p class="sub">Every destination an agent on this machine reached with a vault entry,
-  and the reason it gave. This is the whole record — Wundervault holds none of it.</p>
-  <p class="path">${esc(storePath)}</p>
+  <h1>Your broker's log</h1>
+  <p class="sub">Every use of a key by an agent on this computer: when, which agent and key,
+  where it went, the reason it gave, and what happened. Wundervault holds none of it, only a
+  fingerprint of each line that proves the log hasn't been changed.</p>
+  <p class="path">${esc(activity?.logPath ?? storePath)}</p>
 
   <div class="seal">This page contains no links, loads nothing, and is blocked by its own
   content-security policy from making any network request at all. It is safe to keep, and
   safe to delete — the store it was built from is unchanged.</div>
 
   <div class="bar">
-    <input type="search" id="q" placeholder="Search destination, entry, or reason…" autocomplete="off">
+    <input type="search" id="q" placeholder="Search agent, key, destination, or reason…" autocomplete="off">
     <button id="theme" type="button">Light / dark</button>
     <span class="count" id="count"></span>
   </div>
 
+  ${activity ? `<h2>Every use</h2>
+  <div class="verdict ${verdict!.level}" id="verdict">${verdict!.lines.map((x) => `<p>${esc(x)}</p>`).join('')}</div>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>When</th><th>Agent · key</th><th>What</th><th>Result</th><th>Line</th></tr></thead>
+      <tbody id="uses"></tbody>
+    </table>
+  </div>
+  <div class="empty" id="use-empty" hidden>Nothing matches that.</div>
+  <p class="count" id="use-count"></p>
+  <button id="use-more" type="button" hidden>Show 2,000 more</button>
+  <h2>Destinations, at a glance</h2>` : ''}
   <div class="tablewrap">
     <table>
       <thead><tr>
@@ -164,13 +292,14 @@ export function renderViewer(shape: NetworkShape, storePath: string): string {
   <div class="empty" id="empty" hidden>Nothing matches that.</div>
 
   <footer>
-    Generated ${esc(new Date().toISOString())} from the local store.<br>
-    Until the daemon owns this file, an agent running as your user can edit it — so treat
-    it as a record of what happened, not as proof.
+    Generated ${esc(new Date().toISOString())} from the broker's files.<br>
+    The "Line" column shows each line's number and fingerprint, so you can compare a line with
+    the one your vault page shows for this computer.
   </footer>
 </div>
 <script>
 const DATA = ${embedJson(rows)};
+const USES = ${embedJson(uses)};
 let sortKey = 'lastSeen', sortDir = -1;
 
 const $ = (id) => document.getElementById(id);
@@ -234,7 +363,52 @@ function render(){
   $('count').textContent = rows.length + ' of ' + DATA.length + ' destinations · ' + calls + ' calls';
 }
 
-$('q').addEventListener('input', render);
+const KIND = { call: 'Call', ssh: 'SSH session', ssh_closed: 'SSH session ended', pay: 'Payment', sign: 'Signature', pruned: 'Old lines removed' };
+const OUTCOME = { sent: 'Sent', failed: 'Failed', refused: 'Refused', error: 'Error', opened: 'Opened', closed: 'Closed', signed: 'Signed', removed: 'Removed' };
+const APPROVAL = { asked: 'asked you', approved: 'you approved', not_approved: 'not approved' };
+let usesShown = 2000;
+function renderUses(){
+  const body = $('uses'); if (!body) return;
+  const q = $('q').value.trim().toLowerCase();
+  const hay = (u) => [u.agent, u.key, u.address, u.reason, u.outcome, u.detail, u.method, String(u.seq), u.fp].join(' ').toLowerCase();
+  const rows = USES.filter((u) => !q || hay(u).includes(q));
+  body.replaceChildren();
+  for (const u of rows.slice(0, usesShown)){
+    const tr = document.createElement('tr');
+    tr.appendChild(text('td', 'when', fmt(u.ts)));
+    const who = document.createElement('td');
+    who.appendChild(mark(text('span', null, u.agent || '—'), q));
+    who.appendChild(mark(text('span', 'minor', u.key), q));
+    tr.appendChild(who);
+    const what = document.createElement('td');
+    const label = (KIND[u.kind] || u.kind) + (u.method ? ' ' + u.method : '');
+    what.appendChild(text('span', 'minor', label));
+    if (u.address) what.appendChild(mark(text('span', 'origin', u.address), q));
+    if (u.reason) what.appendChild(mark(text('span', 'minor', '“' + u.reason + '”'), q));
+    const x = u.extra || {};
+    const ex = u.kind === 'pay' ? (x.amount_usdc + ' USDC to ' + x.payee + ' on ' + x.network + (x.inside_rules ? ' · within your rules' : ''))
+      : u.kind === 'ssh_closed' ? (x.signs + ' signature' + (x.signs === 1 ? '' : 's'))
+      : u.kind === 'sign' ? ((x.algorithm ? x.algorithm + ' · ' : '') + 'data ' + String(x.data_sha256 || '').slice(0, 12) + '…')
+      : u.kind === 'pruned' ? (x.lines + ' line' + (x.lines === 1 ? '' : 's') + ' older than a year removed, up to line ' + x.through_seq)
+      : u.kind === 'ssh' ? '' : Object.entries(x).map(([k, v]) => k + ': ' + v).join(' · ');
+    if (ex) what.appendChild(text('span', 'minor', ex));
+    tr.appendChild(what);
+    const res = document.createElement('td');
+    res.appendChild(text('span', null, (OUTCOME[u.outcome] || u.outcome) + (u.status ? ' · HTTP ' + u.status : '')));
+    if (APPROVAL[u.approval]) res.appendChild(text('span', 'minor', APPROVAL[u.approval]));
+    if (u.detail) res.appendChild(mark(text('span', 'minor', u.detail), q));
+    tr.appendChild(res);
+    tr.appendChild(text('td', 'fp', '#' + u.seq + ' · ' + u.fp + (u.signed ? '' : ' · unsigned')));
+    body.appendChild(tr);
+  }
+  $('use-empty').hidden = rows.length > 0;
+  const listed = Math.min(rows.length, usesShown);
+  $('use-count').textContent = 'Showing ' + listed + ' of ' + rows.length + (q ? ' matching' : '') + ' uses' + (USES.length > rows.length ? ' (' + USES.length + ' in all)' : '') + '.';
+  $('use-more').hidden = rows.length <= usesShown;
+}
+
+$('q').addEventListener('input', () => { usesShown = 2000; render(); renderUses(); });
+if ($('use-more')) $('use-more').addEventListener('click', () => { usesShown += 2000; renderUses(); });
 document.querySelectorAll('th[data-k]').forEach(th => th.addEventListener('click', () => {
   const k = th.dataset.k;
   sortDir = (k === sortKey) ? -sortDir : (k === 'count' || k.endsWith('Seen') ? -1 : 1);
@@ -247,6 +421,7 @@ $('theme').addEventListener('click', () => {
   document.documentElement.setAttribute('data-theme', dark ? 'light' : 'dark');
 });
 render();
+renderUses();
 </script>
 </body></html>`;
 }
@@ -261,7 +436,7 @@ render();
  * something nobody asked it to.
  */
 export function writeViewer(storePath = defaultStorePath(), outPath?: string,
-                            shapeOverride?: NetworkShape): string {
+                            shapeOverride?: NetworkShape, activity?: ActivityView): string {
   const shape = shapeOverride ?? load(storePath);
   // The USER's directory, not the daemon's. After the split the store lives somewhere the
   // person running this cannot write, and dropping the page beside it would fail — or,
@@ -281,7 +456,7 @@ export function writeViewer(storePath = defaultStorePath(), outPath?: string,
   try { unlinkSync(tmp); } catch { /* nothing to clear */ }
   const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
   try {
-    writeFileSync(fd, renderViewer(shape, storePath));
+    writeFileSync(fd, renderViewer(shape, storePath, activity));
   } finally {
     closeSync(fd);
   }

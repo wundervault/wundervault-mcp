@@ -6,6 +6,20 @@ import { VERSION } from './version.js';
 
 const TIMEOUT = 30_000;
 
+/** The server's view of one activity-log chain: one per account and broker key. */
+export interface AnchorState {
+  /** Opaque: the same value for every agent of one account on this machine. */
+  stream: string;
+  seq: number | null;
+  head: string | null;
+  updated_at?: string | null;
+  /**
+   * The highest line our server has held for over a year. Lines up to here may be pruned;
+   * a log that starts after it has lost lines it should still have (round 1, F1).
+   */
+  prunable_through?: number | null;
+}
+
 export class AgentVaultAPI {
   private hmacB64: string;
   private vaultKey: Uint8Array | null = null;
@@ -148,6 +162,47 @@ export class AgentVaultAPI {
     }
     return resp.json() as Promise<{ allowed: boolean; tier: string; request_id?: string;
                                     message?: string; emailed?: boolean }>;
+  }
+
+  /** POST a JSON body, signed. A refusal throws with `status` and the parsed `body`. */
+  private async postJson<T>(path: string, body: unknown): Promise<T> {
+    const url = `${this.baseUrl}${path}`;
+    // Serialised once: the bytes hashed for the signature are the bytes sent.
+    const payload = JSON.stringify(body);
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { ...this.signedHeaders('POST', url, payload), 'content-type': 'application/json' },
+      body: payload,
+      signal: AbortSignal.timeout(TIMEOUT),
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      const err: any = new Error(`HTTP ${resp.status}: ${text}`);
+      err.status = resp.status;
+      try { err.body = JSON.parse(text); } catch { /* not JSON */ }
+      throw err;
+    }
+    return resp.json() as Promise<T>;
+  }
+
+  /**
+   * The server's copy of this machine's activity-log chain (activity-anchor.ts). Only a
+   * paired broker has one: the server refuses an agent that is not bonded to a broker key.
+   */
+  async getActivityAnchor(): Promise<AnchorState> {
+    return this.fetchJson<AnchorState>('/agent/activity-anchor');
+  }
+
+  /** Extend the server's chain with the digests of the lines after its `seq`. */
+  async postActivityAnchor(body: { from_seq: number; start_prev?: string; digests: string[] }): Promise<AnchorState> {
+    return this.postJson<AnchorState>('/agent/activity-anchor', body);
+  }
+
+  /** Tell the owner, through the server, that this machine's log no longer matches. */
+  async reportActivityMismatch(body: {
+    problem: 'changed' | 'missing' | 'damaged'; server_seq: number; local_last_seq: number | null;
+  }): Promise<{ retry?: boolean }> {
+    return this.postJson<{ retry?: boolean }>('/agent/activity-mismatch', body);
   }
 
   async getProfile(): Promise<ProfileResponse> {

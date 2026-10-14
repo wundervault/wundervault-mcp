@@ -49,6 +49,8 @@ export interface Deps {
   /** How long one call waits for the owner before telling the agent to call again. */
   approvalWaitMs?: number;
   now?: () => number;
+  /** Told which entry was fetched, so the activity log can name the key (2026-10-13). */
+  onSecret?: (s: SecretResponse) => void;
 }
 
 /**
@@ -124,6 +126,7 @@ export async function pay(d: Deps, args: {
   entryId: string; purpose: string; paymentRequired: unknown; acceptIndex?: number;
 }): Promise<PayResult | OpError> {
   const s: SecretResponse = await d.api.getSecret(args.entryId);
+  d.onSecret?.(s);
   if (!modeAllowsWallet(s.entry_mode)) return err(wrongModeMessage(s.entry_mode, 'wallet'), 'WRONG_MODE');
   const cfg = coerceCfg(s.exec_config);
   const chain = cfg.delivery === 'wallet' && (cfg.chain === 'evm' || cfg.chain === 'solana') ? cfg.chain as Chain : null;
@@ -260,6 +263,7 @@ export async function sign(d: Deps, args: {
   entryId: string; purpose: string; data: unknown; encoding?: unknown;
 }): Promise<{ signature: string; public_key: string; algorithm: string } | OpError> {
   const s = await d.api.getSecret(args.entryId);
+  d.onSecret?.(s);
   if (!modeAllowsSign(s.entry_mode)) return err(wrongModeMessage(s.entry_mode, 'sign'), 'WRONG_MODE');
   if (coerceCfg(s.exec_config).delivery !== 'sign') {
     return err('Refused: this signing key\'s settings are not ones the broker accepts. The owner can fix it in the dashboard.', 'BAD_CONFIG');

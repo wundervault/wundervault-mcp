@@ -768,3 +768,38 @@ describe('the MCP server cannot decrypt anything', () => {
     }
   });
 });
+
+describe('the activity log (2026-10-13): one line per use, through the real broker', () => {
+  it('records every call with what happened, and never a key', async () => {
+    await speak(sock(), {
+      token: TOKEN, op: 'call', entry_id: 'legacy1', purpose: 'should be refused',
+      request: { origin: { scheme: 'https', host: 'api.example', port: 443 }, method: 'GET', path: '/', body: { q: 1 } },
+    });
+    await speak(sock(), {
+      token: TOKEN, op: 'call', entry_id: 'http1', purpose: 'reach a box on the local network',
+      request: { origin: { scheme: 'https', host: '127.0.0.1', port: 9 }, method: 'POST', path: '/x', body: { a: 1 } },
+    });
+    await speak(sock(), {
+      token: TOKEN, op: 'ssh_agent_open', entry_id: 'ssh1', purpose: 'deploy',
+      op_spec: { kind: 'ssh', destination: 'not-listed.example', remoteArgv: ['true'] },
+    });
+    const raw = fs.readFileSync(path.join(dir, 'state', 'activity.log'), 'utf8');
+    const lines = raw.trim().split('\n').map((l) => JSON.parse(l));
+    expect(lines.map((l) => l.seq)).toEqual([1, 2, 3]);
+    expect(lines[0]).toMatchObject({ kind: 'call', agent: 'A', key: 'legacy1', reason: 'should be refused', outcome: 'refused' });
+    expect(lines[0].detail).toMatch(/^WRONG_MODE/);
+    // Recorded before the refusal, from what the agent asked (round 1, F4).
+    expect(lines[0]).toMatchObject({ method: 'GET', address: 'https://api.example:443/' });
+    expect(lines[0].body_sha256).toMatch(/^[0-9a-f]{64}$/); // round 2, F5
+    expect(lines[1]).toMatchObject({
+      kind: 'call', key: 'http1', method: 'POST', address: 'https://127.0.0.1:9/x',
+      reason: 'reach a box on the local network',
+    });
+    expect(['failed', 'refused']).toContain(lines[1].outcome);
+    expect(lines[1].body_sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(lines[2]).toMatchObject({ kind: 'ssh', key: 'ssh1', outcome: 'refused', reason: 'deploy' });
+    for (const s of Object.values(SECRETS)) expect(raw).not.toContain(s.value);
+    // Linked, in order.
+    for (let i = 1; i < lines.length; i += 1) expect(lines[i].prev).toBe(lines[i - 1].hash);
+  });
+});

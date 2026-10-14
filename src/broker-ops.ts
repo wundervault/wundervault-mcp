@@ -63,6 +63,28 @@ import { renderDetail } from './render.js';
 import { SigningState } from './wallet.js';
 import { validateRecipe, recipeSha256, describeRecipe, computeStamp, parseStampedValue, type Recipe } from './stamp.js';
 import { pay as payOp, sign as signOp, approveStamp, type Deps, type PayResult } from './signing-ops.js';
+import type { ActivityRecord } from './activity-log.js';
+import type { AnchorClient } from './activity-anchor.js';
+import { scrubSecret } from './http-broker.js';
+
+/** Where an operation's line in the activity log goes. The daemon supplies one. */
+export interface ActivitySink { record(r: ActivityRecord): void }
+
+/** The first line of a message, bounded: a log line is one line. */
+function firstLine(s: string): string {
+  return String(s ?? '').split('\n')[0].slice(0, 300);
+}
+
+/** Turn an operation's reply into the line's outcome. `sending` means the request went out. */
+function finish(rec: ActivityRecord, r: unknown): void {
+  const e = r as { error?: string; code?: string } | null;
+  if (e && typeof e === 'object' && typeof e.error === 'string') {
+    rec.outcome = rec.outcome === 'sending' ? 'failed' : 'refused';
+    rec.detail = `${e.code ? `${e.code}: ` : ''}${firstLine(e.error)}`;
+  } else if (rec.outcome === 'sending' || rec.outcome === 'refused') {
+    rec.outcome = rec.kind === 'call' ? 'sent' : rec.outcome;
+  }
+}
 
 export interface OpError { error: string; code?: string }
 
@@ -90,7 +112,27 @@ export class BrokerOps {
   private api: AgentVaultAPI;
   /** BUILD 2: this machine's payment record, policy versions and used approvals. */
   private state: SigningState;
-  private ssh = new Map<string, { handle: AgentHandle; timer: NodeJS.Timeout; entryId: string }>();
+  private ssh = new Map<string, { handle: AgentHandle; timer: NodeJS.Timeout; entryId: string; key?: string; host: string; reason: string; tier: string }>();
+  /**
+   * The activity log (activity-log.ts). Set by the daemon; null in a test that does not
+   * care. Writing a line never changes what an operation returns, and never throws into it.
+   */
+  activity: ActivitySink | null = null;
+
+  private record(rec: ActivityRecord): void {
+    try { this.activity?.record(rec); } catch { /* bookkeeping never fails a vault call */ }
+  }
+
+  /** This agent's route to the server's copy of the log's chain. */
+  anchorClient(): AnchorClient {
+    const api = this.api;
+    return {
+      label: this.agentName,
+      getActivityAnchor: () => api.getActivityAnchor(),
+      postActivityAnchor: (b) => api.postActivityAnchor(b),
+      reportActivityMismatch: (b) => api.reportActivityMismatch(b),
+    };
+  }
 
   constructor(
     public readonly agentName: string,
@@ -114,13 +156,54 @@ export class BrokerOps {
     return { api: this.api, state: this.state, ...this.depsOverride };
   }
 
+  /** The same, with the fetched entry's name and tier copied onto the log line. */
+  private depsNaming(rec: ActivityRecord): Deps {
+    return {
+      ...this.deps(),
+      onSecret: (s) => { rec.key = s.name; rec.tier = String(s.access_tier ?? '1'); },
+    };
+  }
+
   // ── pay / sign (build 2) ───────────────────────────────────────────────────
   async pay(args: { entryId: string; purpose: string; paymentRequired: unknown; acceptIndex?: number }): Promise<PayResult | OpError> {
-    return payOp(this.deps(), args);
+    const rec: ActivityRecord = { kind: 'pay', outcome: 'refused', agent: this.agentName, entry_id: args.entryId, reason: args.purpose };
+    try {
+      const r = await payOp(this.depsNaming(rec), args);
+      finish(rec, r);
+      if (!('error' in r)) {
+        rec.outcome = 'signed';
+        rec.approval = r.inside_rules ? 'none' : 'approved';
+        rec.extra = { network: r.network, payee: r.payee, amount_usdc: r.amount_usdc, inside_rules: r.inside_rules };
+      }
+      return r;
+    } catch (e) {
+      rec.outcome = 'error'; rec.detail = firstLine((e as Error).message);
+      throw e;
+    } finally { this.record(rec); }
   }
 
   async sign(args: { entryId: string; purpose: string; data: unknown; encoding?: unknown }) {
-    return signOp(this.deps(), args);
+    const rec: ActivityRecord = {
+      kind: 'sign', outcome: 'refused', agent: this.agentName, entry_id: args.entryId, reason: args.purpose,
+      extra: {
+        data_sha256: createHash('sha256').update(String(args.data ?? '')).digest('hex'),
+        encoding: typeof args.encoding === 'string' ? args.encoding : 'utf8',
+      },
+    };
+    try {
+      const r = await signOp(this.depsNaming(rec), args);
+      finish(rec, r);
+      const ok = r as { signature?: string; algorithm?: string };
+      if (ok && typeof ok.signature === 'string') {
+        rec.outcome = 'signed';
+        rec.approval = 'approved';
+        if (ok.algorithm) rec.extra = { ...rec.extra, algorithm: ok.algorithm };
+      }
+      return r;
+    } catch (e) {
+      rec.outcome = 'error'; rec.detail = firstLine((e as Error).message);
+      throw e;
+    } finally { this.record(rec); }
   }
 
   /**
@@ -157,12 +240,49 @@ export class BrokerOps {
     entryId: string; purpose: string; operationId?: string;
     callArgs?: Record<string, unknown>; request?: AgentRequest;
   }): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
+    // One line in the activity log for every call, whatever happens to it. The inner body
+    // fills in what it learns (the key's name, the address, the approval, the status) as
+    // it learns it, so a refusal at any point still says how far the call got.
+    const rec: ActivityRecord = {
+      kind: 'call', outcome: 'refused', agent: this.agentName, entry_id: args.entryId,
+      reason: args.purpose, approval: 'none',
+    };
+    // What the agent ASKED for, recorded before anything can refuse it (round 1, F4). The
+    // agent never has the key, so this cannot contain it; once the key is decrypted the
+    // address is rewritten from the definition, scrubbed.
+    const ask = args.request;
+    if (ask?.origin?.host && ask.origin.scheme) {
+      rec.method = String(ask.method || 'GET').toUpperCase();
+      rec.address = `${ask.origin.scheme}://${ask.origin.host}:${ask.origin.port ?? ''}${ask.path || '/'}`;
+      if (ask.body !== undefined) rec.body_sha256 = createHash('sha256').update(JSON.stringify(ask.body)).digest('hex');
+    } else if (args.operationId) {
+      rec.extra = { operation: args.operationId };
+    }
+    try {
+      const r = await this.callInner(args, rec);
+      finish(rec, r);
+      return r;
+    } catch (e) {
+      rec.outcome = rec.outcome === 'sending' ? 'failed' : 'error';
+      rec.detail = firstLine((e as Error).message);
+      throw e;
+    } finally {
+      this.record(rec);
+    }
+  }
+
+  private async callInner(args: {
+    entryId: string; purpose: string; operationId?: string;
+    callArgs?: Record<string, unknown>; request?: AgentRequest;
+  }, rec: ActivityRecord): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
     const { entryId, purpose } = args;
     const operationId = args.operationId || '';
     const callArgs = args.callArgs ?? {};
     const agentReq = args.request;
 
     const s = await this.api.getSecret(entryId);
+    rec.key = s.name;
+    rec.tier = String(s.access_tier ?? '1');
     if (!modeAllowsHttpBroker(s.entry_mode)) {
       return err(wrongModeMessage(s.entry_mode, 'http'), 'WRONG_MODE');
     }
@@ -262,6 +382,11 @@ export class BrokerOps {
       const bodyHash = agentReq?.body !== undefined
         ? createHash('sha256').update(JSON.stringify(agentReq.body)).digest('hex')
         : undefined;
+      // The address the agent asked for, before the key is added — scrubbed anyway, so a
+      // key that somehow reached the path never reaches the log.
+      rec.method = def.route.method;
+      rec.address = String(scrubSecret(`${originString(def.origin)}${def.route.path}`, secret));
+      rec.body_sha256 = bodyHash;
 
       // Recorded here, in the broker, which is the first time this has actually worked.
       // The call site used to be in the MCP server — the agent's uid — writing to
@@ -284,10 +409,12 @@ export class BrokerOps {
       });
 
       if (!verdict.allowed) {
+        rec.approval = 'asked';
         const approved = verdict.request_id
           ? await this.api.waitForTier2Approval(verdict.request_id)
           : false;
         if (!approved) {
+          rec.approval = 'not_approved';
           return err(`${verdict.message ?? 'This call needs owner approval.'}\n\n`
             + `Nothing was sent. The owner sees exactly: ${def.route.method} `
             + `${originString(def.origin)}${def.route.path}`);
@@ -297,11 +424,13 @@ export class BrokerOps {
           method: def.route.method, path: def.route.path, body_sha256: bodyHash,
         });
         if (!second.allowed) {
+          rec.approval = 'not_approved';
           return err(`${second.message ?? 'This call needs owner approval.'}\n\n`
             + `Nothing was sent. The owner sees exactly: ${def.route.method} `
             + `${originString(def.origin)}${def.route.path}`);
         }
         verdict.tier = second.tier;
+        rec.approval = 'approved';
       }
 
       let approvedOrigins: string[] = [];
@@ -329,6 +458,7 @@ export class BrokerOps {
           return err(`Refused: ${(e as Error).message}. Nothing was sent. The owner can fix it in the dashboard.`, 'WRONG_KIND');
         }
       }
+      rec.outcome = 'sending';
       const result = await performOperation(
         def, operationId ? callArgs : (typeof agentReq?.body === 'string'
           ? agentReq.body
@@ -336,6 +466,7 @@ export class BrokerOps {
         stamped ? stamped.secret : secret, approvedOrigins,
         stamped ? (img) => computeStamp(stampRecipe!, img, stamped) : undefined,
       );
+      if (result.status) rec.status = result.status;
       if (!result.ok && /internal or reserved address/.test(result.error ?? '')
           && !isApprovedPrivateOrigin(def.origin, approvedOrigins)) {
         return err(`${result.error}\n\nIf you host that service yourself, the owner can approve `
@@ -389,6 +520,28 @@ export class BrokerOps {
     session_id: string; socket_path: string; public_key_path: string; fingerprint: string;
     audited_host: string;
   } | OpError> {
+    const rec: ActivityRecord = {
+      kind: 'ssh', outcome: 'refused', agent: this.agentName, entry_id: args.entryId,
+      reason: args.purpose, address: `ssh://${String(args.op?.destination ?? '')}`,
+      extra: { op: String(args.op?.kind ?? '') },
+    };
+    try {
+      const r = await this.sshAgentOpenInner(args, rec);
+      finish(rec, r);
+      if (!('error' in r)) rec.outcome = 'opened';
+      return r;
+    } catch (e) {
+      rec.outcome = 'error'; rec.detail = firstLine((e as Error).message);
+      throw e;
+    } finally { this.record(rec); }
+  }
+
+  private async sshAgentOpenInner(args: {
+    entryId: string; purpose: string; op: BrokeredOp; ttlSeconds?: number;
+  }, rec: ActivityRecord): Promise<{
+    session_id: string; socket_path: string; public_key_path: string; fingerprint: string;
+    audited_host: string;
+  } | OpError> {
     const { entryId, purpose, op } = args;
     const ttlSeconds = args.ttlSeconds ?? 300;
 
@@ -403,6 +556,8 @@ export class BrokerOps {
     }
 
     const s = await this.api.getSecret(entryId);
+    rec.key = s.name;
+    rec.tier = String(s.access_tier ?? '1');
     if (!modeAllowsSshBroker(s.entry_mode)) {
       return err(wrongModeMessage(s.entry_mode, 'ssh'), 'WRONG_MODE');
     }
@@ -425,6 +580,7 @@ export class BrokerOps {
     }
     const check = checkSshDestination(op, allowedHosts);
     if (!check.ok) return err(check.error, 'HOST_NOT_ALLOWED');
+    rec.address = `ssh://${check.auditedHost}`;
 
     // The agent's reason is no longer sent with the fetch, so it is kept HERE — in the
     // same local store as the web calls' destinations, on the owner's machine, written by
@@ -457,7 +613,10 @@ export class BrokerOps {
 
     const timer = setTimeout(() => this.closeSsh(sessionId), ttlSeconds * 1000);
     (timer as unknown as { unref?: () => void }).unref?.();
-    this.ssh.set(sessionId, { handle, timer, entryId });
+    this.ssh.set(sessionId, { handle, timer, entryId, key: s.name, host: check.auditedHost, reason: purpose, tier: String(s.access_tier ?? '1') });
+    // Pairs this line with its close. A hash, not the id: the id names the signing socket's
+    // directory, and a copy of the log (the viewer page) is readable by agents (round 3, B1).
+    rec.extra = { ...(rec.extra ?? {}), session: sessionRef(sessionId) };
 
     return {
       session_id: sessionId,
@@ -475,8 +634,17 @@ export class BrokerOps {
     clearTimeout(rec.timer);
     try { rec.handle.close(); } catch { /* already gone */ }
     this.ssh.delete(sessionId);
+    this.record({
+      kind: 'ssh_closed', outcome: 'closed', agent: this.agentName, entry_id: rec.entryId,
+      key: rec.key, address: `ssh://${rec.host}`, reason: rec.reason, tier: rec.tier,
+      extra: { signs, session: sessionRef(sessionId) },
+    });
     return { closed: true, signs };
   }
+}
+
+function sessionRef(sessionId: string): string {
+  return createHash('sha256').update(sessionId).digest('hex').slice(0, 12);
 }
 
 function randomId(): string {

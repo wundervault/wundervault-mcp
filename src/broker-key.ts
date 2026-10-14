@@ -192,3 +192,30 @@ export function openBrokerBlob(privateKeyPem: string, blobB64: string): Buffer {
   d.setAuthTag(tag);
   return Buffer.concat([d.update(ciphertext), d.final()]);
 }
+
+/**
+ * The activity log's signer (activity-log.ts), from this machine's broker key, or null when
+ * there is none yet or it cannot be used. Lives here, not in the log module, so that only
+ * the broker's own files touch the key (test/broker-sign.test.ts).
+ *
+ * An unusable key does not stop a line being written: a vault call is not refused over
+ * bookkeeping. The line goes in unsigned and the viewer says so. The request path is where
+ * a broken key fails loudly (broker-sign.ts).
+ */
+export function logSignerFromIdentity(): { sign(message: Buffer): string; keyId: string } | null {
+  if (!hasIdentity()) return null;
+  try {
+    const identity = loadOrCreateIdentity();
+    const key = crypto.createPrivateKey(identity.privateKeyPem);
+    return { sign: (m: Buffer) => crypto.sign('sha256', m, key).toString('base64'), keyId: identity.fingerprint };
+  } catch (e) {
+    console.error(`[wundervault-agent] The activity log is being written UNSIGNED: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+/** This broker's public key, for checking the activity log's signatures. Null when there is none. */
+export function brokerPublicKeyObject(): crypto.KeyObject | null {
+  if (!hasIdentity()) return null;
+  try { return crypto.createPublicKey(crypto.createPrivateKey(loadOrCreateIdentity().privateKeyPem)); } catch { return null; }
+}
