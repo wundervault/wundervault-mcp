@@ -54,13 +54,22 @@ function mockToolResult(name: string, args: Record<string, any>) {
   switch (name) {
     case 'vault_entries_list':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
-        `Vault entries (2):\n  [demo-0001]  DEMO_API_KEY  (tier: read)\n  [demo-0002]  DEMO_SSH_KEY  (tier: 1)${MOCK_NOTE}` }] });
+        `Vault entries (4):\n  [demo-0001]  DEMO_API_KEY  (tier: 1, web service)\n  [demo-0002]  DEMO_SSH_KEY  (tier: 1, SSH)\n`
+        + `  [demo-0003]  DEMO_WALLET  (tier: 1, wallet)\n  [demo-0004]  DEMO_SIGNING_KEY  (tier: 2, signing key)${MOCK_NOTE}` }] });
     case 'vault_ssh_exec':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ Ran on ${args.destination ?? 'demo-host'} (exit 0). 1 signature, key never left the server.${MOCK_NOTE}` }] });
     case 'vault_call':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
-        `✅ ${args.operation_id ?? 'demo.op'} returned 200. Credential was used, not disclosed.${MOCK_NOTE}` }] });
+        `✅ ${args.operation_id ?? args.request?.method ?? 'demo.op'} returned 200. Credential was used, not disclosed.${MOCK_NOTE}` }] });
+    case 'vault_pay':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `✅ Paid 0.01 USDC on base-sepolia inside the owner's rules. Send this header when you retry: `
+        + `PAYMENT-SIGNATURE: demo-payment-header. The wallet key never left the broker.${MOCK_NOTE}` }] });
+    case 'vault_sign':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `✅ Signed after the owner approved. signature: ZGVtby1zaWduYXR1cmU=  public_key: ZGVtby1wdWJsaWMta2V5  `
+        + `algorithm: ed25519. The signing key never left the broker.${MOCK_NOTE}` }] });
     default:
       return CallToolResultSchema.parse({ content: [{ type: 'text', text: `Unknown tool: ${name}${MOCK_NOTE}` }], isError: true });
   }
@@ -103,17 +112,17 @@ export function createServer(args: { url?: string } = {}) {
       {
         name: 'vault_call',
         description: (
-          'Perform a named operation using a vaulted credential that is never returned '
-          + 'to you.\n\n'
-          + 'You supply typed arguments; this server builds the request, attaches the '
-          + 'credential, sends it, and returns only the response fields the operation '
-          + 'permits. You cannot supply a URL, headers or a raw body — the operation '
-          + 'definition fixes the origin and route, and it is signed with a key derived '
-          + 'from the secret itself, so a definition altered anywhere in transit is '
-          + 'refused.\n\n'
-          + 'vault_entries_list shows which operations an entry offers. Or describe the request '
-          + 'yourself with `request`; the entry decides how the key is attached (header, query '
-          + 'parameter or username and password) — you never choose that, and never see the key.'
+          'Call a web service with a vaulted key that is never returned to you: the broker '
+          + 'attaches the key, sends the request and gives you the answer with the key removed.\n\n'
+          + 'Two ways to call. Describe the request yourself with `request` (origin, method, path, '
+          + 'and optional query, body and your own headers). Or run a named operation the owner '
+          + 'defined, with `operation_id` and typed `args`: the operation fixes the origin and '
+          + 'route, returns only the fields it permits, and is signed with a key derived from the '
+          + 'secret itself, so a definition altered in transit is refused. vault_entries_list '
+          + 'shows which operations an entry offers.\n\n'
+          + 'Either way the entry decides how the key is attached (a header, a query parameter, a '
+          + 'username and password, or part of the web address) — you never choose that, and never '
+          + 'see the key.'
         ),
         inputSchema: {
           type: 'object',
@@ -190,7 +199,7 @@ export function createServer(args: { url?: string } = {}) {
         description: (
           'Run a command on a remote host, or rsync files to it, using a vaulted SSH key '
           + 'that is never written to disk and never returned to you.\n\n'
-          + 'The key stays inside this server and answers signature requests over a private '
+          + 'The key stays inside the broker, which answers signature requests over a private '
           + 'ssh-agent socket that exists only for the duration of this call. You choose the '
           + 'remote command; you do not get the key.\n\n'
           + 'The destination is checked against the ssh_hosts allowlist on the entry, and the '

@@ -5,224 +5,274 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-green)](LICENSE)
 [![Follow @wundervault1](https://img.shields.io/badge/follow-%40wundervault1-000000?logo=x&logoColor=white)](https://x.com/wundervault1)
 
-**A zero-knowledge secrets vault for AI agents.** Every API key you paste into an agent chat or a `.env` file ends up in context windows, transcripts, and provider logs. Wundervault's answer: the agent never receives the secret at all. It asks for *work* — "run this deploy with the key injected" — and a local daemon decrypts the secret, injects it into the subprocess environment, zeroes the buffer, and scrubs the output before the agent sees any of it.
+**Your AI agent uses your keys. It never holds them.**
 
-This repo is the MCP server that exposes that workflow to any [Model Context Protocol](https://modelcontextprotocol.io) client — Claude Code, Cursor, Cline, and others.
+A key you paste into a chat with an AI agent, or leave in a settings file it can read, gets
+copied into its memory, its transcripts and its logs. With Wundervault the agent never receives
+the key at all. A small
+program on your own computer, the **broker**, keeps your keys in an account of its own. Your
+agent asks it to call a web service, run a command on a server, pay for something or sign
+something; the broker does it with the key and hands back the result, with the key removed.
 
-**Don't trust the claim — test it:** the zero-knowledge property is independently verifiable at your own network boundary in about 5 minutes (browser DevTools or a mitmproxy canary test). Guide + our own test transcript: [wundervault.com/verify](https://wundervault.com/verify).
+Your vault is encrypted in your browser, so our server stores it but can't read it. Keys
+you mark **"ask me first"** wait for your approval, with your passkey, on your phone or
+computer.
+
+This package is the MCP server your agent talks to, and the broker beside it. It works with
+any [Model Context Protocol](https://modelcontextprotocol.io) client: Claude Code, Codex,
+Cursor, Cline, OpenClaw and others.
+
+**Don't take our word for it:** check the encryption claim on your own network, and verify
+the installer, at [wundervault.com/verify](https://wundervault.com/verify).
+
+## What your agent can do
+
+| Tool | What it does |
+|---|---|
+| `vault_call` | Calls a web service with a key attached, and returns the answer with the key removed. |
+| `vault_ssh_exec` | Runs a command on a server you listed, or rsyncs files to it. The broker signs the SSH login; the key never leaves it. |
+| `vault_pay` | Pays an x402 "402 Payment Required" in USDC on Base or Solana, inside the limits you set. |
+| `vault_sign` | Signs data with a signing key. You approve every signature. |
+| `vault_entries_list` | Lists the keys this agent may use, and what kind each is. Never their values. |
+
+No tool returns a key's value. Version 1's hand-over tools (`vault_exec`, `vault_entry_get`,
+`vault_entry_inject_env`, `vault_rsync`) are gone; see [Upgrading from version 1](#upgrading-from-version-1).
 
 ## How it works
 
 ```
-┌──────────────┐  MCP (stdio)  ┌───────────────────┐  ciphertext only  ┌───────────────────┐
-│   AI agent   │──────────────▶│  wundervault-mcp  │◀─────────────────▶│  wundervault.com  │
-│ (Claude, …)  │◀──────────────│  + local daemon   │                   │ stores encrypted  │
-└──────────────┘ "burned" ack  │  decrypts HERE    │                   │ blobs, no keys    │
-                               └─────────┬─────────┘                   └───────────────────┘
-                                         │  secret → subprocess env
-                                         │  (buffer zeroed after spawn)
+ ┌──────────────┐  MCP (stdio)  ┌──────────────────┐
+ │   AI agent   │──────────────▶│ wundervault-mcp  │  runs as you, holds no keys
+ │ (Claude, …)  │◀──────────────│                  │
+ └──────────────┘  result, key  └────────┬─────────┘
+                   removed               │ local socket
                                          ▼
-                               ┌───────────────────┐
-                               │   your command    │ stdout/stderr scrubbed
-                               │ (deploy, API, …)  │ before the agent sees it
-                               └───────────────────┘
+                              ┌──────────────────────┐  HTTPS / SSH  ┌─────────────┐
+                              │ broker               │──────────────▶│ the service │
+                              │ its own OS account,  │◀──────────────│             │
+                              │ holds the keys, logs │               └─────────────┘
+                              │ each call on this box│
+                              └──────────┬───────────┘
+                                         │ signed requests, ciphertext only
+                                         ▼
+                              ┌──────────────────────┐
+                              │   wundervault.com    │  stores your encrypted vault,
+                              │                      │  relays your approvals
+                              └──────────────────────┘
 ```
 
-Secrets are encrypted client-side (AES-256-GCM via Web Crypto) before upload. The hosted service only ever stores ciphertext — it cannot derive the key, the passphrase, or the plaintext.
+1. Your agent asks for work: "call this API", "deploy to this server".
+2. The MCP server passes the request to the broker over a local socket. It holds no keys.
+3. For an "ask me first" key, the broker waits for you to approve that call.
+4. The broker makes the call with the key, records it in a log on your computer, and returns
+   the result. For web calls the key goes to the service it belongs to, as it must; for SSH it
+   never leaves the broker at all.
 
 ## Install
 
+You need Node.js 20 or newer, and administrator rights on the computer your agents run on.
+The full guide, with every step: [wundervault.com/quickstart](https://wundervault.com/quickstart).
+
+**1. Create a vault** at [wundervault.com](https://wundervault.com). It's free.
+
+**2. Install the package and the broker** on the computer your agents use:
+
 ```bash
-npm install -g @wundervault/mcp-server
+npm install -g @wundervault/mcp-server@2
+sudo sh "$(npm root -g)/@wundervault/mcp-server/packaging/install-daemon.sh"
 ```
 
-## Quick Start
+Windows and macOS (both in beta) have their own installers; see
+[wundervault.com/install](https://wundervault.com/install). The installer downloads nothing
+and is short enough to read first.
+
+**3. Pair the broker with your account:**
+
+```bash
+sudo wundervault-agent --pair
+```
+
+Check that the fingerprint it shows matches the one in your vault, then confirm.
+
+**4. Add an agent.** In your vault, add an agent and choose this computer. You get a claim
+code. Run this and enter it:
+
+```bash
+wundervault-agent --enrol
+```
+
+Then add Wundervault to your agent's MCP settings:
 
 ```json
 {
   "mcpServers": {
     "wundervault": {
       "command": "wundervault-mcp",
-      "env": {
-        "WUNDERVAULT_AGENT_NAME": "<agent-name>"
-      }
+      "env": { "WUNDERVAULT_AGENT_NAME": "<your agent's name>" }
     }
   }
 }
 ```
 
-Keys are never placed in the MCP config. The server names its agent, then asks the
-local `wundervault-agent` daemon for that agent's credentials over a unix socket.
-`onboard.py` registers the agent and starts the daemon.
+The config holds no keys, and there are no key flags on the command line. Configs for other
+clients: [README-AGENTS.md](README-AGENTS.md). If you're an AI agent installing this for
+someone: [llms-install.md](llms-install.md).
 
-New account? [wundervault.com](https://wundervault.com) has a 90-second agent onboarding flow that generates this config for you.
+## Upgrading from version 1
+
+Version 2 moves your keys into the broker. Your account, vault and passkeys carry over.
+Agents still on version 1 can't use your keys, so move each one:
+
+1. `npm install -g @wundervault/mcp-server@2`
+2. Install the broker and pair it (steps 2 and 3 above).
+3. For each agent: open **Agents** in your vault, choose **Repair**, choose this computer,
+   then run `wundervault-agent --enrol` and enter the claim code.
+4. When every agent has moved: `wundervault-agent --migrate --finish` removes the old
+   credential store.
+5. Your vault marks each key your agents could read before version 2 with **Replace it at
+   the service**. Replace those keys at the services that issued them: treat them as seen.
+
+Your agent can't do this for you. It needs an administrator command and your approval in the
+vault, by design. Details: [wundervault.com/install#upgrade-to-2](https://wundervault.com/install#upgrade-to-2).
 
 ## Supported platforms
 
-**Linux and macOS both get the privilege boundary. Windows does not yet.**
+| | Broker's own account | Status |
+|---|---|---|
+| Linux | `wundervault` system user, systemd unit with extra sandboxing | Supported |
+| Windows | `wundervault` local account, scheduled task | Beta |
+| macOS | `_wundervault` system account, LaunchDaemon | Beta |
 
-On Linux and macOS the secret broker runs as its own account — a systemd unit as
-`wundervault`, a LaunchDaemon as `_wundervault` — with its state in a directory your
-agents cannot open. On Windows the daemon runs as you, which means its key material is
-readable by anything you run, and it says so at every start.
+On all three the broker runs under its own account, with its keys in a folder your agents
+can't open. What differs is what surrounds that boundary:
 
-What macOS does NOT get is the second layer. The systemd unit adds `ProtectSystem=strict`,
-`ProtectHome`, `ProtectProc`, a system-call filter and an empty capability set; launchd has
-no equivalent for any of them. The uid split is the boundary on both, and on macOS it is
-very nearly the whole of the defence. Neither is a sandbox.
+- **Linux** adds `ProtectSystem=strict`, `ProtectHome`, `ProtectProc`, a system-call filter
+  and an empty capability set. The store key is sealed with `systemd-creds`, to a TPM where
+  there is one; without a TPM it is sealed to a host key on the same disk.
+- **macOS** has no launchd equivalent of that sandboxing, so the account split is very nearly
+  the whole defence. The store key is a random key in a file only the broker's account can
+  read: not sealed. FileVault is what protects a stolen disk.
+- **Windows** has the same account split and none of the extra sandboxing. An **elevated**
+  administrator process can read the broker's files, as root can on Linux, and Windows
+  OpenSSH gives an administrator an elevated session. The store key is a random key in a file
+  only the broker's account can read; BitLocker protects a stolen disk.
+  `packaging\verify-windows.ps1` checks the boundary on your own machine.
 
-The store key differs too, because the mechanisms do. Linux seals it with `systemd-creds`,
-to a TPM where there is one. macOS has nothing we can reach without a signed binary, so the
-installer writes a random key into a 0600 file owned by the broker's account: not
-recomputable, which the old derived key was, but not sealed either — a copy of the disk
-plus root opens it, and FileVault is what covers that.
+If something on Windows or macOS fails, tell us what it printed:
+[wundervault.com/contact](https://wundervault.com/contact).
 
-Delivery is POSIX-only by construction: the `sudo` recipe pipes through `/bin/sh`, and
-the `git` / `ssh-passphrase` recipes need `mkfifo` and `setsid`. On Windows those
-mechanisms return a clear "not supported" error rather than failing somewhere deep
-inside.
+## Security model
 
-The single-instance lock has two implementations: a kernel-held abstract socket on Linux,
-and a single derived loopback port elsewhere. Both are covered by tests on every CI run —
-the port path is exercised on Linux through `WUNDERVAULT_LOCK_STRATEGY=port`, which is how
-a concurrency bug in it was found that only macOS could previously have shown.
-
-## Security Model
-
-- **Zero-knowledge:** The encryption key lives only in the MCP server process. The Wundervault server never sees it.
-- **Burn-after-reading:** Plaintext secrets are never returned to the calling agent. After decryption, the agent receives only `"Secret retrieved and burned."`.
-- **Exec scrubbing:** Command stdout/stderr are scrubbed of the plaintext before being returned; shell-escape patterns (`$()`, backticks, `sh -c`, `eval`) and file redirects of secrets are rejected *before* decryption.
-- **Directive integrity:** Server-side directive signatures (PBKDF2-HMAC-SHA256, 600k iterations) are verified before any secret is released.
-- **Timing-safe:** HMAC comparison uses `crypto.timingSafeEqual`.
-- **Tiered access:** Per-entry access tiers are enforced server-side; high-tier secrets require human approval before an agent can use them.
+- **The agent never gets a key.** No tool returns a value. The broker attaches the key to the
+  request itself, the way you set for that key (a header, a query parameter, a username and
+  password, or part of the web address), and removes it from the answer. Keys marked
+  "stamped" (AWS, exchanges) never travel: the broker signs each request with them.
+- **A separate account.** Your agents run as you; the broker doesn't. They can't read its
+  files or its memory.
+- **End-to-end encrypted vault.** Keys are encrypted in your browser with AES-256-GCM. The
+  vault key comes from your passphrase, mixed with an Account Secret that never leaves your
+  device, through Argon2id (PBKDF2 for a vault made where WebAssembly is off, such as iPhone
+  Lockdown Mode). We store ciphertext only.
+- **Signed requests.** The broker is paired to your account with a P-256 key whose fingerprint
+  you confirm. The server serves a key's ciphertext only to requests that broker signed, so a
+  copied credential alone gets nothing.
+- **Approvals with your passkey.** An "ask me first" web call waits until you approve that
+  exact destination, method and path, once or for a short window. Every payment outside your
+  rules and every signature is sealed by your browser to exactly what you saw, so a server
+  that only says "approved" can't spend your money.
+- **A log on your computer.** Every call is recorded by the broker, signed, and checked
+  against a copy of its chain we hold, so a changed log is detected. For "run without asking"
+  keys, where the key went and why stays on your computer; we never see it.
+  `sudo wundervault-agent --destinations` opens it.
+- **HTTPS only**, with real certificate checks; redirects are not followed; private network
+  addresses are refused unless you allowed one for that key.
 
 ### Honest limitations
 
-- The platform is **open-core**: this MCP server and the [browser crypto](https://github.com/wundervault/wundervault-crypto) are AGPL-3.0 so you can audit everything that touches your secrets, but the hosted service itself is not open source.
-- A local daemon must run next to the agent; fully air-gapped setups don't fit.
-- By design the agent can never read a secret's value — if your workflow needs the model to *reason about* the secret itself, this is the wrong shape.
+- A "run without asking" key goes where your agent sends it. A tricked agent could send it to
+  a server someone else controls, because the request carries the key. For keys that matter,
+  choose "ask me first".
+- "Ask me first" approves a destination, method and path, not what the request says. Within an
+  approval window, calls to the same place go ahead whatever they contain.
+- The broker removes your key from the answer as it was sent. A service that sends it back in
+  another form, such as encoded, could get it past; and anything the call creates, such as a
+  new API token, is your agent's.
+- Agents that run under the same user account can use each other's access to the broker. Run
+  an agent you trust less under another account.
+- The broker must run on the same computer as the agent; fully air-gapped setups don't fit.
+- The platform is **open-core**: this package and the
+  [browser crypto](https://github.com/wundervault/wundervault-crypto) are AGPL-3.0, so you can
+  audit everything that touches your keys; the hosted service is not open source.
 
-## Tools
+Every known limit, kept with the code: [wundervault.com/limitations](https://wundervault.com/limitations).
+
+## Tool reference
+
+The full reference, with every argument: [wundervault.com/mcp](https://wundervault.com/mcp).
+
+### `vault_call`
+
+```
+entry_id: string       which key
+purpose: string        why; kept in the broker's log on the owner's computer
+request?: {            describe the call (or operation_id + args instead)
+  origin: { scheme: "https", host, port }, method, path,
+  query?, body?, headers?,   # your own headers; never the one carrying the key
+  stamp?                     # for stamped keys: how the service signs requests
+}
+operation_id?, args?   run an operation the owner defined for this key
+```
+
+### `vault_ssh_exec`
+
+```
+entry_id: string            an ed25519 SSH key
+destination: string         [user@]host; the host must be on the key's allowed list
+purpose: string
+remote_argv?: string[]      command and arguments, run without a shell
+rsync_args?: string[]       instead of a command; every host:path is checked too
+timeout_seconds?: number    default 120
+working_dir?: string        local folder for rsync sources
+```
+
+### `vault_pay`
+
+```
+entry_id: string            a wallet
+payment_required            the 402 reply's PAYMENT-REQUIRED header, or its decoded JSON
+accept_index?: number       which offer, when there is more than one
+purpose: string             the owner sees it if they're asked
+→ the header to send when you retry the request, in the reply text
+```
+
+USDC on Base, Base Sepolia, Solana and Solana devnet. Inside the owner's rules (trusted
+payees, a daily limit, allowed networks) it signs at once; anything else waits for the owner.
+
+### `vault_sign`
+
+```
+entry_id: string            a signing key
+data: string                at most 256 KB
+encoding?: "utf8" | "base64" | "hex"
+purpose: string             the owner sees it
+→ the signature (base64), the public key and the algorithm, in the reply text
+```
+
+The owner approves every signature and is shown the data in full when it is text up to 64 KB.
 
 ### `vault_entries_list`
 
-List all vault entries available to this agent. Returns entry IDs and secret names — no values.
-
-```
-Input: {}
-Output: "Vault entries (N):\n  [entry_id]  secret_name  (tier: read)"
-```
-
-### `vault_entry_get`
-
-Retrieve and decrypt a vault secret. Optionally execute a command with it.
-
-```
-Input:
-  entry_id: string          # from vault_entries_list
-  purpose: string           # audit log reason
-  exec?: string             # optional shell command
-
-Output: "Secret retrieved and burned." (plaintext NEVER returned)
-```
-
-**Secure exec pattern** (sudo example):
-```bash
-sudo -S systemctl restart nginx <<< "$WUNDERVault_SECRET"
-```
-Do NOT use `echo $WUNDERVault_SECRET | sudo -S` — that exposes the secret in process logs.
-
-### `vault_exec`
-
-Execute a shell command with a vault secret injected as an env var — locally or on a remote host over SSH. The secret is injected into the subprocess and the buffer is zeroed immediately after spawn; escape patterns are rejected before decryption.
-
-```
-Input:
-  purpose: string           # audit log reason
-  command: string           # full shell command (no escape patterns)
-  entry_id?: string         # secret to inject (omit for SSH-key-only remote exec)
-  working_dir?: string
-  inject_as?: { env_key, pre_command?, post_command? }   # override entry's exec_config
-  remote_host?: { host, user, ssh_key_entry_id? | ssh_key? }
-```
-
-With `remote_host.ssh_key_entry_id`, the SSH key is fetched from the vault and used without ever being written to disk.
-
-### `vault_entry_inject_env`
-
-Write a vault secret directly into a config file (`~/.npmrc`, `~/.netrc`, `~/.docker/config.json`, or a project `.env`) without the plaintext passing through the agent.
-
-```
-Input:
-  entry_id: string
-  purpose: string
-  file_path: string         # allowed config file paths only
-  env_key: string           # variable name to set
-```
-
-### `vault_rsync`
-
-Sync a local directory to a remote host using rsync over SSH, with the SSH key fetched from the vault (temp keyfile deleted immediately after transfer).
-
-### `vault_entry_forget`
-
-Discard a local reference. No-op on the server.
-
-```
-Input: { entry_id: string }
-Output: "Reference [id] discarded from local context."
-```
-
-## Credentials
-
-The MCP server holds no keys of its own and takes none on the command line. On the
-first tool call it resolves them like this:
-
-1. `WUNDERVAULT_AGENT_NAME` (required) names which registered agent this process is.
-2. The agent token is read from `WUNDERVAULT_AGENT_TOKEN`, or from
-   `~/.wundervault/agents/<name>.token`.
-3. That token is presented to the local daemon over
-   `~/.wundervault/agents/<name>.sock`, which returns the API key, the encryption
-   key, and the vault URL.
-
-If the daemon is not running, tool calls fail with instructions rather than falling
-back to a weaker source. Run `onboard.py` to register an agent and start it.
-
-## CLI Options
-
-```
-wundervault-mcp [options]
-
-  --url <url>   API base URL override (default: supplied by the daemon)
-  --help        Show help
-```
-
-There are no `--api-key`, `--enc-key`, or `--credentials` flags. Unknown options are
-rejected.
-
-## Agent wallets (x402)
-
-An [x402](https://x402.org) payment is just a signature, and a wallet key is a
-vault secret like any other. Store the key at **tier 2**, have the agent sign the
-payment payload through `vault_exec`, and the key is injected into a local signing
-subprocess — it never enters the model context, and every use needs the owner's
-approval first (the agent's denied call carries a request id; approval is scoped
-to that agent + secret, once or for a 15/60-minute window). We ran this
-end-to-end on Base Sepolia — the verified run is written up at
-[wundervault.com/agent-wallets](https://wundervault.com/agent-wallets).
-Payment-specific policy (spend caps, payee allowlists) is not built yet:
-compatible, not productized.
+No arguments. Each key's id, name, tier and kind (web service, SSH, wallet or signing key),
+and any operations the owner defined. Never a value.
 
 ## Sandbox / demo mode
 
-Set `WUNDERVAULT_MOCK=1` to run the server **without** a `wundervault-agent`
-daemon or any credentials. In this mode every tool call returns a representative
-response clearly labelled `[DEMO MODE]` instead of contacting the vault — **no
-real secret is ever involved**. This exists so you can poke at the tool surface
-without an account, and so MCP directory scanners and CI
-(e.g. [Glama](https://glama.ai)) can start the server, exercise each tool, and
-validate the build with no live vault. It is **off by default** and is never
-enabled in production.
+Set `WUNDERVAULT_MOCK=1` to run the server **without** a broker or any credentials. Every
+tool call then returns a representative response clearly labelled `[DEMO MODE]` instead of
+contacting the vault — **no real key is ever involved**. It exists so you can try the tool
+surface without an account, and so MCP directory scanners and CI (e.g.
+[Glama](https://glama.ai)) can start the server and exercise each tool. It is **off by
+default**.
 
 ```jsonc
 "env": { "WUNDERVAULT_MOCK": "1" }   // demo/CI only — returns fake, labelled output
@@ -235,15 +285,19 @@ git clone https://github.com/wundervault/wundervault-mcp.git
 cd wundervault-mcp
 npm install
 npm run build   # compiles TypeScript to dist/
-npm test        # run the test suite
+npm test
 ```
 
 ## Stay updated
 
-Releases, security notes and product posts go out on X as [@wundervault1](https://x.com/wundervault1). Full release history: [wundervault.com/changelog](https://wundervault.com/changelog).
+Releases and security notes go out on X as [@wundervault1](https://x.com/wundervault1).
+Full release history: [wundervault.com/changelog](https://wundervault.com/changelog).
 
 ## License
 
-Licensed under the **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`). See [LICENSE](LICENSE).
+Licensed under the **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`).
+See [LICENSE](LICENSE).
 
-Wundervault is **open-core**: this MCP server and the client are open source; the hosted service at [wundervault.com](https://wundervault.com) is a commercial offering. For commercial or hosting inquiries, get in touch via [wundervault.com/contact](https://wundervault.com/contact).
+Wundervault is **open-core**: this MCP server, the broker and the browser crypto are open
+source; the hosted service at [wundervault.com](https://wundervault.com) is a commercial
+offering. For commercial or hosting inquiries: [wundervault.com/contact](https://wundervault.com/contact).

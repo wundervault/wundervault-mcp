@@ -4,7 +4,7 @@ How to configure `@wundervault/mcp-server` for different AI agent environments.
 
 ## Claude Code
 
-Add to `~/.claude/desktop_config.json` (or your Claude Code MCP config):
+Run `claude mcp add`, or add this to `~/.claude.json` (all projects) or a project's `.mcp.json`:
 
 ```json
 {
@@ -39,22 +39,20 @@ Add to `.cursor/mcp.json` in your project (or `~/.cursor/mcp.json` globally):
 ## OpenAI Agents SDK
 
 ```python
-from openai_agents import Agent
-from openai_agents.mcp import MCPServerStdio
+import asyncio
+from agents import Agent, Runner
+from agents.mcp import MCPServerStdio
 
-wundervault_server = MCPServerStdio(
-    params={
+async def main():
+    async with MCPServerStdio(params={
         "command": "wundervault-mcp",
-        "env": {
-            "WUNDERVAULT_AGENT_NAME": "<agent-name>",
-        },
-    }
-)
+        "env": {"WUNDERVAULT_AGENT_NAME": "<agent-name>"},
+    }) as wundervault:
+        agent = Agent(name="my-agent", mcp_servers=[wundervault])
+        result = await Runner.run(agent, "List my vault keys.")
+        print(result.final_output)
 
-agent = Agent(
-    name="my-agent",
-    mcp_servers=[wundervault_server],
-)
+asyncio.run(main())
 ```
 
 ## Generic (npx, no global install)
@@ -64,7 +62,7 @@ agent = Agent(
   "mcpServers": {
     "wundervault": {
       "command": "npx",
-      "args": ["@wundervault/mcp-server"],
+      "args": ["-y", "--package=@wundervault/mcp-server@2", "wundervault-mcp"],
       "env": {
         "WUNDERVAULT_AGENT_NAME": "<agent-name>"
       }
@@ -75,42 +73,36 @@ agent = Agent(
 
 ## Where the keys actually come from
 
-There is no credentials file and no key in your MCP config. `onboard.py` registers the
-agent and the local `wundervault-agent` broker holds the API key and the encryption key.
-The MCP server talks to it over a unix socket — `/run/wundervault/<name>.sock` on Linux,
-`/var/lib/wundervault/run/<name>.sock` on macOS, and `~/.wundervault/agents/<name>.sock`
-where no broker account has been installed — authenticated with the agent token in
-`~/.wundervault/agents/<name>.token`. The token stays in your own home on purpose: it is
-the agent's identity, and moving it into the broker's directory would make it unreadable
-by the only party that needs it.
+There is no credentials file and no key in your MCP config. `wundervault-agent --enrol`
+(with the claim code from the owner's vault) enrols the agent with the broker, and the
+broker, running under its own account, holds the agent's keys. The MCP server talks to it
+over a local socket (`/run/wundervault/<name>.sock` on Linux,
+`/var/lib/wundervault/run/<name>.sock` on macOS, a loopback port on Windows), authenticated
+with the agent token in `~/.wundervault/agents/<name>.token`. The token stays in your own
+home on purpose: it is the agent's identity, and moving it into the broker's directory would
+make it unreadable by the only party that needs it.
 
 **The socket serves operations, not credentials.** The broker does not hand the keys over:
-it lists entries, performs a brokered HTTP call, answers a signature request. What crosses
-the socket is the result, not the secret.
+it lists entries, makes a web call, signs an SSH login, a payment or a signature. What
+crosses the socket is the result, not the key.
 
 All your config has to say is which agent this is.
 
-## What the server checks, and what it does not
+## What the server checks
 
-On Linux, once you have run `sudo wundervault-agent --pair` and repaired the agent onto
-that broker, every request to Wundervault is signed with a private key that lives in
-`/var/lib/wundervault` — a directory the agents cannot read. The server refuses an
-unsigned request from an agent bonded to a broker, and refuses to hand over a
-broker-mode secret to anyone who did not sign. A copy of the credential on its own stops
-being enough.
+Every request a broker makes to Wundervault is signed with a private key that lives in the
+broker's own directory, which the agents cannot read; the owner confirmed its fingerprint
+when pairing. The server refuses an unsigned request from an agent enrolled on a broker, and
+serves a key's ciphertext only to the broker that signed for it. A copy of the credential on
+its own is not enough.
 
-**An agent with no paired broker is authenticated on its credential alone**, exactly as
-before. That is every agent until it has been repaired onto a broker — installing the
-broker does not migrate anything by itself. For those, a broker-mode secret is refused
-outright — there is nothing on that machine that could use one — and everything still in
-the legacy mode is served to whoever holds the credential.
+Version 2 is brokered only. The MCP server refuses to run without a broker, and version 1's
+hand-over mode, where the agent was given the key, is gone from the server too.
 
-**Windows has a broker of its own as of phase 8**, by the same mechanism and with the same
-claim as Linux and macOS: a separate account, and a directory the agents cannot open. The
-boundary there is an NTFS access list rather than a file mode, an administrator is inside
-it exactly as root is on Linux, and the install is not finished until
-`packaging\verify-windows.ps1` exits 0 — it proves the boundary from a throwaway
-unprivileged account rather than reading the permissions back.
+On all three platforms the broker has an account of its own. On Windows the boundary is an
+NTFS access list rather than a file mode, an elevated administrator is inside it exactly as
+root is on Linux, and `packaging\verify-windows.ps1` proves it from a throwaway unprivileged
+account rather than reading the permissions back.
 
 ## Environment Variables Reference
 
@@ -122,5 +114,6 @@ unprivileged account rather than reading the permissions back.
 
 ## CLI Options
 
-`--url <url>` overrides the API base URL; `--help` prints usage. There are no
-`--api-key`, `--enc-key`, or `--credentials` flags — unknown options are rejected.
+`--help` prints usage. `--url` is accepted and ignored: the vault's address comes from the
+broker, so a config cannot point the agent somewhere else. There are no `--api-key`,
+`--enc-key`, or `--credentials` flags — unknown options are rejected.

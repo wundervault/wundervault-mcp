@@ -65,14 +65,15 @@ Secure vault tool provider for AI agents via MCP protocol.
 Usage: wundervault-mcp [options]
 
 Options:
-  --url <url>      API base URL override (default: from daemon)
+  --url <url>      Ignored: the vault's address comes from the broker
   --destinations   Write a local HTML view of where this machine's agents have sent
                    secrets, and print its path. Never leaves this machine.
   --help           Show this help
 
-Credentials are loaded from the wundervault-agent daemon.
+Keys stay with the broker (wundervault-agent); no tool returns one.
 Set WUNDERVAULT_AGENT_NAME in your MCP config to identify this agent.
-Run onboard.py to register an agent with the daemon.
+Enrol an agent with the broker: wundervault-agent --enrol (claim code from your vault).
+Setup: https://wundervault.com/quickstart
 `);
   process.exit(0);
 }

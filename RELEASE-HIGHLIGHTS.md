@@ -95,9 +95,10 @@ replace at their providers, and which ones are handed over in full every time th
 
 ## Not yet true — do NOT put these on a page
 
-- **Argon2id.** Vendored, verified against the reference implementation, and switched OFF.
-  `NEW_ACCOUNT_KDF` still says PBKDF2, so PBKDF2 is what runs. Do not claim it until the
-  parameters have been measured on a real phone and the constant has been flipped.
+- **Argon2id for every vault.** Switched ON in the 1.0 build (2026-10-02) for new vaults, and
+  existing vaults move to it on their next unlock. A vault created where WebAssembly is off
+  (iPhone Lockdown Mode) falls back to PBKDF2, so "every vault" is not true; "new vaults use
+  Argon2id" is. (This line used to say it was off.)
 - **"We rotated your exposed credentials."** We cannot. We can only name them; replacing them
   at the provider is the owner's action and we have no way to verify it happened.
 - **"Sealed" on a machine with no TPM.** Where there is no TPM the key is sealed to systemd's

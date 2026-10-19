@@ -1,90 +1,123 @@
 # Wundervault MCP Server — AI Agent Installation Guide
 
-This guide is written for AI agents (Cline, Claude Code, Cursor, etc.) installing the Wundervault MCP server on behalf of a user.
+This guide is written for AI agents (Claude Code, Codex, Cline, Cursor, OpenClaw, etc.)
+installing the Wundervault MCP server on behalf of a user.
 
-Wundervault is a zero-knowledge secrets vault: the user's secrets are encrypted client-side, decrypted only by a local process, and **plaintext is never returned into the model context**. The zero-knowledge claim is independently verifiable: https://wundervault.com/verify
+Wundervault lets you use the user's API keys, SSH keys, wallets and signing keys **without
+ever holding them**. A broker on the user's computer, running under its own operating-system
+account, keeps the keys and makes each call for you; you get the result with the key removed.
+No tool returns a key's value. The encryption claim is independently verifiable:
+https://wundervault.com/verify
+
+**Some of this needs the human.** Installing the broker is an administrator command, and
+pairing and adding an agent need the user's approval in their vault. That is by design: you
+cannot enrol yourself. Tell the user what to run; don't try to work around it.
 
 ## Prerequisites
 
 - Node.js 20 or newer (`node --version`)
 - npm
+- The user, with administrator rights on this computer, for steps 2 and 3
 
-## Step 1 — Install the server
+## Step 1 — Install the package
 
 ```bash
-npm install -g @wundervault/mcp-server
+npm install -g @wundervault/mcp-server@2
 ```
 
-This provides the `wundervault-mcp` binary. Verify the install:
+This provides two commands: `wundervault-mcp` (the MCP server you talk to) and
+`wundervault-agent` (the broker). Check the install:
 
 ```bash
 npm ls -g @wundervault/mcp-server
 ```
 
-## Step 2 — Get credentials (requires the human, once)
+## Step 2 — The user installs the broker (administrator, once per computer)
 
-The server starts and lists its tools with no configuration, but real vault access needs an agent identity:
+Linux:
 
-1. The user creates a free account at https://wundervault.com and clicks **NEW AGENT** on the dashboard.
-2. The dashboard gives the user what their machine needs. **Which of two things it is matters to you:**
-   - a **claim code**, where the machine runs a paired secret broker. It opens nothing on
-     its own. The broker fetches and decrypts the credentials inside its own account, and
-     they never enter your process.
-   - a **one-time setup link**, otherwise. This one *is* a credential: it decrypts to the
-     agent's keys, which unwrap the vault key, which opens every secret in the vault.
-3. **Do not ask the user to put a setup link in a command, and do not accept one if they
-   offer.** A command line is readable by every other process on the machine, so passing
-   it that way publishes the one credential this whole design assumes you cannot obtain.
-   The installer refuses a link given as an argument for that reason and reads it from a
-   prompt instead. The user runs the command; the user pastes the link at the prompt. You
-   do not need to see it, and you should say so rather than accepting it.
-4. The command installs/updates this package, registers the credentials with the local
-   broker, and **prints the exact MCP config snippet for your client** — use that snippet
-   in Step 3.
+```bash
+sudo sh "$(npm root -g)/@wundervault/mcp-server/packaging/install-daemon.sh"
+```
 
-Full flow documentation: https://wundervault.com/quickstart
+Windows and macOS (both in beta) have their own installers:
+https://wundervault.com/install. The installer downloads nothing and is short enough to read
+first; reading it before the user runs it is a good idea.
 
-## Step 3 — Configure the MCP client
+## Step 3 — The user pairs the broker with their account
 
-For Cline, add the server to `cline_mcp_settings.json` (use the snippet printed in Step 2; the general shape is):
+```bash
+sudo wundervault-agent --pair
+```
+
+The user checks that the fingerprint it shows matches the one in their vault at
+https://wundervault.com, then confirms there. They need a free account first.
+
+## Step 4 — The user adds you as an agent
+
+In their vault, the user adds an agent and chooses this computer. They get a **claim code**.
+Then this command, entered by the user at its prompt:
+
+```bash
+wundervault-agent --enrol
+```
+
+The claim code opens nothing on its own: the broker fetches and decrypts your credentials
+inside its own account, and they never enter your process.
+
+Then add the server to your MCP client's configuration (the agent name is the one the user
+chose in step 4):
 
 ```json
 {
   "mcpServers": {
     "wundervault": {
-      "command": "wundervault-mcp"
+      "command": "wundervault-mcp",
+      "env": { "WUNDERVAULT_AGENT_NAME": "<agent name>" }
     }
   }
 }
 ```
 
-Credentials can also be supplied explicitly — see "Credential Loading Priority" in README.md (CLI flags, environment variables, or `--credentials <file>`).
+The configuration holds no keys. Shapes for other clients: README-AGENTS.md.
 
-## Step 4 — Verify
+## Step 5 — Verify
 
-After the client connects, you should see 6 tools: `vault_entries_list`, `vault_entry_get`, `vault_entry_forget`, `vault_entry_inject_env`, `vault_exec`, `vault_rsync`.
+After your client connects you should see 5 tools: `vault_entries_list`, `vault_call`,
+`vault_ssh_exec`, `vault_pay`, `vault_sign`.
 
-Call `vault_entries_list`. With credentials configured it returns the user's entries; without credentials it returns a clear "Vault unavailable" message (this is expected, not a crash).
+Call `vault_entries_list`. With the broker running and you enrolled, it returns the keys the
+user has given you. Otherwise it returns a clear "Vault unavailable" message that says what
+is missing (this is expected, not a crash).
 
 ## Demo mode (no account needed)
 
-To exercise the tools without any Wundervault account, set `WUNDERVAULT_MOCK=1` in the server's environment. All 6 tools return canned `[DEMO MODE]` responses. Never use demo mode for real secrets.
+To try the tools without an account, set `WUNDERVAULT_MOCK=1` in the server's environment.
+All 5 tools return canned `[DEMO MODE]` responses. Never use demo mode for real keys.
 
 ## Troubleshooting
 
-- **"Vault unavailable: WUNDERVAULT_AGENT_NAME is not set"** — credentials are not configured; re-run the dashboard setup command (Step 2).
-- **Server won't start for a second session** — Wundervault allows one MCP server instance per agent identity (lock file at `~/.wundervault/mcp-<Agent>.lock`). Close the older session; the lock releases automatically.
-- **Node version errors** — upgrade to Node 20+.
+- **"Vault unavailable: WUNDERVAULT_AGENT_NAME is not set"** — add the `env` block in step 4.
+- **"wundervault-agent is not running for agent '…'"** — the broker isn't installed on this
+  computer (step 2), or this agent isn't enrolled (step 4).
+- **"FATAL: this MCP is v… but the server requires >= v…"** — update:
+  `npm install -g @wundervault/mcp-server@2`.
+- **Server won't start for a second session** — one MCP server runs per agent name on a
+  computer. Close the older session.
+- **Coming from version 1** (`vault_exec`, `vault_entry_get`, `vault_entry_inject_env`,
+  `vault_rsync`)? Those tools are gone. The user moves each agent:
+  https://wundervault.com/install#upgrade-to-2
 
-## Security notes for agents
+## How to behave with Wundervault
 
-- You will never receive plaintext secrets. Tools inject secrets into subprocesses or files and return only confirmations.
-- Do not attempt shell escape patterns (`$()`, backticks, `bash -c`, `sh -c`, `eval`) in `vault_exec` commands — they are rejected before decryption.
-- Treat a one-time setup URL as a live credential, not as a token to be handled carefully:
-  it decrypts to the agent's keys and through them to every secret in the vault. Never
-  accept one in a command, never log it, never store it, never repeat it back. Where the
-  machine has a paired broker you will be given a claim code instead, which opens nothing.
-- On Linux and macOS the credentials are held by a broker running as its own account, in a
-  directory your account cannot open. Its socket serves **operations, not credentials** —
-  you can ask it to use a secret; you cannot ask it for one. On Windows it runs as the
-  same account you do, and says so at every start.
+- You will never receive a key's value. Use `vault_call` for web services, `vault_ssh_exec`
+  for servers, `vault_pay` for x402 payments and `vault_sign` for signatures, and let the
+  broker do the work.
+- State a real `purpose`. It is kept in the broker's log on the user's computer, and the user
+  sees it when they are asked to approve.
+- If a call is waiting for approval, wait, or call again with the same request to keep
+  waiting. Calling a different destination asks the user again.
+- Never ask the user to paste a key, a claim code or a setup link into your chat, and don't
+  accept one if they offer. They enter the claim code at the broker's prompt themselves.
+- Full tool reference: https://wundervault.com/mcp · Every known limit:
+  https://wundervault.com/limitations
