@@ -148,8 +148,10 @@ export class AgentVaultAPI {
     const resp = await fetch(`${this.baseUrl}/agent/vault/operation-check`, {
       method: 'POST',
       headers: {
+        // headers() already says Content-Type. A second, differently-cased copy here made
+        // Node send "application/json, application/json", which FastAPI does not read as
+        // JSON: every operation check answered 422 (1.0 rehearsal, 2026-10-20).
         ...this.signedHeaders('POST', `${this.baseUrl}/agent/vault/operation-check`, payload),
-        'content-type': 'application/json',
       },
       body: payload,
       signal: AbortSignal.timeout(TIMEOUT),
@@ -171,7 +173,7 @@ export class AgentVaultAPI {
     const payload = JSON.stringify(body);
     const resp = await fetch(url, {
       method: 'POST',
-      headers: { ...this.signedHeaders('POST', url, payload), 'content-type': 'application/json' },
+      headers: this.signedHeaders('POST', url, payload),   // one Content-Type, from headers()
       body: payload,
       signal: AbortSignal.timeout(TIMEOUT),
     });
