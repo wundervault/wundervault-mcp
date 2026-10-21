@@ -140,6 +140,33 @@ if [ -d "$STATE_DIR" ]; then
     else
       bad "this user CANNOT traverse ${RUN_DIR}" "its agents cannot reach their sockets"
     fi
+    # Each SSH session's socket and id.pub live in ${RUN_DIR}/ssh/<id>/. Before the fix the
+    # broker made ssh/ under Umask 0077 as 0700, and every vault_ssh_exec failed with
+    # "Permission denied" on id.pub (owner's Mac, 2026-10-21). Absent until the first call.
+    if [ -d "${RUN_DIR}/ssh" ]; then
+      S_MODE=$(stat -f '%Lp' "${RUN_DIR}/ssh")
+      case "$S_MODE" in
+        711) ok "ssh session dir is 711 — agents can reach id.pub and the socket; session ids are not listable" ;;
+        755|775|777) warn "ssh session dir is ${S_MODE}" "SSH works, but any local account can list the live session ids; the next SSH call from a fixed broker sets 711" ;;
+        *[13579]) warn "ssh session dir is ${S_MODE}, not 711" "agents can pass through; the next SSH call from a fixed broker sets 711" ;;
+        *) bad "ssh session dir is ${S_MODE}" "other accounts cannot pass through, so every SSH call fails; the next call from a fixed broker repairs it" ;;
+      esac
+      # The mode is not the whole answer on macOS: an ACL can deny what the mode allows
+      # (review round 2, B1). So also ask whether the owner's account can actually get in.
+      if [ -n "${SUDO_USER:-}" ]; then
+        if sudo -u "$SUDO_USER" test -x "${RUN_DIR}/ssh" 2>/dev/null; then
+          ok "the invoking user can pass through ${RUN_DIR}/ssh"
+        else
+          bad "the invoking user CANNOT pass through ${RUN_DIR}/ssh" "check for an ACL: ls -led ${RUN_DIR}/ssh"
+        fi
+      elif [ -x "${RUN_DIR}/ssh" ]; then
+        ok "this user can pass through ${RUN_DIR}/ssh"
+      else
+        bad "this user CANNOT pass through ${RUN_DIR}/ssh" "every SSH call fails; check for an ACL: ls -led ${RUN_DIR}/ssh"
+      fi
+    else
+      skip "no ${RUN_DIR}/ssh yet" "made on the first SSH call"
+    fi
   else
     bad "no ${RUN_DIR}" "the installer creates it; the daemon cannot, ${BASE_DIR} being root-made"
   fi

@@ -599,7 +599,21 @@ export class BrokerOps {
     }
 
     const sessionId = randomId();
-    const dir = path.join(runtimeDir(), 'ssh', sessionId);
+    // The PARENT too, every time. A recursive mkdir creates `ssh/` with its mode masked by
+    // umask, and only the leaf is chmodded below: under the macOS LaunchDaemon's Umask 0077
+    // `ssh/` came out 0700, so the agent could reach neither the socket nor id.pub ("SSH
+    // couldn't read the broker's id.pub file: Permission denied", the owner's Mac,
+    // 2026-10-21). The same trap start() documents for the runtime directory. chmod on an
+    // existing directory also repairs a Mac that already has a 0700 `ssh/`.
+    //
+    // 0711, not 0755: other uids may pass through to a session they were told the id of, but
+    // may not LIST the live session ids. At 0755 any local account could read the ids and
+    // connect to those 0666 signing sockets, so "the path is the unguessable part" below was
+    // only true of this directory once it stopped being readable (review round 1, B1).
+    const sshRoot = path.join(runtimeDir(), 'ssh');
+    fs.mkdirSync(sshRoot, { recursive: true, mode: 0o711 });
+    fs.chmodSync(sshRoot, 0o711);
+    const dir = path.join(sshRoot, sessionId);
     fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
     // 0755 on the directory and 0666 on the socket, for the same reason every broker
     // socket is world-connectable: the broker is a different uid from the agent, so a
