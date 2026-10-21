@@ -11,6 +11,7 @@ import {
   credentialIsFree,
   whoHolds,
   releaseCredential,
+  startReclaim,
   describeHolder,
   agentName,
   type Holder,
@@ -96,12 +97,13 @@ async function serveHeldNotice(holder: Holder): Promise<void> {
   const agent = agentName() || '(unnamed agent)';
   const detail =
     `The wundervault credential for "${agent}" is already checked out by another ` +
-    `MCP instance (${describeHolder(holder)}).\n\n` +
-    `The vault permits one connected agent per credential at a time, so this ` +
-    `session has no vault tools. This is the vault enforcing that rule — not a ` +
-    `crash, and not a broken install.\n\n` +
-    `To take the credential: close the session that owns the process above, then ` +
-    `reconnect this MCP server (/mcp in Claude Code).`;
+    `MCP instance (${describeHolder(holder)}) that cannot share it.\n\n` +
+    `Copies of one agent share its connection when they are all version 2 or later; ` +
+    `this holder is an older copy, or a different agent whose name maps to the same ` +
+    `address. So this session has no vault tools. This is the vault enforcing that ` +
+    `rule — not a crash, and not a broken install.\n\n` +
+    `To fix it: update or close the copy that owns the process above, then reconnect ` +
+    `this MCP server (/mcp in Claude Code).`;
 
   console.error(`[wundervault-mcp] ${detail.replace(/\n+/g, ' ')}`);
 
@@ -158,13 +160,23 @@ async function serveHeldNotice(holder: Holder): Promise<void> {
 
 // ── Run ──────────────────────────────────────────────────────────────────────
 
-const claim = await acquireCredential(VERSION);
+const claim = await acquireCredential(VERSION, { share: true });
 if (!claim.ok) {
   if (claim.reason) console.error(`[wundervault-mcp] ${claim.reason}`);
   // Bound nothing, so this process holds nothing: it installs no release
   // handlers and can never remove the real holder's lock file.
   await serveHeldNotice(claim.holder!);
 } else {
+  if (claim.role === 'shared') {
+    // Another 2.0 copy of this agent holds the address (an MCP host that starts one process
+    // per session, or two hosts). Serve beside it, and take the claim over if it exits, so
+    // older copies keep standing down (SPEC-2.0-shared-agent S5, S6).
+    console.error(`[wundervault-mcp] sharing "${agentName()}" with the copy already running ` +
+      `(${describeHolder(claim.holder!)})`);
+    startReclaim(VERSION, () => {
+      console.error(`[wundervault-mcp] the other copy exited; this one now holds "${agentName()}"`);
+    });
+  }
   await serveVault();
 }
 

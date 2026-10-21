@@ -226,7 +226,8 @@ ABSTRACT_ONLY('holder identity', () => {
   it('never puts a secret or a parent command line in the banner', async () => {
     await mustAcquire();
     const who = await lock.whoHolds();
-    expect(Object.keys(who).sort()).toEqual(['agent', 'pid', 'since', 'source']);
+    // `shares` is the one field added since (SPEC-2.0-shared-agent S1): a yes/no, no secret.
+    expect(Object.keys(who).sort()).toEqual(['agent', 'pid', 'shares', 'since', 'source']);
   });
 });
 

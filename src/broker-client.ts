@@ -72,7 +72,7 @@ export class BrokerClient {
    * call costs a unix-socket connect and removes a whole class of "it worked until it
    * had been idle for two minutes" bug.
    */
-  private async rpc(ep: Endpoint, payload: Record<string, unknown>): Promise<BrokerReply> {
+  private async rpc(ep: Endpoint, payload: Record<string, unknown>, token: string): Promise<BrokerReply> {
     // CONNECT FIRST, AND ON WINDOWS DO NOT SPEAK UNTIL THE FAR END HAS PROVED ITSELF.
     // connectToEndpoint resolves only after the hello is verified, so by the time this
     // function writes a token it is writing it to something holding the broker's private
@@ -94,7 +94,7 @@ export class BrokerClient {
           `The secret broker did not answer within ${Math.round(RPC_TIMEOUT_MS / 1000)}s.`))),
         RPC_TIMEOUT_MS,
       );
-      socket.write(JSON.stringify({ token: this.token, ...payload }) + '\n');
+      socket.write(JSON.stringify({ token, ...payload }) + '\n');
       socket.on('data', (d) => {
         buf += d.toString();
         // A reply is bounded so a broken or hostile socket cannot grow this without end.
@@ -127,8 +127,46 @@ export class BrokerClient {
    * migration has to keep working — and it ANNOUNCES itself, because that install has the
    * old threat model while the release notes describe the new one.
    */
+  /**
+   * Read the token file again; true if it now holds a different token.
+   *
+   * A re-enrolment (after a Repair) replaces the token while this process runs. It read the
+   * token once, at start, so every chat already open kept sending the old one and got
+   * 'unauthorized' until restarted. Copies of one agent now share, so more of them live long
+   * (SPEC-2.0-shared-agent, round 2, B2). An explicit WUNDERVAULT_AGENT_TOKEN is never
+   * second-guessed.
+   */
+  private reloadToken(): boolean {
+    if (process.env.WUNDERVAULT_AGENT_TOKEN) return false;
+    const tokenPath = agentTokenPath(this.agentName);
+    let fresh = '';
+    try { fresh = existsSync(tokenPath) ? readFileSync(tokenPath, 'utf8').trim() : ''; } catch { return false; }
+    if (!fresh || fresh === this.token) return false;
+    this.token = fresh;
+    return true;
+  }
+
   async send(op: string, payload: Record<string, unknown> = {}): Promise<BrokerReply> {
-    if (!this.token) {
+    if (!this.token) this.reloadToken();   // enrolled after this process started
+    // The token THIS request carries. Another call in flight may reload the shared one first;
+    // comparing against what was actually sent keeps that call's retry (round 3, F1).
+    const sent = this.token;
+    const reply = await this.sendOnce(op, payload, sent);
+    if (reply?.error !== 'unauthorized') return reply;
+    this.reloadToken();
+    // One retry, and only with a token different from the one refused: a wrong token is
+    // never sent twice.
+    if (this.token && this.token !== sent) return this.sendOnce(op, payload, this.token);
+    if (process.env.WUNDERVAULT_AGENT_TOKEN) {
+      // Respected, never overridden, so say where it comes from (round 3, B3).
+      return { ...reply, error: 'unauthorized: this copy uses WUNDERVAULT_AGENT_TOKEN from its MCP settings; '
+        + 'after re-enrolling, update or remove it there' };
+    }
+    return reply;
+  }
+
+  private async sendOnce(op: string, payload: Record<string, unknown>, token: string): Promise<BrokerReply> {
+    if (!token) {
       throw new BrokerUnavailable(
         `No token for agent '${this.agentName}'. Expected ${agentTokenPath(this.agentName)} `
         + `or WUNDERVAULT_AGENT_TOKEN. Re-run enrolment: wundervault-agent --enrol`);
@@ -137,7 +175,7 @@ export class BrokerClient {
     for (const cand of endpointCandidates(this.agentName)) {
       if (!endpointExists(cand.ep)) continue;
       try {
-        const reply = await this.rpc(cand.ep, { op, ...payload });
+        const reply = await this.rpc(cand.ep, { op, ...payload }, token);
         if (cand.legacy && !this.warnedLegacy) {
           this.warnedLegacy = true;
           process.stderr.write(

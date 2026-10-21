@@ -83,10 +83,14 @@ export interface Holder {
   agent: string | null;
   /** How we learned this: the holder itself, or the compatibility file. */
   source: 'holder' | 'lock-file' | 'unknown';
+  /** The holder said it lets other copies of the same agent share (SPEC-2.0-shared-agent S1). */
+  shares: boolean;
 }
 
 export interface Claim {
   ok: boolean;
+  /** 'holder' bound the address; 'shared' serves beside a holder that allows it (S2). */
+  role?: 'holder' | 'shared';
   holder?: Holder;
   /** Set when we refused because we could not establish a claim safely. */
   reason?: string;
@@ -128,6 +132,11 @@ export function lockFilePath(): string {
   // this design correctly but uselessly reports as "cannot claim".
   const name = agent ? `mcp-${slug().slice(0, 200)}.lock` : 'mcp.lock';
   return path.join(os.homedir(), '.wundervault', name);
+}
+
+/** Which account a holder runs under, as a short digest: says "same account or not", nothing more. */
+function accountTag(): string {
+  return createHash('sha256').update(`wundervault-mcp-account:${principalId()}`).digest('hex').slice(0, 12);
 }
 
 /**
@@ -182,6 +191,10 @@ function addressPort(): number {
 
 /** Exported for the test that asserts the range over a sample of names, not one name. */
 export { addressPort as _addressPortForTests };
+/** Exported so a test can write a same-account banner for a holder it stands up. */
+export function _accountTagForTests(): string { return accountTag(); }
+/** Exported so a test can stand up a holder of another build on this agent's address. */
+export function _listenOptionsForTests(): net.ListenOptions { return listenOptions(); }
 
 let held: net.Server | null = null;
 let identityLine = '';
@@ -228,7 +241,7 @@ function closed(server: net.Server): Promise<void> {
 }
 
 /** Ask whoever holds the address who they are. */
-function askHolder(): Promise<Holder | null> {
+function askHolder(timeoutMs = 1000): Promise<Holder | null> {
   return new Promise((resolve) => {
     let buf = '';
     let settled = false;
@@ -248,7 +261,10 @@ function askHolder(): Promise<Holder | null> {
         try {
           const o = JSON.parse(buf.slice(0, buf.indexOf('\n')));
           if (o && o.protocol === 'wundervault-mcp-holder') {
-            done({ pid: o.pid ?? null, since: o.since ?? null, agent: o.agent ?? null, source: 'holder' });
+            // `shares` only counts from a holder under THIS account: the port range is
+            // machine-global, so two accounts' same-name agents can meet on one address (round 1, B2).
+            done({ pid: o.pid ?? null, since: o.since ?? null, agent: o.agent ?? null, source: 'holder',
+                   shares: o.shares === 1 && o.account === accountTag() });
             return;
           }
         } catch { /* not ours */ }
@@ -257,7 +273,7 @@ function askHolder(): Promise<Holder | null> {
     });
     sock.on('error', () => done(null));
     sock.on('close', () => done(null));
-    setTimeout(() => done(null), 1000).unref();
+    setTimeout(() => done(null), timeoutMs).unref();
   });
 }
 
@@ -372,8 +388,8 @@ function pidAlive(pid: number): boolean {
 
 function holderFromFile(): Holder {
   const compat = readCompatFile();
-  if (!compat) return { pid: null, since: null, agent: null, source: 'unknown' };
-  return { pid: compat.pid, since: compat.since, agent: agentName() || null, source: 'lock-file' };
+  if (!compat) return { pid: null, since: null, agent: null, source: 'unknown', shares: false };
+  return { pid: compat.pid, since: compat.since, agent: agentName() || null, source: 'lock-file', shares: false };
 }
 
 /**
@@ -412,15 +428,75 @@ export async function whoHolds(): Promise<Holder> {
   return holderFromFile();
 }
 
-export async function acquireCredential(version: string): Promise<Claim> {
+/**
+ * Ask who holds the address, and ask again for a while if nobody answers yet.
+ *
+ * A holder binds first and starts answering a few steps later (legacy check, compatibility
+ * file, banner). Two copies started in the same second (the owner's Mac, 2026-10-21: OpenClaw's
+ * gateway and its Codex runtime each start one) used to meet in that gap, get no answer, and
+ * report "a stranger": a refusal on a machine where nothing was wrong (S4).
+ */
+async function askHolderPatiently(): Promise<{ who: Holder | null; freed: boolean }> {
+  // ONE deadline for the whole thing, answers and pauses included: a silent occupant is
+  // refused in about 1.5 s, not six full timeouts later (round 1, F2).
+  const deadline = Date.now() + 1500;
+  for (;;) {
+    const left = deadline - Date.now();
+    const who = await askHolder(Math.max(50, Math.min(500, left)));
+    if (who) return { who, freed: false };
+    // It went away while we asked: the address is free, which is not a stranger (round 1, F1).
+    // Checked after EVERY unanswered attempt, the last one included (round 2, F1).
+    if ((await tryBindProbe()) === 'free') return { who: null, freed: true };
+    if (deadline - Date.now() <= 150) return { who: null, freed: false };
+    await new Promise((r) => setTimeout(r, 150));
+  }
+}
+
+/** Is the address still taken? Binds and closes at once if it is free. */
+async function tryBindProbe(): Promise<'free' | 'taken'> {
+  const r = await tryBind();
+  if (r.status === 'bound') { await closed(r.server); return 'free'; }
+  return 'taken';
+}
+
+export async function acquireCredential(version: string, opts: { share?: boolean } = {}): Promise<Claim> {
+  // Two tries: the second only when the holder left while we were asking who it was, so the
+  // address is free and an ordinary claim (legacy and file checks included) is the answer (F1).
+  for (let attempt = 0; ; attempt++) {
+    const r = await acquireOnce(version, opts);
+    if (r !== 'freed') return r;
+    if (attempt >= 1) {
+      return { ok: false, holder: await whoHolds(),
+               reason: `${addressLabel()} kept changing hands while it was being claimed; reconnect to try again` };
+    }
+  }
+}
+
+async function acquireOnce(version: string, opts: { share?: boolean }): Promise<Claim | 'freed'> {
   const result = await tryBind();
   let bound: net.Server | null = null;
 
   if (result.status === 'bound') {
     bound = result.server;
+    // Answer at once, before the legacy check and the compatibility file: those can take
+    // seconds on a Mac (/bin/ps), and a copy starting meanwhile would hear nothing and call us
+    // a stranger (round 3, B1). If we stand down below, the address closes with us.
+    identityLine = JSON.stringify({
+      protocol: 'wundervault-mcp-holder',
+      pid: process.pid,
+      agent: agentName(),
+      since: new Date().toISOString(),
+      shares: 1,   // other 2.0 copies of this agent may serve beside us (S1)
+      account: accountTag(),   // ...under this same account only (round 1, B2)
+    }) + '\n';
+    bound.on('connection', (sock) => {
+      try { sock.end(identityLine); } catch { /* ignore */ }
+    });
   } else if (result.status === 'in-use') {
     // EADDRINUSE on OUR one address. Ask who is there.
-    const who = await askHolder();
+    const asked = await askHolderPatiently();
+    if (asked.freed) return 'freed';
+    const who = asked.who;
 
     // A wundervault holder for a DIFFERENT agent is a hash collision, not our holder.
     //
@@ -439,6 +515,15 @@ export async function acquireCredential(version: string): Promise<Claim> {
           `agent names can derive the same lock port; this is a collision, NOT your ` +
           `credential being in use. Set WUNDERVAULT_LOCK_PORT for one of them.`,
       };
+    }
+
+    // SHARING (SPEC-2.0-shared-agent S2). A 2.0 holder of this same agent holds nothing a
+    // second copy could take: the broker holds the credential, and each tool call is its own
+    // connection with the token this account can already read. So a copy that asks to share
+    // serves beside it. Only a holder that SAYS it can share, under exactly our agent name;
+    // anything older keeps the old meaning, because a 1.x holder holds a real credential.
+    if (who && opts.share && who.shares && who.agent === agentName() && agentName()) {
+      return { ok: true, role: 'shared', holder: who };
     }
 
     if (who) return { ok: false, holder: who };
@@ -484,23 +569,48 @@ export async function acquireCredential(version: string): Promise<Claim> {
     await closed(bound);
     return {
       ok: false,
-      holder: { pid: null, since: null, agent: null, source: 'unknown' },
+      holder: { pid: null, since: null, agent: null, source: 'unknown', shares: false },
       reason: `could not write ${lockFilePath()}, which older copies rely on`,
     };
   }
 
-  identityLine = JSON.stringify({
-    protocol: 'wundervault-mcp-holder',
-    pid: process.pid,
-    agent: agentName(),
-    since: new Date().toISOString(),
-  }) + '\n';
-  bound.on('connection', (sock) => {
-    try { sock.end(identityLine); } catch { /* ignore */ }
-  });
-
   held = bound;
-  return { ok: true };
+  return { ok: true, role: 'holder' };
+}
+
+/** Does this process hold the address right now? */
+export function isHolding(): boolean {
+  return held !== null;
+}
+
+/**
+ * For a sharing copy: take the claim when the holder has gone (S5), so a 2.0 copy keeps the
+ * address and the compatibility file while any of them runs. Every 5 s, not 15: the gap after
+ * a holder exits is a window in which an older copy sees no lock (round 1, B1). Each attempt is the ordinary
+ * exclusive claim. Resolves the timer so the caller can stop it; `onTaken` runs once.
+ */
+export function startReclaim(version: string, onTaken: () => void, everyMs = 5_000): NodeJS.Timeout {
+  let busy = false;
+  let warned = false;
+  const t = setInterval(async () => {
+    if (busy || held) return;
+    busy = true;
+    try {
+      const c = await acquireCredential(version);
+      if (c.ok && held) { clearInterval(t); onTaken(); return; }
+      // Refused by something other than a sharing copy (a 1.x copy that started in the gap,
+      // or an older 2.0 one). Vault tools keep working: in 2.0 the broker is the boundary, and
+      // a 1.x copy of this agent holds a credential the enrol that 2.0 needs already retired.
+      // Said once, and the attempts go on (SPEC S8, round 2, B1).
+      if (!c.ok && c.holder && !c.holder.shares && !warned) {
+        warned = true;
+        console.error(`[wundervault-mcp] an older copy now holds "${agentName()}" (${describeHolder(c.holder)}); ` +
+          `this copy keeps working through the broker. Update or close the older copy.`);
+      }
+    } catch { /* try again next time */ } finally { busy = false; }
+  }, everyMs);
+  t.unref();
+  return t;
 }
 
 /** Release only a lock file this exact incarnation wrote. */
