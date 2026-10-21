@@ -10,7 +10,7 @@
 # small enough to read in one sitting is the point: this is the script that asks for root,
 # so it should be the script you can audit in a minute.
 #
-#   sudo sh install-daemon-macos.sh [--exec /path/to/wundervault-agent] [--uninstall]
+#   sudo sh install-daemon-macos.sh [--exec /path/to/wundervault-agent] [--node /path/to/node] [--uninstall]
 #
 # Re-runnable. Running it twice leaves the same machine as running it once.
 
@@ -35,11 +35,13 @@ LABEL=com.wundervault.agent
 PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 EXEC=""
+NODE=""
 MODE=install
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --exec) EXEC="${2:?--exec needs a path}"; shift 2 ;;
+    --node) NODE="${2:?--node needs a path}"; shift 2 ;;
     --uninstall) MODE=uninstall; shift ;;
     -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -103,20 +105,23 @@ case "$EXEC" in /*) ;; *) EXEC=$(CDPATH= cd -- "$(dirname -- "$EXEC")" && pwd)/$
 # Resolve symlinks BEFORE the home-directory check. `npm install -g` into a user prefix
 # leaves ~/.local/bin/wundervault-agent pointing at ~/.local/lib/node_modules/..., so a
 # path that looks fine can still land the real file under /Users.
-if command -v readlink >/dev/null 2>&1 && readlink -f / >/dev/null 2>&1; then
-  REAL_EXEC=$(readlink -f "$EXEC")
-else
+real_path() {
+  if command -v readlink >/dev/null 2>&1 && readlink -f / >/dev/null 2>&1; then
+    readlink -f "$1"
+    return
+  fi
   # macOS readlink has no -f before Ventura. Follow it by hand.
-  REAL_EXEC="$EXEC"
-  while [ -L "$REAL_EXEC" ]; do
-    LINK=$(readlink "$REAL_EXEC")
+  R="$1"
+  while [ -L "$R" ]; do
+    LINK=$(readlink "$R")
     case "$LINK" in
-      /*) REAL_EXEC="$LINK" ;;
-      *)  REAL_EXEC="$(dirname -- "$REAL_EXEC")/$LINK" ;;
+      /*) R="$LINK" ;;
+      *)  R="$(dirname -- "$R")/$LINK" ;;
     esac
   done
-  REAL_EXEC=$(CDPATH= cd -- "$(dirname -- "$REAL_EXEC")" && pwd)/$(basename -- "$REAL_EXEC")
-fi
+  printf '%s\n' "$(CDPATH= cd -- "$(dirname -- "$R")" && pwd)/$(basename -- "$R")"
+}
+REAL_EXEC=$(real_path "$EXEC")
 
 # On Linux the reason to refuse a home directory is ProtectHome=yes, which makes the path
 # invisible to the service. launchd has no ProtectHome, so the job WOULD start — and that
@@ -146,13 +151,56 @@ EOM
   esac
 done
 
+# ── the interpreter ──────────────────────────────────────────────────────────
+# The broker is a Node script whose first line is `#!/usr/bin/env node`, and launchd starts
+# a daemon with PATH=/usr/bin:/bin:/usr/sbin:/sbin. No Mac has node there (the nodejs.org
+# installer uses /usr/local/bin, Homebrew /opt/homebrew/bin), so the job exited 127 on every
+# start and launchd respawned it for ever. Found on the first real Mac, 2026-10-20. The job
+# now names the interpreter by its full path, resolved here, where the PATH is yours.
+#
+# The interpreter is code the broker runs exactly as much as its own script is, so both are
+# held to one rule: owned by root and writable by nobody else. A node the agents' account
+# can replace is a broker the agents can replace.
+if [ -z "$NODE" ]; then
+  NODE=$(command -v node 2>/dev/null || true)
+fi
+[ -n "$NODE" ] || {
+  echo "ERROR: there is no node on your PATH. Install Node.js from nodejs.org, or pass --node /path/to/node." >&2
+  exit 1
+}
+case "$NODE" in /*) ;; *) echo "ERROR: --node needs a full path, not: $NODE" >&2; exit 1 ;; esac
+[ -x "$NODE" ] || { echo "Not executable: $NODE" >&2; exit 1; }
+REAL_NODE=$(real_path "$NODE")
+for F in "$REAL_EXEC" "$REAL_NODE"; do
+  F_OWNER=$(stat -f '%Su' "$F")
+  F_MODE=$(stat -f '%Lp' "$F")
+  F_GROUP_W=$(printf '%s' "$F_MODE" | cut -c2)
+  F_OTHER_W=$(printf '%s' "$F_MODE" | cut -c3)
+  case "$F_GROUP_W$F_OTHER_W" in
+    *[2367]*) F_BAD="writable by group or others (mode $F_MODE)" ;;
+    *) F_BAD="" ;;
+  esac
+  [ "$F_OWNER" = root ] || F_BAD="owned by ${F_OWNER}, not root"
+  if [ -n "$F_BAD" ]; then
+    cat >&2 <<EOM
+ERROR: $F is $F_BAD.
+
+The broker runs this file. Anyone who can replace it can replace the broker, and with it
+everything the broker holds. Install it as root, somewhere only root can write: for node,
+the installer from nodejs.org (/usr/local/bin/node); for the broker,
+  sudo npm install -g --prefix /usr/local @wundervault/mcp-server
+EOM
+    exit 1
+  fi
+done
+
 PLIST_SRC="${HERE}/${LABEL}.plist"
 [ -f "$PLIST_SRC" ] || { echo "Missing plist template: $PLIST_SRC" >&2; exit 1; }
 
 echo "This will:"
 echo "  1. create the hidden service account '${ACCOUNT}' for the secret broker"
 echo "  2. create ${STATE_DIR} (0700) and ${RUN_DIR} (0755), owned by ${ACCOUNT}"
-echo "  3. install ${PLIST_PATH}, which runs the broker: ${EXEC}"
+echo "  3. install ${PLIST_PATH}, which runs the broker: ${NODE} ${EXEC}"
 echo "  4. start the broker"
 echo
 
@@ -402,10 +450,15 @@ echo ""
 # ── 3. the job ───────────────────────────────────────────────────────────────
 # The template is shipped alongside this script and read from disk rather than written
 # inline, so what lands in /Library/LaunchDaemons is the file you reviewed in the repo.
-# Only the ProgramArguments path is substituted.
-awk -v exec_path="$EXEC" '
+# Only ProgramArguments is substituted: the interpreter, then the script, both full paths.
+awk -v exec_path="$EXEC" -v node_path="$NODE" '
   prev ~ /<key>ProgramArguments<\/key>/ && $0 ~ /<array>/ { print; inarr = 1; prev = $0; next }
-  inarr && /<string>/ { sub(/<string>.*<\/string>/, "<string>" exec_path "</string>"); inarr = 0 }
+  inarr && /<string>/ {
+    indent = $0; sub(/<string>.*/, "", indent)
+    print indent "<string>" node_path "</string>"
+    print indent "<string>" exec_path "</string>"
+    inarr = 0; prev = $0; next
+  }
   { print; prev = $0 }
 ' "$PLIST_SRC" > "$PLIST_PATH"
 
@@ -420,6 +473,10 @@ grep -q "<string>${ACCOUNT}</string>" "$PLIST_PATH" || {
 }
 grep -q "<string>${EXEC}</string>" "$PLIST_PATH" || {
   echo "ERROR: the installed plist does not point at ${EXEC}. Refusing to continue." >&2
+  rm -f "$PLIST_PATH"; exit 1
+}
+grep -q "<string>${NODE}</string>" "$PLIST_PATH" || {
+  echo "ERROR: the installed plist does not name the interpreter ${NODE}. Refusing to continue." >&2
   rm -f "$PLIST_PATH"; exit 1
 }
 plutil -lint "$PLIST_PATH" >/dev/null || {
