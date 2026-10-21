@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, chmodSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -281,11 +281,22 @@ ABSTRACT_ONLY('distinct agents that slug the same', () => {
 ABSTRACT_ONLY('refusing when the claim cannot be made safely', () => {
   it('does not serve when the lock file cannot be written', async () => {
     // An older copy gates on that file; unwritten, it would start alongside us.
-    (os as any).homedir = () => path.join(home, 'does', 'not', 'exist');
+    // A directory nobody may write to — not a missing one, which is just a fresh machine.
+    chmodSync(path.join(home, '.wundervault'), 0o500);
     const claim = await lock.acquireCredential('9.9.9');
-    (os as any).homedir = () => home;
+    chmodSync(path.join(home, '.wundervault'), 0o700);
     expect(claim.ok).toBe(false);
     expect(claim.reason).toMatch(/could not write/);
+  });
+
+  it('claims on a fresh machine, where ~/.wundervault does not exist yet', async () => {
+    // The first real Mac (2026-10-20) had no 1.x history, so no ~/.wundervault: every agent's
+    // first claim was refused, and the agent was told its own credential was held.
+    rmSync(path.join(home, '.wundervault'), { recursive: true, force: true });
+    const claim = await lock.acquireCredential('9.9.9');
+    expect(claim.ok).toBe(true);
+    expect(existsSync(lock.lockFilePath())).toBe(true);
+    expect(statSync(path.join(home, '.wundervault')).mode & 0o777).toBe(0o700);
   });
 });
 

@@ -70,7 +70,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import net from 'node:net';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
@@ -348,6 +348,10 @@ function writeCompatFile(version: string): boolean {
       token: ourToken,
       start: procStart(process.pid),
     };
+    // ~/.wundervault does not exist on a machine that never ran a 1.x copy, and the claim
+    // is the first thing an agent does: without this, a fresh install refused its own
+    // credential as "held". Found on the first real Mac, 2026-10-20.
+    mkdirSync(path.dirname(lockFilePath()), { recursive: true, mode: 0o700 });
     // Line 1 must stay a bare PID: older builds parseInt it, and a pure-JSON
     // file reads as NaN there, which makes them ignore the lock entirely.
     writeFileSync(lockFilePath(), `${process.pid}\n${JSON.stringify(meta)}\n`, 'utf8');

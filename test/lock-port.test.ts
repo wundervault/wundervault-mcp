@@ -208,17 +208,18 @@ describe('a refusal after binding does not poison the next attempt', () => {
     // meets its own closing socket instead of moving to a free candidate, and is told a
     // stranger holds the address. If someone can make that timing deterministic, this is
     // the test to strengthen.
-    const { rmSync: rm } = await import('node:fs');
-    rm(path.join(home, '.wundervault'), { recursive: true, force: true });
+    // A directory nobody may write to. (A MISSING one is a fresh machine, which now claims:
+    // the lock creates ~/.wundervault itself.)
+    const { chmodSync } = await import('node:fs');
+    chmodSync(path.join(home, '.wundervault'), 0o500);
 
     const refused = await lock.acquireCredential('test');
     expect(refused.ok).toBe(false);
     expect(refused.reason).toMatch(/could not write/);
 
-    // Put the directory back and try again. This must succeed, and must NOT report the
+    // Make it writable again and try again. This must succeed, and must NOT report the
     // address as occupied by a stranger.
-    const { mkdirSync: mk } = await import('node:fs');
-    mk(path.join(home, '.wundervault'), { recursive: true });
+    chmodSync(path.join(home, '.wundervault'), 0o700);
 
     const second = await lock.acquireCredential('test');
     expect(second.reason ?? '').not.toMatch(/not a wundervault holder/);
