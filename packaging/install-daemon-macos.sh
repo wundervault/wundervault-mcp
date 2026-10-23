@@ -194,6 +194,31 @@ EOM
   fi
 done
 
+# ── Node.js with the October 21, 2026 security fix ──────────────────────────
+# That release fixed a memory-corruption flaw in Node's Brotli decoder and two TLS hostname
+# checks. The broker decompresses replies from services an agent chooses, so on an unpatched
+# Node an agent could corrupt the memory of the process that holds your keys. The broker
+# refuses to start on one (src/node-floor.ts); this says so before anything is installed.
+NODE_NEED="Node.js 22.23.4, 24.22.1 or 26.12.1 or newer (the October 21, 2026 security release)"
+node_ok() {  # $1: what `node -p process.version` printed, e.g. v24.22.1
+  _v=${1#v}; _maj=${_v%%.*}; _r=${_v#*.}; _min=${_r%%.*}; _pat=${_r#*.}; _pre=${_pat#"${_pat%%[!0-9]*}"}; _pat=${_pat%%[!0-9]*}
+  for _n in "$_maj" "$_min" "$_pat"; do case "$_n" in ''|*[!0-9]*) return 1 ;; esac; done
+  case "$_maj" in
+    22) _fm=23; _fp=4 ;;
+    24) _fm=22; _fp=1 ;;
+    26) _fm=12; _fp=1 ;;
+    *) [ "$_maj" -gt 26 ]; return ;;
+  esac
+  # A pre-release OF the floor version (22.23.4-rc.1) comes before it, and may predate the fix.
+  [ "$_min" -gt "$_fm" ] || { [ "$_min" -eq "$_fm" ] && { [ "$_pat" -gt "$_fp" ] || { [ "$_pat" -eq "$_fp" ] && [ -z "$_pre" ]; }; }; }
+}
+NODE_VERSION=$("$NODE" -p process.version 2>/dev/null || echo unknown)
+node_ok "$NODE_VERSION" || {
+  echo "ERROR: $NODE is Node.js $NODE_VERSION, which lacks the October 21, 2026 security fix." >&2
+  echo "Install ${NODE_NEED} from nodejs.org, then run this again. Nothing has been changed." >&2
+  exit 1
+}
+
 PLIST_SRC="${HERE}/${LABEL}.plist"
 [ -f "$PLIST_SRC" ] || { echo "Missing plist template: $PLIST_SRC" >&2; exit 1; }
 

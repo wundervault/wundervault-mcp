@@ -35,6 +35,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { VERSION } from './version.js';
+import { nodeFloorProblem } from './node-floor.js';
 import { redeemSetupLink, peekAgentName } from './enrol.js';
 import {
   systemRoot, profilesPath, saltPath, mgmtSocketPath, agentSocketPath,
@@ -2025,6 +2026,13 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
       process.exit(2);
     }
     refuseRoot();
+    // Before anything else: an unpatched Node would let an agent corrupt this process's
+    // memory through a reply it chose (node-floor.ts). A restart cannot fix it, so exit 0.
+    const nodeProblem = nodeFloorProblem();
+    if (nodeProblem) {
+      console.error(`[wundervault-agent] Refusing to start. ${nodeProblem}`);
+      process.exit(0);
+    }
     announceBoundary();
     let daemon: AgentDaemon;
     try {

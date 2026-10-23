@@ -70,8 +70,9 @@ No tool returns a key's value. Version 1's hand-over tools (`vault_exec`, `vault
 
 ## Install
 
-You need Node.js 20 or newer, and administrator rights on the computer your agents run on.
-The full guide, with every step: [wundervault.com/quickstart](https://wundervault.com/quickstart).
+You need Node.js 22.23.4, 24.22.1 or 26.12.1 or newer (the October 21, 2026 security release: the broker
+refuses to start on an older Node), and administrator rights on the computer your agents run on.
+Every step: [wundervault.com/help/computer](https://wundervault.com/help/computer).
 
 **1. Create a vault** at [wundervault.com](https://wundervault.com). It's free.
 

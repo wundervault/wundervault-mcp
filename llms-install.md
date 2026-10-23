@@ -15,7 +15,8 @@ cannot enrol yourself. Tell the user what to run; don't try to work around it.
 
 ## Prerequisites
 
-- Node.js 20 or newer (`node --version`)
+- Node.js 22.23.4, 24.22.1 or 26.12.1 or newer (`node --version`). These carry the October 21, 2026
+  security fix; the broker refuses to start on an older Node.
 - npm
 - The user, with administrator rights on this computer, for steps 2 and 3
 

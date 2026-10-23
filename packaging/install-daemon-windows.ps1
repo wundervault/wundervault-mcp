@@ -139,6 +139,26 @@ Install it first:  npm install -g @wundervault/mcp-server
 Or pass its path:  -AgentPath 'C:\...\dist\agent.js'
 "@
 }
+# Node.js with the October 21, 2026 security fix. That release fixed a memory-corruption flaw in
+# Node's Brotli decoder and two TLS hostname checks; the broker decompresses replies from services
+# an agent chooses, so it refuses to start on an unpatched Node (src/node-floor.ts). Say so here,
+# before anything is changed.
+$NodeNeed = 'Node.js 22.23.4, 24.22.1 or 26.12.1 or newer (the October 21, 2026 security release)'
+$NodeVersion = (& $NodePath -p 'process.version' 2>$null | Select-Object -First 1)
+$nodeOk = $false
+if ("$NodeVersion".Trim() -match '^v(\d+)\.(\d+)\.(\d+)(-\S*)?$') {
+    $maj = [int]$Matches[1]; $min = [int]$Matches[2]; $pat = [int]$Matches[3]; $pre = [bool]$Matches[4]
+    $floors = @{ 22 = @(23, 4); 24 = @(22, 1); 26 = @(12, 1) }
+    if ($maj -gt 26) { $nodeOk = $true }
+    elseif ($floors.ContainsKey($maj)) {
+        $f = $floors[$maj]
+        # A pre-release OF the floor version (22.23.4-rc.1) comes before it, and may predate the fix.
+        $nodeOk = ($min -gt $f[0]) -or ($min -eq $f[0] -and ($pat -gt $f[1] -or ($pat -eq $f[1] -and -not $pre)))
+    }
+}
+if (-not $nodeOk) {
+    Fail "$NodePath is Node.js $NodeVersion, which lacks the October 21, 2026 security fix.`nInstall $NodeNeed from nodejs.org, then run this again. Nothing has been changed."
+}
 Say "node:   $NodePath"
 Say "broker: $AgentPath"
 
