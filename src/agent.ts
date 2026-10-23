@@ -1393,8 +1393,8 @@ class AgentDaemon {
                     `This machine is paired with a broker (${pairedRec.fingerprint}), so setup `
                     + `links are not accepted here — they are bearer credentials and the pairing `
                     + `exists to stop one being carried.\n`
-                    + `Repair the agent in the dashboard, choose this broker, and paste the CLAIM `
-                    + `CODE instead. Nothing was redeemed, so the link you have is still valid.`);
+                    + `Use Repair on the agent in your vault, choose this computer, and give the agent `
+                    + `the message it shows instead. Nothing was redeemed, so the link you have is still valid.`);
                 }
                 // The burn is deferred: the link is marked used only once the profile is
                 // actually stored, so a disk error cannot consume it either.
@@ -1866,17 +1866,14 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
     // /var/lib/wundervault. Nothing secret leaves this command: it uploads a PUBLIC key
     // and prints a fingerprint and a code, both of which an onlooker may read.
     void (async () => {
-      const { startPairing, awaitConfirmation } = await import('./pair.js');
+      const { startPairing, awaitConfirmation, pairInstructions, pairedNextSteps } = await import('./pair.js');
       try {
         const start = await startPairing();
         console.log('');
         console.log('  Pairing code : ' + start.code);
         console.log('  Fingerprint  : ' + start.identity.fingerprint);
         console.log('');
-        console.log('  In the dashboard: Settings > Agents > Pair a broker, enter the code above,');
-        console.log('  and check the fingerprint it shows matches this one EXACTLY before you');
-        console.log('  confirm. That comparison is the whole ceremony — everything after it is');
-        console.log('  sealed to the key you just approved.');
+        for (const line of pairInstructions()) console.log(line);
         console.log('');
         console.log('  Neither of those two values is a secret. Anyone reading this screen learns');
         console.log('  a public key and a code that opens nothing.');
@@ -1903,8 +1900,7 @@ State lives in ${systemRoot()} and is readable only by ${SYSTEM_ACCOUNT}.
         console.log(`  Paired. This broker is ${rec.fingerprint}`
           + (rec.account_label ? ` (${rec.account_label})` : ''));
         console.log('');
-        console.log('  Setup links are no longer accepted on this machine. Repair an agent in the');
-        console.log('  dashboard, choose this broker, and paste the CLAIM CODE into --enrol.');
+        for (const line of pairedNextSteps()) console.log(line);
         process.exit(0);
       } catch (e) {
         console.log('');

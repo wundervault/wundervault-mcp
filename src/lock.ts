@@ -523,6 +523,12 @@ async function acquireOnce(version: string, opts: { share?: boolean }): Promise<
     // serves beside it. Only a holder that SAYS it can share, under exactly our agent name;
     // anything older keeps the old meaning, because a 1.x holder holds a real credential.
     if (who && opts.share && who.shares && who.agent === agentName() && agentName()) {
+      // The holder answers before it has checked for a live 1.x copy (it stands down after, if it
+      // finds one), so a copy joining in that gap checks for itself: a live 1.x holder still
+      // refuses a first claim (polish review round 1, broker F1).
+      // The file the answering holder wrote itself names the holder's own pid: that is not a 1.x copy.
+      const legacy = legacyHolder();
+      if (legacy && legacy.pid !== who.pid) return { ok: false, holder: legacy };
       return { ok: true, role: 'shared', holder: who };
     }
 

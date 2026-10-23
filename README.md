@@ -82,7 +82,7 @@ npm install -g @wundervault/mcp-server@2
 sudo sh "$(npm root -g)/@wundervault/mcp-server/packaging/install-daemon.sh"
 ```
 
-Windows and macOS (both in beta) have their own installers; see
+Windows and macOS have their own installers; see
 [wundervault.com/install](https://wundervault.com/install). The installer downloads nothing
 and is short enough to read first.
 
@@ -140,8 +140,8 @@ vault, by design. Details: [wundervault.com/install#upgrade-to-2](https://wunder
 | | Broker's own account | Status |
 |---|---|---|
 | Linux | `wundervault` system user, systemd unit with extra sandboxing | Supported |
-| Windows | `wundervault` local account, scheduled task | Beta |
-| macOS | `_wundervault` system account, LaunchDaemon | Beta |
+| Windows | `wundervault` local account, scheduled task | Supported |
+| macOS | `_wundervault` system account, LaunchDaemon | Supported |
 
 On all three the broker runs under its own account, with its keys in a folder your agents
 can't open. What differs is what surrounds that boundary:

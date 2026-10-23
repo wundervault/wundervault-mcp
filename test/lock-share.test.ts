@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import net from 'node:net';
 import os from 'node:os';
@@ -113,6 +113,21 @@ for (const strategy of STRATEGIES) {
       expect(c.reason).toMatch(/different agent/);
     });
 
+    it('refuses to share while a live 1.x copy holds the compatibility file, even if a holder answers (polish r1 F1)', async () => {
+      // A holder answers "shares" before it checks for a 1.x copy; a copy joining then must check too.
+      // Node itself, not `sleep`: Windows has none (round 2, F1).
+      const old = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+      try {
+        await new Promise((r) => setTimeout(r, 100));
+        mkdirSync(path.dirname(lock.lockFilePath()), { recursive: true });
+        writeFileSync(lock.lockFilePath(), `${old.pid}\n${JSON.stringify({ agent: AGENT })}\n`, 'utf8');
+        await fakeHolder({ pid: 4545, agent: AGENT, shares: 1 });
+        const c = await lock.acquireCredential('2.0.0', { share: true });
+        expect(c.ok).toBe(false);
+        expect(c.holder?.pid).toBe(old.pid);
+      } finally { old.kill(); }
+    });
+
     it('waits for a holder that has bound but not started answering, then shares', async () => {
       await fakeHolder({ pid: 4444, agent: AGENT, shares: 1 }, 400);
       const c = await lock.acquireCredential('2.0.0', { share: true });
@@ -191,6 +206,12 @@ for (const strategy of STRATEGIES) {
  */
 describe('sharing across real processes', () => {
   const DIST = path.resolve('dist/lock.js');
+  // These processes run the BUILT lock; a dist older than src would test yesterday's code and pass
+  // (polish review round 1, broker blind spot B3). Say so instead.
+  beforeAll(() => {
+    const built = statSync(DIST).mtimeMs, source = statSync(path.resolve('src/lock.ts')).mtimeMs;
+    if (built < source) throw new Error('dist/lock.js is older than src/lock.ts: run `npm run build` first');
+  });
   const NAME = `ShareProc_${process.pid}_${Date.now()}`;
   let procHome: string;
   let kids: ChildProcess[] = [];

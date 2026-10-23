@@ -109,6 +109,28 @@ async function getJson(url: string): Promise<any> {
   return parsed;
 }
 
+/**
+ * What `--pair` prints after the code and fingerprint: where in the vault to enter it, in the 1.0
+ * vault's own words (Your computers, then Pair a computer). Kept here so a test can read it without
+ * running the CLI.
+ */
+export function pairInstructions(): string[] {
+  return [
+    '  In your vault: Your computers, then Pair a computer. Enter the code above, and check',
+    '  that the fingerprint it shows matches this one EXACTLY before you confirm. That',
+    '  comparison is the whole ceremony: everything after it is sealed to the key you approved.',
+  ];
+}
+
+/** What `--pair` prints once the vault has confirmed: how an agent on this machine gets set up. */
+export function pairedNextSteps(): string[] {
+  return [
+    '  Setup links are no longer accepted on this machine. To set up an agent here, use Add an',
+    '  agent (or Repair, for one you have) in your vault, choose this computer, and give the',
+    '  agent the message the vault shows.',
+  ];
+}
+
 export interface PairStart { code: string; identity: BrokerIdentity; expiresInMinutes: number }
 
 /** Upload the public half and get the code the owner will type. */

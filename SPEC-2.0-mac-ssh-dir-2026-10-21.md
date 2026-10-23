@@ -24,8 +24,10 @@ fixes the same trap for the runtime directory itself; this parent was missed.
 - **R3** Nothing else about the session changes: the leaf directory, socket mode (0666), id.pub
   mode (0644), random session id, removal on close, and the 0700 state directory are as before.
 - **R4** `packaging/verify-macos.sh` reports the mode of `<runtime>/ssh/`: PASS at 711, WARN at
-  755/775/777 (works, but listable), FAIL otherwise with what breaks, and SKIP (not applicable)
-  when no SSH call has made it yet.
+  755/775/777 (works, but listable) and at any other mode other accounts can still pass through
+  (an odd last digit: SSH works, the next call sets 711), FAIL when they cannot (every SSH call
+  fails) with what breaks, and SKIP (not applicable) when no SSH call has made it yet.
+  (Wording matched to the script in polish review round 1, broker F3: the script was right.)
 
 ## Acceptance checks
 

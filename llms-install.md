@@ -40,7 +40,7 @@ Linux:
 sudo sh "$(npm root -g)/@wundervault/mcp-server/packaging/install-daemon.sh"
 ```
 
-Windows and macOS (both in beta) have their own installers:
+Windows and macOS have their own installers:
 https://wundervault.com/install. The installer downloads nothing and is short enough to read
 first; reading it before the user runs it is a good idea.
 

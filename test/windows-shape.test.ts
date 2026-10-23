@@ -238,7 +238,10 @@ describe('the windows shape puts things where Windows can host them', () => {
       .toBe(path.join('/pd/wundervault', 'run'));
   });
 
-  it('puts the run directory inside the user root end-to-end when nothing is installed', () => {
+  // "Nothing is installed" is a fact about the machine running the suite: on one with a real
+  // broker (/run/wundervault exists) this end-to-end path cannot be taken, so it is skipped there
+  // and says so; runtimeDirFor's pure tests above cover the decision everywhere (polish r1, F2).
+  it.skipIf(fs.existsSync('/run/wundervault'))('puts the run directory inside the user root end-to-end when nothing is installed', () => {
     // The whole path, not the pure function: systemRoot() falls back to the user's own
     // directory when there is no installed state root, and runtimeDir() must follow.
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wv-presplit-'));
