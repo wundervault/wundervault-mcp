@@ -67,7 +67,7 @@ export function validateBinding(raw: unknown): BindingCheck {
   if (where === 'header') {
     if (!HEADER_NAME.test(name)) return bad('binding.name', 'not a valid header name');
     name = name.toLowerCase();
-    if (FORBIDDEN_HEADERS.has(name)) return bad('binding.name', `the ${name} header can't carry a key`);
+    if (FORBIDDEN_HEADERS.has(name)) return bad('binding.name', `the ${name} header can't carry a secret`);
   } else if (!QUERY_NAME.test(name)) {
     return bad('binding.name', 'not a valid query parameter name');
   }
@@ -107,7 +107,7 @@ export function hasDotSegment(path: string): boolean {
  */
 function validatePathBinding(b: Record<string, unknown>): BindingCheck {
   const bad = (field: string, reason: string): BindingCheck => ({ ok: false, field, reason });
-  if (b.name !== undefined && b.name !== null && b.name !== '') return bad('binding.name', 'a key in the web address has no name');
+  if (b.name !== undefined && b.name !== null && b.name !== '') return bad('binding.name', 'a secret in the web address has no name');
   if (b.username !== undefined && b.username !== null) return bad('binding.username', 'a username only goes with {basic}');
   const template = b.template;
   if (typeof template !== 'string' || !template) return bad('binding.template', 'binding.template is required');
@@ -139,11 +139,11 @@ export function pathBindingProblem(binding: CredentialBinding, secret: string, a
   if (binding.in !== 'path') return null;
   if (!secret || secret.length > 512 || !PATH_CHARS.test(secret) || hasDotSegment(secret)
       || secret.includes('//') || secret.startsWith('/') || secret.endsWith('/')) {
-    return "this entry's key has characters that can't go in a web address, so it can't be sent that way. "
+    return "this entry's secret has characters that can't go in a web address, so it can't be sent that way. "
       + 'The owner can choose another way to send it in the dashboard.';
   }
   const pathOnly = agentPath.split('?')[0];
-  if (hasDotSegment(pathOnly)) return 'with a key in the web address, the path may not contain a . or .. segment.';
+  if (hasDotSegment(pathOnly)) return 'with a secret in the web address, the path may not contain a . or .. segment.';
   return null;
 }
 
@@ -238,7 +238,7 @@ export function validateAgentHeaders(raw: unknown, binding: CredentialBinding): 
       return bad('request.headers', `the ${lower} header is set by the broker, not the caller`);
     }
     if (lower === credentialHeader) {
-      return bad('request.headers', `${lower} carries this entry's key; the entry sets it, not the caller`);
+      return bad('request.headers', `${lower} carries this entry's secret; the entry sets it, not the caller`);
     }
     if (out.has(lower)) return bad('request.headers', `${lower} is given twice`);
     if (typeof value !== 'string') return bad('request.headers', `the value of ${lower} must be a string`);

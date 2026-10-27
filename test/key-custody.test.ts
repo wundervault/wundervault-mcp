@@ -471,7 +471,7 @@ describe("the agent's own headers, checked by the broker", () => {
     for (const name of ['authorization', 'Authorization', 'AUTHORIZATION']) {
       const r = await call({ [name]: 'Bearer mine' });
       expect(r.json.code, name).toBe('BAD_REQUEST');
-      expect(r.json.error, name).toMatch(/authorization carries this entry's key/);
+      expect(r.json.error, name).toMatch(/authorization carries this entry's secret/);
       expect(r.raw).not.toContain(SECRETS.http1.value);
     }
   });

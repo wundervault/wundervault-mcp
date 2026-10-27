@@ -1761,7 +1761,7 @@ credentials so the agents cannot read them. It is normally started by systemd as
                 this process. A claim code is not a credential; a setup link is.
   --migrate     Show which agents still need moving to the broker, and how.
   --finish      With --migrate: delete the old store, once every agent is across.
-  --destinations  Show the broker's log: every use of a key, where it went, why, and
+  --destinations  Show the broker's log: every use of a secret, where it went, why, and
                 what happened, with whether the log checks out (signed, linked, and
                 matching Wundervault's copy). Needs sudo: the log belongs to the broker
                 so your agents cannot read it. The page is opened and then DELETED,

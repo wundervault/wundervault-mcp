@@ -315,7 +315,7 @@ export async function approveStamp(d: Deps, args: {
   recipeSha: string; summary: string; purpose: string;
 }): Promise<OpError | null> {
   const pol = readPolicy({ ciphertext: args.s.policy_ciphertext, nonce: args.s.policy_nonce, vaultKey: args.vaultKey, entryId: args.entryId, kind: 'stamped' });
-  if (!pol.ok) return err(`Refused: this key's settings could not be used (${pol.reason}). Nothing was sent.`, 'BAD_POLICY');
+  if (!pol.ok) return err(`Refused: this secret's settings could not be used (${pol.reason}). Nothing was sent.`, 'BAD_POLICY');
   const r = await guarded(async () => {
     if (pol.policy) {
       const bad = d.state.acceptPolicy(pol.policy);

@@ -108,7 +108,7 @@ export function verdictOf(a: ActivityView): { level: 'ok' | 'bad' | 'unknown'; l
         : `This log ends at line ${a.lastSeq ?? 0}, but Wundervault's copy reaches line ${reach}: lines were removed.`,
     ] };
   }
-  if (a.missing) return { level: 'unknown', lines: ['There is no activity log on this computer yet. It starts with the first use of a key.'] };
+  if (a.missing) return { level: 'unknown', lines: ['There is no activity log on this computer yet. It starts with the first use of a secret.'] };
   if (a.checkpointsMatch === false) {
     return { level: 'bad', lines: ['This log has been rewritten since it was last checked: a line no longer matches what Wundervault recorded for it.'] };
   }
@@ -250,7 +250,7 @@ export function renderViewer(shape: NetworkShape, storePath: string, activity?: 
 </head><body>
 <div class="wrap">
   <h1>Your broker's log</h1>
-  <p class="sub">Every use of a key by an agent on this computer: when, which agent and key,
+  <p class="sub">Every use of a secret by an agent on this computer: when, which agent and secret,
   where it went, the reason it gave, and what happened. Wundervault holds none of it, only a
   fingerprint of each line that proves the log hasn't been changed.</p>
   <p class="path">${esc(activity?.logPath ?? storePath)}</p>
@@ -260,7 +260,7 @@ export function renderViewer(shape: NetworkShape, storePath: string, activity?: 
   safe to delete — the store it was built from is unchanged.</div>
 
   <div class="bar">
-    <input type="search" id="q" placeholder="Search agent, key, destination, or reason…" autocomplete="off">
+    <input type="search" id="q" placeholder="Search agent, secret, destination, or reason…" autocomplete="off">
     <button id="theme" type="button">Light / dark</button>
     <span class="count" id="count"></span>
   </div>
@@ -269,7 +269,7 @@ export function renderViewer(shape: NetworkShape, storePath: string, activity?: 
   <div class="verdict ${verdict!.level}" id="verdict">${verdict!.lines.map((x) => `<p>${esc(x)}</p>`).join('')}</div>
   <div class="tablewrap">
     <table>
-      <thead><tr><th>When</th><th>Agent · key</th><th>What</th><th>Result</th><th>Line</th></tr></thead>
+      <thead><tr><th>When</th><th>Agent · secret</th><th>What</th><th>Result</th><th>Line</th></tr></thead>
       <tbody id="uses"></tbody>
     </table>
   </div>

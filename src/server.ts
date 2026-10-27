@@ -103,26 +103,26 @@ export function createServer(args: { url?: string } = {}) {
       {
         name: 'vault_entries_list',
         description: (
-          'List the vault entries this agent may use. For each: its ID, name, tier, what kind of key '
+          'List the vault entries this agent may use. For each: its ID, name, tier, what kind of secret '
           + 'it is — web-service (vault_call), SSH (vault_ssh_exec), wallet (vault_pay) or signing '
-          + 'key (vault_sign) — and any signed operations it offers. Never a key\'s value — no tool returns one.'
+          + 'key (vault_sign) — and any signed operations it offers. Never a secret\'s value — no tool returns one.'
         ),
         inputSchema: { type: 'object', properties: {} },
       },
       {
         name: 'vault_call',
         description: (
-          'Call a web service with a vaulted key that is never returned to you: the broker '
-          + 'attaches the key, sends the request and gives you the answer with the key removed.\n\n'
+          'Call a web service with a vaulted secret that is never returned to you: the broker '
+          + 'attaches the secret, sends the request and gives you the answer with the secret removed.\n\n'
           + 'Two ways to call. Describe the request yourself with `request` (origin, method, path, '
           + 'and optional query, body and your own headers). Or run a named operation the owner '
           + 'defined, with `operation_id` and typed `args`: the operation fixes the origin and '
           + 'route, returns only the fields it permits, and is signed with a key derived from the '
           + 'secret itself, so a definition altered in transit is refused. vault_entries_list '
           + 'shows which operations an entry offers.\n\n'
-          + 'Either way the entry decides how the key is attached (a header, a query parameter, a '
+          + 'Either way the entry decides how the secret is attached (a header, a query parameter, a '
           + 'username and password, or part of the web address) — you never choose that, and never '
-          + 'see the key.'
+          + 'see the secret.'
         ),
         inputSchema: {
           type: 'object',
@@ -135,9 +135,9 @@ export function createServer(args: { url?: string } = {}) {
               description: 'Describe the call yourself: {origin:{scheme,host,port}, method, path, body?, query?, headers?}. '
                 + 'body: an object or array is sent as JSON; a string is sent as written (set content-type in '
                 + 'headers, e.g. application/x-www-form-urlencoded). headers: your own, such as user-agent or an '
-                + 'API version; the header that carries the key, and framing headers, are refused. '
-                + 'If the entry keeps its key in the web address (Telegram, webhooks), path is only what comes '
-                + 'AFTER the key, e.g. /sendMessage, or / for the stored address as is. '
+                + 'API version; the header that carries the secret, and framing headers, are refused. '
+                + 'If the entry keeps its secret in the web address (Telegram, webhooks), path is only what comes '
+                + 'AFTER the secret, e.g. /sendMessage, or / for the stored address as is. '
                 + 'Tier 1 secrets proceed and are logged. Tier 2 secrets are refused until the owner approves '
                 + 'this exact origin, method and path; the approval covers whatever headers and body it carries. '
                 + 'STAMPED keys (AWS, SnapTrade, exchanges) never travel: add request.stamp describing how the '
@@ -257,7 +257,7 @@ export function createServer(args: { url?: string } = {}) {
         const lines = [`Vault entries (${entries.length}):\n`];
         for (const e of entries) {
           const use = e.entry_mode === 'BROKER_SSH_AGENT' ? 'SSH key → vault_ssh_exec'
-            : e.entry_mode === 'BROKER_HTTP' ? 'web key → vault_call'
+            : e.entry_mode === 'BROKER_HTTP' ? 'web-service secret → vault_call'
             : e.entry_mode === 'BROKER_WALLET' ? 'wallet → vault_pay'
             : e.entry_mode === 'BROKER_SIGN' ? 'signing key → vault_sign'
             : 'not usable until the owner sets how it is used';

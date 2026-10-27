@@ -691,7 +691,7 @@ export function modeAllowsSign(mode: string | undefined): boolean { return modeI
 
 const MODES: Record<string, { kind: string; tool: string }> = {
   [BROKER_SSH_AGENT]: { kind: 'an SSH key', tool: 'vault_ssh_exec' },
-  [BROKER_HTTP]: { kind: 'a web-service key', tool: 'vault_call' },
+  [BROKER_HTTP]: { kind: 'a web-service secret', tool: 'vault_call' },
   [BROKER_WALLET]: { kind: 'a wallet', tool: 'vault_pay' },
   [BROKER_SIGN]: { kind: 'a signing key', tool: 'vault_sign' },
 };
@@ -701,8 +701,8 @@ export function wrongModeMessage(mode: string | undefined, wanted: keyof typeof 
   const m = (mode || '').trim().toUpperCase() || 'no';
   const have = MODES[m];
   if (!have) {
-    return `Refused: this entry is in ${m} mode, which 1.0 does not use — keys are no longer `
-      + 'handed to agents. The owner needs to choose in the dashboard what kind of key it is.';
+    return `Refused: this entry is in ${m} mode, which 1.0 does not use — secrets are no longer `
+      + 'handed to agents. The owner needs to choose in the dashboard what kind of secret it is.';
   }
   return `Refused: this entry is ${have.kind}, not ${MODES[WANTED[wanted]].kind}. Use ${have.tool} with it, or the owner `
     + 'can change how it is used in the dashboard.';

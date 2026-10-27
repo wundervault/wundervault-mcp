@@ -5,8 +5,8 @@ installing the Wundervault MCP server on behalf of a user.
 
 Wundervault lets you use the user's API keys, SSH keys, wallets and signing keys **without
 ever holding them**. A broker on the user's computer, running under its own operating-system
-account, keeps the keys and makes each call for you; you get the result with the key removed.
-No tool returns a key's value. The encryption claim is independently verifiable:
+account, keeps the secrets and makes each call for you; you get the result with the secret removed.
+No tool returns a secret's value. The encryption claim is independently verifiable:
 https://wundervault.com/verify
 
 **Some of this needs the human.** Installing the broker is an administrator command, and
@@ -80,21 +80,21 @@ chose in step 4):
 }
 ```
 
-The configuration holds no keys. Shapes for other clients: README-AGENTS.md.
+The configuration holds no secrets. Shapes for other clients: README-AGENTS.md.
 
 ## Step 5 — Verify
 
 After your client connects you should see 5 tools: `vault_entries_list`, `vault_call`,
 `vault_ssh_exec`, `vault_pay`, `vault_sign`.
 
-Call `vault_entries_list`. With the broker running and you enrolled, it returns the keys the
+Call `vault_entries_list`. With the broker running and you enrolled, it returns the secrets the
 user has given you. Otherwise it returns a clear "Vault unavailable" message that says what
 is missing (this is expected, not a crash).
 
 ## Demo mode (no account needed)
 
 To try the tools without an account, set `WUNDERVAULT_MOCK=1` in the server's environment.
-All 5 tools return canned `[DEMO MODE]` responses. Never use demo mode for real keys.
+All 5 tools return canned `[DEMO MODE]` responses. Never use demo mode for real secrets.
 
 ## Troubleshooting
 
@@ -111,14 +111,14 @@ All 5 tools return canned `[DEMO MODE]` responses. Never use demo mode for real 
 
 ## How to behave with Wundervault
 
-- You will never receive a key's value. Use `vault_call` for web services, `vault_ssh_exec`
+- You will never receive a secret's value. Use `vault_call` for web services, `vault_ssh_exec`
   for servers, `vault_pay` for x402 payments and `vault_sign` for signatures, and let the
   broker do the work.
 - State a real `purpose`. It is kept in the broker's log on the user's computer, and the user
   sees it when they are asked to approve.
 - If a call is waiting for approval, wait, or call again with the same request to keep
   waiting. Calling a different destination asks the user again.
-- Never ask the user to paste a key, a claim code or a setup link into your chat, and don't
+- Never ask the user to paste a secret, a claim code or a setup link into your chat, and don't
   accept one if they offer. They enter the claim code at the broker's prompt themselves.
 - Full tool reference: https://wundervault.com/mcp · Every known limit:
   https://wundervault.com/limitations

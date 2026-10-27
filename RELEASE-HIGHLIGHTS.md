@@ -17,7 +17,7 @@ token; it cannot read the credential store on disk, and cannot read the broker's
 through `/proc`, because it is a different user.
 
 **Why it is unusual:** most agent tooling puts credentials in an env var or a dotfile owned
-by the same user the agent runs as — which means "the agent has the key" is literally true.
+by the same user the agent runs as — which means "the agent has the secret" is literally true.
 Here it never does.
 
 **Verified:** on a two-uid install the agent's account gets `Permission denied` on the store
@@ -37,8 +37,10 @@ never sees it.
 
 > *The record of where your secrets went stays on your machine — and we cannot read it.*
 
-### 3. Two-Secret Key Derivation (the 1Password property)
-A 16-byte Account Secret is generated on your device and never sent to the server. It is
+<a id="3-two-secret-key-derivation-the-1password-property"></a>
+
+### 3. Two-Part Key Derivation (the 1Password property)
+A 16-byte Account Key is generated on your device and never sent to the server. It is
 mixed with your passphrase through PBKDF2 (600,000 iterations) and HKDF to produce the auth
 and vault keys.
 
@@ -77,7 +79,7 @@ is written to be read by the agent being asked to run it.
 Tier 1 secrets are available once your vault is unlocked. Tier 2 requires your explicit
 approval per use, with biometric unlock, and the agent is blocked until you answer.
 
-> *Some keys should need a human. Those ones do.*
+> *Some secrets should need a human. Those ones do.*
 
 ### 8. Repairing an agent replaces the lock, not just the key
 Repairing an agent gives it a brand-new vault key and re-encrypts everything it holds under

@@ -49,7 +49,7 @@ async def main():
         "env": {"WUNDERVAULT_AGENT_NAME": "<agent-name>"},
     }) as wundervault:
         agent = Agent(name="my-agent", mcp_servers=[wundervault])
-        result = await Runner.run(agent, "List my vault keys.")
+        result = await Runner.run(agent, "List my vault secrets.")
         print(result.final_output)
 
 asyncio.run(main())
@@ -71,20 +71,22 @@ asyncio.run(main())
 }
 ```
 
-## Where the keys actually come from
+<a id="where-the-keys-actually-come-from"></a>
 
-There is no credentials file and no key in your MCP config. `wundervault-agent --enrol`
+## Where the secrets actually come from
+
+There is no credentials file and no secret in your MCP config. `wundervault-agent --enrol`
 (with the claim code from the owner's vault) enrols the agent with the broker, and the
-broker, running under its own account, holds the agent's keys. The MCP server talks to it
+broker, running under its own account, holds the agent's secrets. The MCP server talks to it
 over a local socket (`/run/wundervault/<name>.sock` on Linux,
 `/var/lib/wundervault/run/<name>.sock` on macOS, a loopback port on Windows), authenticated
 with the agent token in `~/.wundervault/agents/<name>.token`. The token stays in your own
 home on purpose: it is the agent's identity, and moving it into the broker's directory would
 make it unreadable by the only party that needs it.
 
-**The socket serves operations, not credentials.** The broker does not hand the keys over:
+**The socket serves operations, not credentials.** The broker does not hand the secrets over:
 it lists entries, makes a web call, signs an SSH login, a payment or a signature. What
-crosses the socket is the result, not the key.
+crosses the socket is the result, not the secret.
 
 All your config has to say is which agent this is.
 
@@ -93,11 +95,11 @@ All your config has to say is which agent this is.
 Every request a broker makes to Wundervault is signed with a private key that lives in the
 broker's own directory, which the agents cannot read; the owner confirmed its fingerprint
 when pairing. The server refuses an unsigned request from an agent enrolled on a broker, and
-serves a key's ciphertext only to the broker that signed for it. A copy of the credential on
+serves a secret's ciphertext only to the broker that signed for it. A copy of the credential on
 its own is not enough.
 
 Version 2 is brokered only. The MCP server refuses to run without a broker, and version 1's
-hand-over mode, where the agent was given the key, is gone from the server too.
+hand-over mode, where the agent was given the secret, is gone from the server too.
 
 On all three platforms the broker has an account of its own. On Windows the boundary is an
 NTFS access list rather than a file mode, an elevated administrator is inside it exactly as

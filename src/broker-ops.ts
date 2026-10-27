@@ -295,7 +295,7 @@ export class BrokerOps {
     const bound = bindingFromExecConfig(coerceCfg(s.exec_config));
     if (!bound.ok) {
       return err(`Refused: this entry's delivery setting is not one the broker accepts `
-        + `(${bound.field}: ${bound.reason}). Nothing was sent. The owner can set how the key `
+        + `(${bound.field}: ${bound.reason}). Nothing was sent. The owner can set how the secret `
         + `is sent in the dashboard.`, 'BAD_BINDING');
     }
     const binding = bound.binding;
@@ -307,7 +307,7 @@ export class BrokerOps {
       if (operationId) return err('Refused: a stamped key is used with request and request.stamp, not a signed operation.', 'BAD_REQUEST');
       const raw = (agentReq as { stamp?: unknown } | undefined)?.stamp;
       if (raw === undefined) {
-        return err('Refused: this key is stamped — it never travels, and each request carries a code computed from it. '
+        return err('Refused: this secret is stamped — it never travels, and each request carries a code computed from it. '
           + 'Describe how the service wants it in request.stamp (see the vault_call description). Nothing was sent.', 'BAD_REQUEST');
       }
       const rc = validateRecipe(raw);

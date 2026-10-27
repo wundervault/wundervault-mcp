@@ -5,16 +5,16 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-green)](LICENSE)
 [![Follow @wundervault1](https://img.shields.io/badge/follow-%40wundervault1-000000?logo=x&logoColor=white)](https://x.com/wundervault1)
 
-**Your AI agent uses your keys. It never holds them.**
+**Your AI agent uses your secrets. It never holds them.**
 
-A key you paste into a chat with an AI agent, or leave in a settings file it can read, gets
+A secret you paste into a chat with an AI agent, or leave in a settings file it can read, gets
 copied into its memory, its transcripts and its logs. With Wundervault the agent never receives
-the key at all. A small
-program on your own computer, the **broker**, keeps your keys in an account of its own. Your
+the secret at all. A small
+program on your own computer, the **broker**, keeps your secrets in an account of its own. Your
 agent asks it to call a web service, run a command on a server, pay for something or sign
-something; the broker does it with the key and hands back the result, with the key removed.
+something; the broker does it with the secret and hands back the result, with the secret removed.
 
-Your vault is encrypted in your browser, so our server stores it but can't read it. Keys
+Your vault is encrypted in your browser, so our server stores it but can't read it. Secrets
 you mark **"ask me first"** wait for your approval, with your passkey, on your phone or
 computer.
 
@@ -29,28 +29,28 @@ the installer, at [wundervault.com/verify](https://wundervault.com/verify).
 
 | Tool | What it does |
 |---|---|
-| `vault_call` | Calls a web service with a key attached, and returns the answer with the key removed. |
+| `vault_call` | Calls a web service with a secret attached, and returns the answer with the secret removed. |
 | `vault_ssh_exec` | Runs a command on a server you listed, or rsyncs files to it. The broker signs the SSH login; the key never leaves it. |
 | `vault_pay` | Pays an x402 "402 Payment Required" in USDC on Base or Solana, inside the limits you set. |
 | `vault_sign` | Signs data with a signing key. You approve every signature. |
-| `vault_entries_list` | Lists the keys this agent may use, and what kind each is. Never their values. |
+| `vault_entries_list` | Lists the secrets this agent may use, and what kind each is. Never their values. |
 
-No tool returns a key's value. Version 1's hand-over tools (`vault_exec`, `vault_entry_get`,
+No tool returns a secret's value. Version 1's hand-over tools (`vault_exec`, `vault_entry_get`,
 `vault_entry_inject_env`, `vault_rsync`) are gone; see [Upgrading from version 1](#upgrading-from-version-1).
 
 ## How it works
 
 ```
  ┌──────────────┐  MCP (stdio)  ┌──────────────────┐
- │   AI agent   │──────────────▶│ wundervault-mcp  │  runs as you, holds no keys
+ │   AI agent   │──────────────▶│ wundervault-mcp  │  runs as you, holds no secrets
  │ (Claude, …)  │◀──────────────│                  │
- └──────────────┘  result, key  └────────┬─────────┘
-                   removed               │ local socket
+ └──────────────┘    result     └────────┬─────────┘
+                 (secret removed)        │ local socket
                                          ▼
                               ┌──────────────────────┐  HTTPS / SSH  ┌─────────────┐
                               │ broker               │──────────────▶│ the service │
                               │ its own OS account,  │◀──────────────│             │
-                              │ holds the keys, logs │               └─────────────┘
+                              │ holds the secrets,   │               └─────────────┘
                               │ each call on this box│
                               └──────────┬───────────┘
                                          │ signed requests, ciphertext only
@@ -62,10 +62,10 @@ No tool returns a key's value. Version 1's hand-over tools (`vault_exec`, `vault
 ```
 
 1. Your agent asks for work: "call this API", "deploy to this server".
-2. The MCP server passes the request to the broker over a local socket. It holds no keys.
-3. For an "ask me first" key, the broker waits for you to approve that call.
-4. The broker makes the call with the key, records it in a log on your computer, and returns
-   the result. For web calls the key goes to the service it belongs to, as it must; for SSH it
+2. The MCP server passes the request to the broker over a local socket. It holds no secrets.
+3. For an "ask me first" secret, the broker waits for you to approve that call.
+4. The broker makes the call with the secret, records it in a log on your computer, and returns
+   the result. For web calls the secret goes to the service it belongs to, as it must; for SSH it
    never leaves the broker at all.
 
 ## Install
@@ -115,14 +115,14 @@ Then add Wundervault to your agent's MCP settings:
 }
 ```
 
-The config holds no keys, and there are no key flags on the command line. Configs for other
+The config holds no secrets, and none go in command-line flags. Configs for other
 clients: [README-AGENTS.md](README-AGENTS.md). If you're an AI agent installing this for
 someone: [llms-install.md](llms-install.md).
 
 ## Upgrading from version 1
 
-Version 2 moves your keys into the broker. Your account, vault and passkeys carry over.
-Agents still on version 1 can't use your keys, so move each one:
+Version 2 moves your secrets into the broker. Your account, vault and passkeys carry over.
+Agents still on version 1 can't use your secrets, so move each one:
 
 1. `npm install -g @wundervault/mcp-server@2`
 2. Install the broker and pair it (steps 2 and 3 above).
@@ -130,8 +130,8 @@ Agents still on version 1 can't use your keys, so move each one:
    then run `wundervault-agent --enrol` and enter the claim code.
 4. When every agent has moved: `wundervault-agent --migrate --finish` removes the old
    credential store.
-5. Your vault marks each key your agents could read before version 2 with **Replace it at
-   the service**. Replace those keys at the services that issued them: treat them as seen.
+5. Your vault marks each secret your agents could read before version 2 with **Replace it at
+   the service**. Replace those secrets at the services that issued them: treat them as seen.
 
 Your agent can't do this for you. It needs an administrator command and your approval in the
 vault, by design. Details: [wundervault.com/install#upgrade-to-2](https://wundervault.com/install#upgrade-to-2).
@@ -144,7 +144,7 @@ vault, by design. Details: [wundervault.com/install#upgrade-to-2](https://wunder
 | Windows | `wundervault` local account, scheduled task | Supported |
 | macOS | `_wundervault` system account, LaunchDaemon | Supported |
 
-On all three the broker runs under its own account, with its keys in a folder your agents
+On all three the broker runs under its own account, with its secrets in a folder your agents
 can't open. What differs is what surrounds that boundary:
 
 - **Linux** adds `ProtectSystem=strict`, `ProtectHome`, `ProtectProc`, a system-call filter
@@ -164,18 +164,18 @@ If something on Windows or macOS fails, tell us what it printed:
 
 ## Security model
 
-- **The agent never gets a key.** No tool returns a value. The broker attaches the key to the
-  request itself, the way you set for that key (a header, a query parameter, a username and
-  password, or part of the web address), and removes it from the answer. Keys marked
+- **The agent never gets a secret.** No tool returns a value. The broker attaches the secret to the
+  request itself, the way you set for that secret (a header, a query parameter, a username and
+  password, or part of the web address), and removes it from the answer. Secrets marked
   "stamped" (AWS, exchanges) never travel: the broker signs each request with them.
 - **A separate account.** Your agents run as you; the broker doesn't. They can't read its
   files or its memory.
-- **End-to-end encrypted vault.** Keys are encrypted in your browser with AES-256-GCM. The
-  vault key comes from your passphrase, mixed with an Account Secret that never leaves your
+- **End-to-end encrypted vault.** Secrets are encrypted in your browser with AES-256-GCM. The
+  vault key comes from your passphrase, mixed with an Account Key that never leaves your
   device, through Argon2id (PBKDF2 for a vault made where WebAssembly is off, such as iPhone
   Lockdown Mode). We store ciphertext only.
 - **Signed requests.** The broker is paired to your account with a P-256 key whose fingerprint
-  you confirm. The server serves a key's ciphertext only to requests that broker signed, so a
+  you confirm. The server serves a secret's ciphertext only to requests that broker signed, so a
   copied credential alone gets nothing.
 - **Approvals with your passkey.** An "ask me first" web call waits until you approve that
   exact destination, method and path, once or for a short window. Every payment outside your
@@ -183,19 +183,19 @@ If something on Windows or macOS fails, tell us what it printed:
   that only says "approved" can't spend your money.
 - **A log on your computer.** Every call is recorded by the broker, signed, and checked
   against a copy of its chain we hold, so a changed log is detected. For "run without asking"
-  keys, where the key went and why stays on your computer; we never see it.
+  secrets, where the secret went and why stays on your computer; we never see it.
   `sudo wundervault-agent --destinations` opens it.
 - **HTTPS only**, with real certificate checks; redirects are not followed; private network
-  addresses are refused unless you allowed one for that key.
+  addresses are refused unless you allowed one for that secret.
 
 ### Honest limitations
 
-- A "run without asking" key goes where your agent sends it. A tricked agent could send it to
-  a server someone else controls, because the request carries the key. For keys that matter,
+- A "run without asking" secret goes where your agent sends it. A tricked agent could send it to
+  a server someone else controls, because the request carries the secret. For secrets that matter,
   choose "ask me first".
 - "Ask me first" approves a destination, method and path, not what the request says. Within an
   approval window, calls to the same place go ahead whatever they contain.
-- The broker removes your key from the answer as it was sent. A service that sends it back in
+- The broker removes your secret from the answer as it was sent. A service that sends it back in
   another form, such as encoded, could get it past; and anything the call creates, such as a
   new API token, is your agent's.
 - Agents that run under the same user account can use each other's access to the broker. Run
@@ -203,7 +203,7 @@ If something on Windows or macOS fails, tell us what it printed:
 - The broker must run on the same computer as the agent; fully air-gapped setups don't fit.
 - The platform is **open-core**: this package and the
   [browser crypto](https://github.com/wundervault/wundervault-crypto) are AGPL-3.0, so you can
-  audit everything that touches your keys; the hosted service is not open source.
+  audit everything that touches your secrets; the hosted service is not open source.
 
 Every known limit, kept with the code: [wundervault.com/limitations](https://wundervault.com/limitations).
 
@@ -214,14 +214,14 @@ The full reference, with every argument: [wundervault.com/mcp](https://wundervau
 ### `vault_call`
 
 ```
-entry_id: string       which key
+entry_id: string       which secret
 purpose: string        why; kept in the broker's log on the owner's computer
 request?: {            describe the call (or operation_id + args instead)
   origin: { scheme: "https", host, port }, method, path,
-  query?, body?, headers?,   # your own headers; never the one carrying the key
+  query?, body?, headers?,   # your own headers; never the one carrying the secret
   stamp?                     # for stamped keys: how the service signs requests
 }
-operation_id?, args?   run an operation the owner defined for this key
+operation_id?, args?   run an operation the owner defined for this secret
 ```
 
 ### `vault_ssh_exec`
@@ -263,14 +263,14 @@ The owner approves every signature and is shown the data in full when it is text
 
 ### `vault_entries_list`
 
-No arguments. Each key's id, name, tier and kind (web service, SSH, wallet or signing key),
+No arguments. Each secret's id, name, tier and kind (web service, SSH, wallet or signing key),
 and any operations the owner defined. Never a value.
 
 ## Sandbox / demo mode
 
 Set `WUNDERVAULT_MOCK=1` to run the server **without** a broker or any credentials. Every
 tool call then returns a representative response clearly labelled `[DEMO MODE]` instead of
-contacting the vault — **no real key is ever involved**. It exists so you can try the tool
+contacting the vault — **no real secret is ever involved**. It exists so you can try the tool
 surface without an account, and so MCP directory scanners and CI (e.g.
 [Glama](https://glama.ai)) can start the server and exercise each tool. It is **off by
 default**.

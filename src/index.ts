@@ -71,7 +71,7 @@ Options:
                    secrets, and print its path. Never leaves this machine.
   --help           Show this help
 
-Keys stay with the broker (wundervault-agent); no tool returns one.
+Secrets stay with the broker (wundervault-agent); no tool returns one.
 Set WUNDERVAULT_AGENT_NAME in your MCP config to identify this agent.
 Enrol an agent with the broker: wundervault-agent --enrol (claim code from your vault).
 Setup: https://wundervault.com/quickstart
