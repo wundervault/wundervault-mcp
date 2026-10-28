@@ -85,6 +85,8 @@ export interface Holder {
   source: 'holder' | 'lock-file' | 'unknown';
   /** The holder said it lets other copies of the same agent share (SPEC-2.0-shared-agent S1). */
   shares: boolean;
+  /** Set (true) only when the holder runs under ANOTHER user account on this computer (2.0.1). */
+  otherAccount?: boolean;
 }
 
 export interface Claim {
@@ -264,7 +266,9 @@ function askHolder(timeoutMs = 1000): Promise<Holder | null> {
             // `shares` only counts from a holder under THIS account: the port range is
             // machine-global, so two accounts' same-name agents can meet on one address (round 1, B2).
             done({ pid: o.pid ?? null, since: o.since ?? null, agent: o.agent ?? null, source: 'holder',
-                   shares: o.shares === 1 && o.account === accountTag() });
+                   shares: o.shares === 1 && o.account === accountTag(),
+                   // Only when it is so: a holder's fields are what whoHolds reports (round 1, B3).
+                   ...(typeof o.account === 'string' && o.account !== accountTag() ? { otherAccount: true } : {}) });
             return;
           }
         } catch { /* not ours */ }
@@ -681,6 +685,47 @@ export function describeHolder(h: Holder): string {
   if (!bits.length) return 'another process on this machine';
   if (h.source === 'lock-file') bits.push('reported by its lock file');
   return bits.join(', ');
+}
+
+/** A holder's start time, the way a person reads it. Its raw form when it isn't a date. */
+function readableSince(since: string): string {
+  const d = new Date(since);
+  if (Number.isNaN(d.getTime())) return since;
+  return d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
+/**
+ * What a copy that stands down tells the agent and the owner (2.0.1, B3).
+ *
+ * The 2.0.0 text ("already checked out by another MCP instance … whose name maps to the same
+ * address") was accurate and unusable: on cutover day the owner had to find and kill the old
+ * process by hand. The usual cause is an app that was open when version 2 was installed, so the
+ * usual fix comes first, in the words a person would use.
+ */
+export function heldNoticeText(agent: string, h: Holder): string {
+  const proc = h.pid !== null ? `process ${h.pid}` : 'another process on this computer';
+  const since = h.since ? `, running since ${readableSince(h.since)}` : '';
+  if (h.otherAccount) {
+    // Not an older copy (review round 1, blind spot B3): a current one, under another user.
+    return `Wundervault can't start for "${agent}": another user account on this computer runs an agent `
+      + `with the same name, and its copy of Wundervault holds the place this one needs (${proc}${since}). `
+      + `Two user accounts can't share one.\n\n`
+      + `This session has no vault tools until that changes. It isn't a crash or a broken install.\n\n`
+      + `To fix it: give this agent a different name (WUNDERVAULT_AGENT_NAME in its MCP settings), then `
+      + `reconnect Wundervault (in Claude Code: /mcp).`;
+  }
+  if (h.agent && h.agent !== agent) {
+    return `Wundervault can't start for "${agent}": another agent, "${h.agent}", already holds the same `
+      + `place on this computer (${proc}${since}), and two different agents can't share one.\n\n`
+      + `This session has no vault tools until that changes. It isn't a crash or a broken install.\n\n`
+      + `To fix it: give one of the two agents a different name (WUNDERVAULT_AGENT_NAME in its MCP `
+      + `settings), then reconnect Wundervault (in Claude Code: /mcp).`;
+  }
+  return `Wundervault can't start for "${agent}": an older copy of Wundervault for this agent is still `
+    + `running (${proc}${since}), and an older copy can't share the agent's place.\n\n`
+    + `This session has no vault tools until it closes. It isn't a crash or a broken install.\n\n`
+    + `To fix it: quit and reopen your agent app, which closes the old copy, then reconnect Wundervault `
+    + `(in Claude Code: /mcp). If it keeps happening, end ${proc}.`;
 }
 
 export function addressDescription(): string {

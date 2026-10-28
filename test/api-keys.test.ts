@@ -102,10 +102,13 @@ let dir = '';
 let vault: http.Server | null = null;
 let baseUrl = '';
 let opChecks: string[] = [];
+/** Set to a tier-2 status ('denied', 'expired') to make operation-check ask the owner, who answers so. */
+let askOwner: string | null = null;
 let daemon: any;
 
 function startVault(): Promise<void> {
   opChecks = [];
+  askOwner = null;
   return new Promise((resolve) => {
     vault = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
@@ -132,8 +135,10 @@ function startVault(): Promise<void> {
         if (url.pathname === '/agent/vault/operation-check') {
           // Everything the server is told about a call, in full, to prove the key is not in it.
           opChecks.push(url.search + Buffer.concat(chunks).toString('utf8'));
+          if (askOwner) return json(200, { allowed: false, tier: '2', request_id: 'rq1', message: 'Asked the owner.' });
           return json(200, { allowed: true, tier: '1' });
         }
+        if (url.pathname === '/agent/vault/tier2-requests/rq1') return json(200, { status: askOwner });
         return json(404, { detail: 'nope' });
       });
     });
@@ -285,4 +290,18 @@ describe('B. a key in the web address', () => {
     }
     expect(wire).toHaveLength(0);
   });
+});
+
+describe('C. an approval that does not come (2.0.1, B4)', () => {
+  for (const [status, words] of [['denied', /^The vault owner declined this use of "tg"\. Nothing was sent\./],
+    ['expired', /^The approval request for "tg" expired before the vault owner answered\. Nothing was sent\./]] as const) {
+    it(`says so plainly when the owner's answer is "${status}", and sends nothing`, async () => {
+      askOwner = status;
+      const r = await call('tg', 'POST', '/sendMessage?chat_id=5');
+      expect(r.json.error, r.raw).toMatch(words);
+      expect(r.json.error).toContain(`The owner sees exactly: POST https://127.0.0.1:${upPort}/sendMessage?chat_id=5`);
+      expect(r.json.error).not.toMatch(/HTTP 403|\/agent\/|tier2-requests/);
+      expect(wire).toHaveLength(0);
+    }, 20_000);   // the broker's first look at the request is 5 s after asking
+  }
 });

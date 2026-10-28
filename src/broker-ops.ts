@@ -43,7 +43,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { AgentVaultAPI } from './api-client.js';
+import { AgentVaultAPI, approvalNotGivenMessage } from './api-client.js';
 import { signerFromIdentity, type BrokerSigner } from './broker-sign.js';
 import { decryptSecretContent, loadEncryptionKey } from './crypto.js';
 import {
@@ -410,13 +410,16 @@ export class BrokerOps {
 
       if (!verdict.allowed) {
         rec.approval = 'asked';
-        const approved = verdict.request_id
-          ? await this.api.waitForTier2Approval(verdict.request_id)
-          : false;
-        if (!approved) {
+        const outcome = verdict.request_id
+          ? await this.api.waitForTier2Outcome(verdict.request_id)
+          : null;
+        if (outcome !== 'approved') {
           rec.approval = 'not_approved';
-          return err(`${verdict.message ?? 'This call needs owner approval.'}\n\n`
-            + `Nothing was sent. The owner sees exactly: ${def.route.method} `
+          // The same words as every other tool (2.0.1, B4); a server that could not ask at all
+          // still says why, in its own words.
+          const why = outcome ? approvalNotGivenMessage(outcome, `"${s.name}"`)
+            : `${verdict.message ?? 'This call needs owner approval.'} Nothing was sent.`;
+          return err(`${why}\n\nThe owner sees exactly: ${def.route.method} `
             + `${originString(def.origin)}${def.route.path}`);
         }
         const second = await this.api.checkOperation({

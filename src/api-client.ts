@@ -6,6 +6,34 @@ import { VERSION } from './version.js';
 
 const TIMEOUT = 30_000;
 
+/** How long a tool call waits for the owner to answer an approval. */
+export const APPROVAL_WAIT_MS = 90_000;
+
+export type ApprovalOutcome = 'approved' | 'declined' | 'expired' | 'unanswered';
+
+/**
+ * What an agent is told when an approval did not come (2.0.1, B4). One wording for every tool,
+ * so "the owner hasn't looked yet" never reads like "the owner said no", and never names a
+ * server endpoint the agent has no way to call.
+ */
+export function approvalNotGivenMessage(outcome: Exclude<ApprovalOutcome, 'approved'>, what = 'this secret'): string {
+  if (outcome === 'declined') return `The vault owner declined this use of ${what}. Nothing was sent.`;
+  if (outcome === 'expired') {
+    return `The approval request for ${what} expired before the vault owner answered. Nothing was sent. `
+      + 'Make the same call again to ask again.';
+  }
+  return `Waited ${APPROVAL_WAIT_MS / 1000} seconds for the vault owner to approve using ${what}; no answer yet. `
+    + 'Nothing was sent. The request stays open in their vault for a day: when they approve it, make the '
+    + 'same call again.';
+}
+
+export class ApprovalNotGiven extends Error {
+  constructor(public readonly outcome: Exclude<ApprovalOutcome, 'approved'>, what?: string) {
+    super(approvalNotGivenMessage(outcome, what));
+    this.name = 'ApprovalNotGiven';
+  }
+}
+
 /** The server's view of one activity-log chain: one per account and broker key. */
 export interface AnchorState {
   /** Opaque: the same value for every agent of one account on this machine. */
@@ -236,8 +264,11 @@ export class AgentVaultAPI {
         ? String(err.message).match(/tier2-requests\/([A-Za-z0-9_-]+)/)?.[1]
         : undefined;
       if (!requestId) throw err;
-      const approved = await this.waitForTier2Approval(requestId);
-      if (!approved) throw err;
+      const outcome = await this.waitForTier2Outcome(requestId);
+      // Not the server's 403 (2.0.1, B4): it named an endpoint the agent cannot use and read as
+      // a refusal even when the owner simply had not looked yet. The same words as every tool,
+      // with the secret's name (review round 1, F2), which this refused fetch never returned.
+      if (outcome !== 'approved') throw new ApprovalNotGiven(outcome, await this.quotedNameOf(id));
       return await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, { purpose: '' });
     }
   }
@@ -256,22 +287,39 @@ export class AgentVaultAPI {
    * escalation routine — at which point it stops being read, which is the failure mode
    * that matters for a channel whose entire job is to work at 3am.
    */
+  /** An entry's name, quoted, for a message; undefined when the list can't be read. Best effort:
+   *  it runs only on a call that has already failed, and must not fail it differently. */
+  private async quotedNameOf(id: string): Promise<string | undefined> {
+    try {
+      const e = (await this.listSecrets()).entries.find((x) => x.id === id);
+      return e?.secret_name ? `"${e.secret_name}"` : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   async waitForTier2Approval(requestId: string): Promise<boolean> {
-    const deadline = Date.now() + 90_000;
+    return (await this.waitForTier2Outcome(requestId)) === 'approved';
+  }
+
+  /** The same wait, saying how it ended, so the agent can be told which (2.0.1, B4). */
+  async waitForTier2Outcome(requestId: string): Promise<ApprovalOutcome> {
+    const deadline = Date.now() + APPROVAL_WAIT_MS;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 5_000));
       try {
         const res = await this.fetchJson<{ status: string }>(
           `/agent/vault/tier2-requests/${requestId}`,
         );
-        if (res.status === 'approved') return true;
-        if (res.status === 'denied' || res.status === 'expired') return false;
+        if (res.status === 'approved') return 'approved';
+        if (res.status === 'denied') return 'declined';
+        if (res.status === 'expired') return 'expired';
       } catch {
         // transient poll error — keep waiting until the deadline
       }
     }
     await this.reportUnanswered(requestId);
-    return false;
+    return 'unanswered';
   }
 
   /**

@@ -67,8 +67,47 @@ fi
 # ── the binary ───────────────────────────────────────────────────────────────
 # Resolved before anything is created, so a bad path fails before it has changed the
 # machine rather than after.
+#
+# >>> pick the broker: the copy this installer came with (2.0.1). The first
+# wundervault-agent on sudo's PATH used to win, and /usr/local/bin comes before /usr/bin, so
+# an old copy left in /usr/local was installed over the new one the owner had just put in
+# /usr (cutover day, 2026-10-27). Windows has always installed the copy beside it.
+# test/installer-pick.test.ts runs this function on its own; it sets EXEC and reads nothing
+# else.
+pick_broker() {
+  _self_pkg=$(CDPATH= cd -- "$1/.." 2>/dev/null && pwd -P) || _self_pkg=""
+  _own=""
+  if [ -n "$_self_pkg" ] && [ -f "$_self_pkg/dist/agent.js" ]; then
+    # npm's global layout: <prefix>/lib/node_modules/@wundervault/mcp-server, launchers in <prefix>/bin.
+    _bin=$(CDPATH= cd -- "$_self_pkg/../../../../bin" 2>/dev/null && pwd -P) || _bin=""
+    if [ -n "$_bin" ] && [ -x "$_bin/wundervault-agent" ] \
+       && [ "$(readlink -f "$_bin/wundervault-agent")" = "$(readlink -f "$_self_pkg/dist/agent.js")" ]; then
+      _own="$_bin/wundervault-agent"
+    fi
+  fi
+  _first=$(command -v wundervault-agent 2>/dev/null || true)
+  if [ -n "$_own" ]; then
+    EXEC="$_own"
+    if [ -n "$_first" ] && [ "$(readlink -f "$_first")" != "$(readlink -f "$_own")" ]; then
+      echo "note: using $_own, the copy this installer came with."
+      echo "      $_first comes first on PATH but is a different copy, so it was skipped."
+    fi
+  else
+    EXEC="$_first"
+    if [ -n "$EXEC" ] && [ -n "$_self_pkg" ]; then
+      case "$(readlink -f "$EXEC")" in
+        "$_self_pkg"/*) ;;
+        *)
+          echo "WARNING: no wundervault-agent launcher found for the copy at $_self_pkg," >&2
+          echo "         so this installs $EXEC from PATH, which is a different copy." >&2
+          echo "         To choose:  sudo sh $0 --exec /path/to/wundervault-agent" >&2 ;;
+      esac
+    fi
+  fi
+}
+# <<< pick the broker
 if [ -z "$EXEC" ]; then
-  EXEC=$(command -v wundervault-agent 2>/dev/null || true)
+  pick_broker "$HERE"
 fi
 [ -n "$EXEC" ] || {
   echo "Could not find wundervault-agent on PATH." >&2
@@ -299,11 +338,6 @@ else
   echo "NOTE: openssl not found; the broker will create its key at first --pair." >&2
 fi
 
-echo ""
-echo "  Next, ONCE per machine:  sudo wundervault-agent --pair"
-echo "  That prints a code and a fingerprint. Type the code into the dashboard and check"
-echo "  the fingerprint matches before you confirm. Neither value is a secret."
-echo ""
 
 SEALED_KEY="${STATE_DIR}/store.key.cred"
 if [ -f "$SEALED_KEY" ]; then
@@ -408,9 +442,30 @@ if systemctl is-active --quiet "$UNIT_NAME"; then
   echo
   echo "The secret broker is running. ${STATE_DIR} is readable only by ${ACCOUNT},"
   echo "which means your agents cannot read the credentials it holds."
+  # One block, in order, and the last thing printed (2.0.1): the --migrate line used to come
+  # after the pair line, marked "no sudo", and read as "pair without sudo".
+  # The short command only when it runs the copy just installed (review rounds 1-2): an older
+  # copy first on PATH, --exec, or a prefix that isn't on PATH at all would otherwise send the
+  # owner to the wrong program, or to none. Quoted when the path has a space in it.
+  AGENT_CMD=wundervault-agent
+  _onpath=$(command -v wundervault-agent 2>/dev/null || true)
+  if [ -z "$_onpath" ] || [ "$(readlink -f "$_onpath")" != "$(readlink -f "$EXEC")" ]; then
+    case "$EXEC" in *" "*) AGENT_CMD="\"$EXEC\"" ;; *) AGENT_CMD="$EXEC" ;; esac
+    echo
+    if [ -n "$_onpath" ]; then
+      echo "Note: wundervault-agent on PATH ($_onpath) is a different copy, so the steps below"
+      echo "      use the full path of the one installed. Remove the other copy to use the short command."
+    else
+      echo "Note: wundervault-agent isn't on PATH here, so the steps below use its full path."
+    fi
+  fi
   echo
-  echo "Next, as your normal user (no sudo):"
-  echo "  wundervault-agent --migrate     # hand existing agents over to the daemon"
+  echo "Next, in this order:"
+  echo "  1. Pair this computer, once:   sudo ${AGENT_CMD} --pair"
+  echo "     It prints a code and a fingerprint. Type the code into your vault and check the"
+  echo "     fingerprint matches before you confirm. Neither value is a secret."
+  echo "  2. Only if this computer ran Wundervault version 1, as your normal user (no sudo):"
+  echo "       ${AGENT_CMD} --migrate"
 else
   echo
   echo "The secret broker did not start. What it said:" >&2

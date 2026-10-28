@@ -13,6 +13,7 @@ import {
   releaseCredential,
   startReclaim,
   describeHolder,
+  heldNoticeText,
   agentName,
   type Holder,
 } from './lock.js';
@@ -95,15 +96,7 @@ Setup: https://wundervault.com/quickstart
  */
 async function serveHeldNotice(holder: Holder): Promise<void> {
   const agent = agentName() || '(unnamed agent)';
-  const detail =
-    `The wundervault credential for "${agent}" is already checked out by another ` +
-    `MCP instance (${describeHolder(holder)}) that cannot share it.\n\n` +
-    `Copies of one agent share its connection when they are all version 2 or later; ` +
-    `this holder is an older copy, or a different agent whose name maps to the same ` +
-    `address. So this session has no vault tools. This is the vault enforcing that ` +
-    `rule — not a crash, and not a broken install.\n\n` +
-    `To fix it: update or close the copy that owns the process above, then reconnect ` +
-    `this MCP server (/mcp in Claude Code).`;
+  const detail = heldNoticeText(agent, holder);
 
   console.error(`[wundervault-mcp] ${detail.replace(/\n+/g, ' ')}`);
 
@@ -142,15 +135,9 @@ async function serveHeldNotice(holder: Holder): Promise<void> {
     const free = await credentialIsFree();
     const current = free ? null : await whoHolds();
     const text = current
-      ? `Vault tools are unavailable in this session. The credential for ` +
-        `"${agent}" is currently held by another MCP instance ` +
-        `(${describeHolder(current)}). The vault permits one connected agent per ` +
-        `credential at a time; this is that rule, not a crash. To take it, close ` +
-        `the session that owns that process, then reconnect this MCP server ` +
-        `(/mcp in Claude Code).`
-      : `The credential for "${agent}" is now FREE. This process cannot upgrade ` +
-        `itself mid-session — reconnect this MCP server (/mcp in Claude Code) to ` +
-        `get the vault tools.`;
+      ? `Vault tools are still unavailable in this session. ${heldNoticeText(agent, current)}`
+      : `The old copy has closed, so "${agent}" is free now. This session can't pick that up by ` +
+        `itself: reconnect Wundervault (in Claude Code: /mcp) to get the vault tools.`;
     return { content: [{ type: 'text' as const, text }] };
   });
 

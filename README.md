@@ -79,9 +79,12 @@ Every step: [wundervault.com/help/computer](https://wundervault.com/help/compute
 **2. Install the package and the broker** on the computer your agents use:
 
 ```bash
-npm install -g @wundervault/mcp-server@2
+sudo npm install -g @wundervault/mcp-server@2
 sudo sh "$(npm root -g)/@wundervault/mcp-server/packaging/install-daemon.sh"
 ```
+
+That is Linux: `sudo`, because the broker only runs a copy installed in a system folder, never
+one inside your home folder.
 
 Windows and macOS have their own installers; see
 [wundervault.com/install](https://wundervault.com/install). The installer downloads nothing

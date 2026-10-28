@@ -14,7 +14,13 @@ import path from 'node:path';
  * another build, or of another agent, is still refused. Run on both lock strategies.
  */
 
-const AGENT = `ShareTest_${process.pid}_${Date.now()}`;
+// A fresh name for every test (2.0.1, B5). On Linux the address is derived from the name, so one
+// shared name meant each test bound the socket the previous one had only just let go of: CI hit
+// EADDRINUSE in "refuses to share with a same-name holder under another account" right after the
+// test that takes the claim during the LAST attempt. A name per test is an address per test.
+const AGENT_BASE = `ShareTest_${process.pid}_${Date.now()}`;
+let agentSeq = 0;
+let AGENT = AGENT_BASE;
 const realHomedir = os.homedir;
 const saved: Record<string, string | undefined> = {};
 let home: string;
@@ -64,6 +70,7 @@ for (const strategy of STRATEGIES) {
       home = mkdtempSync(path.join(os.tmpdir(), 'wv-share-'));
       (os as any).homedir = () => home;
       mkdirSync(path.join(home, '.wundervault'), { recursive: true });
+      AGENT = `${AGENT_BASE}_${++agentSeq}`;
       setEnv('WUNDERVAULT_AGENT_NAME', AGENT);
       setEnv('WUNDERVAULT_LOCK_STRATEGY', strategy);
       setEnv('WUNDERVAULT_LOCK_PORT', strategy === 'port' ? String(await freePort()) : undefined);
