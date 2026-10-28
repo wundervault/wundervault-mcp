@@ -139,7 +139,8 @@ for (const which of ['linux', 'macos'] as const) {
       expect(chain(which, '/usr/bin/env')).toEqual({ ok: true, why: '' });
     });
     it('refuses sticky, world-writable /tmp on the way (real)', () => {
-      expect(chain(which, '/tmp').why).toBe('/tmp is writable by group or others (mode 777)');
+      // On a Mac /tmp is a link to /private/tmp: the walk follows it and names the real folder.
+      expect(chain(which, '/tmp').why).toBe(`${fs.realpathSync('/tmp')} is writable by group or others (mode 777)`);
     });
     it('refuses a file another user owns, naming it', () => {
       const f = file(path.join(tmp, 'bin', 'node'));
@@ -300,7 +301,14 @@ describe('package_scan', () => {
     it(`${which}: an access control list in the package is refused (Linux: ls marks it with +)`, () => {
       const pkg = tree();
       const ls = `ls() {\n  if [ "$1" = -lRL ]; then printf '%s\\n' '${pkg}:' '-rw-r--r--+ 1 root root 0 Oct 28 10:00 agent.js'; else command ls "$@"; fi\n}`;
-      expect(scan(pkg, gnu({}) + '\n' + ls)).toMatch(/has an access control list \(-rw-r--r--\+/);
+      // the Linux branch, wherever the test runs (a Mac takes the find -acl branch, tested below)
+      expect(scan(pkg, gnu({}) + '\nuname() { echo Linux; }\n' + ls)).toMatch(/has an access control list \(-rw-r--r--\+/);
+    });
+    it.runIf(process.platform === 'darwin')(`${which}: a real access control list in the package is refused (macOS: find -acl)`, () => {
+      const pkg = tree(); const js = path.join(pkg, 'dist', 'agent.js');
+      expect(scan(pkg, gnu({}))).toBe('OK');
+      expect(spawnSync('/bin/chmod', ['+a', 'everyone allow write', js]).status).toBe(0);
+      expect(scan(pkg, gnu({}))).toBe(`BAD ${pkg} has an access control list (${js}), so someone other than root may change it`);
     });
   }
 });
