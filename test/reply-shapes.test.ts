@@ -210,6 +210,16 @@ describe('round 2 regressions', () => {
     expect(get.error).not.toMatch(/may already have reached/);
   });
 
+  it('a POST that loses a REUSED (kept-alive) connection still says it may have run (2.0.2)', async () => {
+    // The second request rides the socket the first left open; a reused socket fires no new
+    // secureConnect, and the warning used to be lost exactly there (seen first on Node.js 24).
+    const warm = await call(def('GET', '/record'));
+    expect(warm.ok).toBe(true);
+    const post = await call(def('POST', '/hang-up'));
+    expect(post.ok).toBe(false);
+    expect(post.error).toMatch(/may already have reached the service and taken effect/);
+  });
+
   it('a POST that never connected does not claim it may have run', async () => {
     const closed = https.createServer();
     await new Promise<void>((r) => closed.listen(0, '127.0.0.1', () => r()));

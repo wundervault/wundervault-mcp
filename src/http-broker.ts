@@ -13,6 +13,7 @@
 import { request as httpsRequest } from 'node:https';
 import { lookup as dnsLookup } from 'node:dns';
 import { isIP } from 'node:net';
+import type { TLSSocket } from 'node:tls';
 import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
 import type { OperationDefinition, CredentialBinding } from './opdef.js';
 import { filterResponse } from './opdef.js';
@@ -518,7 +519,14 @@ export async function performOperation(
     const total = setTimeout(() => { req.destroy(); finish({ ok: false, error: `Operation timed out after ${TOTAL_TIMEOUT_MS / 1000}s.` }); }, TOTAL_TIMEOUT_MS);
     req.on('close', () => clearTimeout(total));
     req.on('timeout', () => { req.destroy(); finish({ ok: false, error: 'Connection timed out.' }); });
-    req.on('socket', (sock) => { sock.once('secureConnect', () => { connected = true; }); });
+    // A kept-alive socket the agent hands back is connected and verified already, and fires
+    // no second secureConnect: on Node.js 24 a POST that lost a REUSED connection was reported
+    // as a plain failure, without "may have run". `authorized` is set only once the handshake
+    // has verified the certificate, so a fresh socket still waits for the event.
+    req.on('socket', (sock) => {
+      if ((sock as TLSSocket).authorized) connected = true;
+      else sock.once('secureConnect', () => { connected = true; });
+    });
     req.on('error', (e) => finish({ ok: false, error: `Request failed: ${e.message}` }));
 
     if (body) req.write(body);

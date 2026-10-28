@@ -30,6 +30,9 @@ installers. The full history, with the website's changes beside it, is at
   dropped as well as its user, it stops instead of carrying on with them.
 - A damaged record in the destination store shows as a damaged value; it no longer stops the page from
   showing the rest of the log.
+- A request that changes something (a POST, a payment) and loses its connection now always says it may
+  already have taken effect. On a connection kept open from an earlier call it read as a plain failure,
+  which invites sending it again.
 - CI runs on Node.js 22 and 24, the versions 2.0 supports (it was still testing Node.js 20).
 
 ## [2.0.1] — 2026-10-27
