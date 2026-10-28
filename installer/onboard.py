@@ -1,20 +1,35 @@
 #!/usr/bin/env python3
 """
 WunderVault agent onboarding — download and run:
-  curl -fsSL https://wundervault.com/onboard -o onboard.py && python3 onboard.py "SETUP_URL"
+  curl -fsSL https://wundervault.com/onboard -o onboard.py && python3 onboard.py
 
 Requires: python3, pip install cryptography (or: pip install cryptography --quiet)
 """
 import sys, json, base64, hashlib, hmac, os
-try:
-    import urllib.request as _req
-    import urllib.parse as _parse
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-except ImportError:
-    print("Installing cryptography...")
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "cryptography", "--quiet"])
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import urllib.request as _req
+import urllib.parse as _parse
+
+# `cryptography` is NOT imported at module scope any more.
+#
+# It used to be, with a pip install in the except branch — which meant that on a machine
+# where pip is absent or the interpreter is externally managed (PEP 668), this script died
+# on its second line with a traceback about a missing module, before it had said anything
+# about what it was for.
+#
+# It is also no longer always needed. Where the system daemon is installed, the daemon
+# fetches and decrypts the credentials inside its own account and this script never touches
+# a key — so on the path that matters most it was a hard dependency for work it does not do.
+# Fetched on demand, by the two paths that genuinely need it: signature verification and the
+# pre-split credential decrypt.
+def _aesgcm():
+    """The AESGCM class, installing `cryptography` first if it is not already there."""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        return AESGCM
+    except ImportError:
+        _ensure_cryptography()
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        return AESGCM
 
 ONBOARD_PUBLIC_KEY = "3yhfVM5ABcBHPGSuZSQuIxr0C9QkHnFKoGMWwcWpooY="  # ed25519 public key
 
@@ -66,7 +81,7 @@ def _ensure_cryptography():
     print("  any system    : python3 -m venv ~/.wv-venv \\")
     print("                    && ~/.wv-venv/bin/pip install cryptography \\")
     _self = sys.argv[0] if sys.argv and sys.argv[0] not in ("", "-") else "onboard.py"
-    print("                    && ~/.wv-venv/bin/python3 " + _self + ' "SETUP_URL"')
+    print("                    && ~/.wv-venv/bin/python3 " + _self)
     sys.exit(1)
 
 
@@ -125,7 +140,7 @@ def verify_self(base_url, allow_skip=False):
     if not script_path or script_path == "<stdin>":
         print("ERROR: Script integrity cannot be verified when running via pipe.")
         print("Download the script first so verification can run:")
-        print('  curl -fsSL https://wundervault.com/onboard -o onboard.py && python3 onboard.py "SETUP_URL"')
+        print('  curl -fsSL https://wundervault.com/onboard -o onboard.py && python3 onboard.py')
         sys.exit(1)
 
     try:
@@ -285,32 +300,138 @@ Nothing above has happened. Re-run without --dry-run to proceed.
 """)
 
 
+DEFAULT_BASE_URL = "https://wundervault.com"
+
+
+def _flag_value(argv, name):
+    """`--name value` or `--name=value`, or None."""
+    for i, a in enumerate(argv):
+        if a == name and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _strip_flags(argv, flags, valued=()):
+    """Remove known flags, including the VALUE that follows a valued one.
+
+    Without the `valued` handling, `--base-url https://x` leaves `https://x` sitting in
+    args, where the argv refusal below reads it as somebody passing a setup link and
+    refuses to run at all.
+    """
+    out = []
+    skip = False
+    for a in argv:
+        if skip:
+            skip = False
+            continue
+        if a in flags:
+            continue
+        if a in valued:
+            skip = True
+            continue
+        if any(a.startswith(v + "=") for v in valued):
+            continue
+        out.append(a)
+    return out
+
+
+def _read_setup_link():
+    """Read the setup link from stdin.
+
+    A prompt when there is a terminal, a plain read when something is piping it in, so
+    the script stays scriptable without the link ever reaching a command line. The
+    prompt goes to stderr so that piping stdout somewhere does not swallow it.
+    """
+    if sys.stdin.isatty():
+        sys.stderr.write("Paste the setup link from the dashboard (it ends in #...): ")
+        sys.stderr.flush()
+        line = sys.stdin.readline()
+    else:
+        # Piped: take the first non-empty line. Reading the whole stream would pick up a
+        # trailing newline or a second line and turn a good link into an unparseable one.
+        line = ""
+        for candidate in sys.stdin:
+            if candidate.strip():
+                line = candidate
+                break
+    return line.strip()
+
+
 def main():
     args = sys.argv[1:]
     repair_mode = '--repair' in args
     dry_run = '--dry-run' in args or '--explain' in args
     skip_verify = '--skip-verify' in args
     _flags = ('--repair', '--dry-run', '--explain', '--skip-verify')
-    args = [a for a in args if a not in _flags]
+    args = _strip_flags(args, _flags, valued=('--base-url',))
 
-    if not args:
-        print("Usage: python3 onboard.py [--repair] [--dry-run] <SETUP_URL>")
-        print("  SETUP_URL format: https://wundervault.com/setup/agent/TOKEN#PASSPHRASE")
+    # THE SETUP LINK IS NEVER TAKEN FROM argv.
+    #
+    # A command line is world-readable through /proc/<pid>/cmdline, so `onboard.py
+    # "https://...#passphrase"` published it to every process on the machine for as long
+    # as the script ran — and that link decrypts to the agent's encryption_key, which
+    # unwraps vault_key_for_agent, which decrypts every entry in its vault. Because
+    # fetching and burning are separate steps, anything that copied it had time to redeem
+    # it first.
+    #
+    # It is REFUSED rather than quietly ignored: someone pasting the old command needs to
+    # find out here, not after the link has already been published and spent.
+    if args:
+        looks_like_link = any(a.startswith('http://') or a.startswith('https://') for a in args)
+        print("Error: the setup link is not accepted as an argument.")
+        if looks_like_link:
+            print()
+            print("  A command line is readable by every process on this machine, and the link")
+            print("  is the key to this agent's vault. That link may now be compromised — repair")
+            print("  the agent in the dashboard to mint a new one before continuing.")
+        print()
+        print("Usage: python3 onboard.py [--repair] [--dry-run]")
+        print("  The setup link is read from stdin: paste it at the prompt, or pipe it in.")
         print("  --repair       Update an existing agent entry in place instead of adding a new one.")
         print("  --dry-run      Print every action this script would take, then exit. Changes nothing.")
         print("  --skip-verify  Proceed even if the signature cannot be fetched. Deliberate opt-out.")
-        sys.exit(1)
+        sys.exit(2)
 
+    # --dry-run needs no LINK. It prints what WOULD happen, and nothing it prints depends
+    # on which agent this is — so asking for the vault key in order to be told that
+    # nothing will be done was never a reasonable trade.
+    #
+    # It does depend on the ORIGIN, though, and a self-hosted install is not
+    # wundervault.com. The script cannot know where it was fetched from, so: take
+    # --base-url if given, accept a piped link if there is one (piping is not a person
+    # pasting, so the link is not being published to a terminal), and otherwise say
+    # plainly which origin the preview describes rather than implying it is universal.
+    if dry_run:
+        base = _flag_value(sys.argv[1:], "--base-url")
+        if not base and not sys.stdin.isatty():
+            piped = _read_setup_link()
+            if piped:
+                parsed_piped = _parse.urlparse(piped)
+                if parsed_piped.scheme and parsed_piped.netloc:
+                    base = f"{parsed_piped.scheme}://{parsed_piped.netloc}"
+        if not base:
+            base = DEFAULT_BASE_URL
+            print(f"(No origin given, so this describes {base}.")
+            print(" For a self-hosted vault, re-run with --base-url https://your.vault)")
+            print()
+        print_manifest(base)
+        sys.exit(0)
 
-    setup_url = args[0]
+    setup_url = _read_setup_link()
+    if not setup_url:
+        print("Error: no setup link given.")
+        sys.exit(2)
+
     parsed = _parse.urlparse(setup_url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
     token = parsed.path.rstrip('/').split('/')[-1]
     passphrase = parsed.fragment
-
-    if dry_run:
-        print_manifest(base_url)
-        sys.exit(0)
+    if not parsed.scheme or not parsed.netloc:
+        print("Error: that does not look like a setup link.")
+        print("  Expected: https://wundervault.com/setup/agent/TOKEN#PASSPHRASE")
+        sys.exit(2)
 
     # Verify BEFORE anything is installed or executed. _check_mcp_version runs
     # `npm install -g`, which executes the package's install scripts, so it must
@@ -324,6 +445,126 @@ def main():
         sys.exit(1)
 
     ua = "WunderVault-Onboard/1.0"
+
+    # ── Is there a system daemon to hand this to? ─────────────────────────────
+    #
+    # THE ORDER MATTERS AND IT IS EASY TO GET BACKWARDS. This script used to fetch the
+    # blob, decrypt it, and then decide what to do with the credentials. Once the daemon
+    # runs under its own account that is the wrong shape twice over: the credentials pass
+    # through this process for no reason, and the setup link is already spent by the time
+    # we could have handed it over. So the decision has to happen BEFORE the fetch.
+    #
+    # When the broker is there, this script never sees a credential at all. It
+    # passes the link across and the broker does the fetching, the decrypting and the
+    # burning inside the account that is allowed to hold the result.
+    # Imported here rather than at the bottom of main(): this branch runs BEFORE the
+    # pre-split path that used to own these imports, and a NameError at this point would
+    # abort onboarding after the daemon had already been told to enrol.
+    import socket as _socket
+    import shutil as _shutil
+
+    SYSTEM_MGMT_SOCK = "/run/wundervault/mgmt/agent.sock"
+
+    def _talk(sock_path, msg, timeout=60):
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(sock_path)
+        s.sendall((json.dumps(msg) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        return json.loads(buf.decode().strip())
+
+    if sys.platform.startswith("linux") and os.path.exists(SYSTEM_MGMT_SOCK):
+        print("Found the secret broker. Handing it the setup link —")
+        print("the credentials go straight into its own account and never touch this script.")
+
+        _socket_token = os.urandom(32).hex()
+        try:
+            _reply = _talk(SYSTEM_MGMT_SOCK, {
+                "action": "enrol",
+                "setup_url": setup_url,
+                "socket_token": _socket_token,
+            })
+        except Exception as _e:
+            print(f"ERROR: could not reach the secret broker at {SYSTEM_MGMT_SOCK}: {_e}")
+            print("       Check it with: systemctl status wundervault-agent")
+            sys.exit(1)
+
+        if not _reply or _reply.get("error"):
+            print(f"ERROR: the secret broker refused the setup link: {(_reply or {}).get('error')}")
+            sys.exit(1)
+
+        _name = _reply.get("agent_name") or "unknown"
+
+        # The token file is written HERE, by the user, not by the broker — reaching into a
+        # user's home directory is exactly the access the split removes.
+        _agents_dir = os.path.expanduser("~/.wundervault/agents")
+        os.makedirs(_agents_dir, exist_ok=True)
+        os.chmod(_agents_dir, 0o700)
+        _tok_path = os.path.join(_agents_dir, _name + ".token")
+        with open(_tok_path, "w") as _tf:
+            _tf.write(_socket_token)
+        os.chmod(_tok_path, 0o600)
+
+        print(f"Enrolled '{_name}'. Its credentials are in /var/lib/wundervault,")
+        print("which this account cannot read.")
+        if _reply.get("link_burned") is False:
+            print()
+            print("WARNING: the server did not confirm the setup link as used, so it stays")
+            print("valid until it expires. Repair the agent again if that matters to you.")
+
+        _mcp = os.path.expanduser("~/.openclaw/workspace/node_modules/.bin/wundervault-mcp")
+        if not os.path.exists(_mcp):
+            _mcp = _shutil.which("wundervault-mcp") or "wundervault-mcp"
+
+        print()
+        print("═══════════════════════════════════════════════")
+        print(f"  Agent : {_name}")
+        print(f"  Vault : {base_url}")
+        print()
+        print("  Next: add this entry to your framework's MCP server config,")
+        print("  then reload your MCP connection.")
+        print()
+        print(f'    Command : {_mcp}')
+        print(f'    Env     : WUNDERVAULT_AGENT_NAME = "{_name}"')
+        print()
+        print("  Token is auto-discovered — do not add it to the config:")
+        print(f"    ~/.wundervault/agents/{_name}.token")
+        print("═══════════════════════════════════════════════")
+        print()
+        print("Common MCP config file locations:")
+        print("  Claude Code  ~/.claude.json                           → mcpServers")
+        print("  Grok Build   ~/.grok/mcp.json                         → servers")
+        print("  OpenClaw     ~/.openclaw/openclaw.json                → mcp.servers")
+        print("  Hermes       ~/.hermes/config.yaml                    → mcp_servers")
+        print("  Windsurf     ~/.codeium/windsurf/mcp_config.json      → mcpServers")
+        print()
+        # Same machine-readable block as the pre-split path, so anything parsing this
+        # output keeps working. The socket moved, which is precisely why it is reported.
+        print("---")
+        print(f"WUNDERVAULT_AGENT_NAME={_name}")
+        print(f"WUNDERVAULT_VAULT_URL={base_url}")
+        print(f"WUNDERVAULT_DAEMON_SOCKET=/run/wundervault/{_name}.sock")
+        print(f"WUNDERVAULT_MCP_GLOBAL={_mcp}")
+        print("WUNDERVAULT_BOUNDARY=uid-split")
+        print("---")
+        sys.exit(0)
+
+    if sys.platform.startswith("linux"):
+        print()
+        print("No secret broker on this machine, so this sets up the older shape:")
+        print("credentials will be held by a process running as YOU, so its key material and")
+        print("memory are readable by anything running as you — including your agents.")
+        print()
+        print("To install the secret broker and get the real boundary, after this finishes run:")
+        print("  sudo sh /usr/local/lib/node_modules/@wundervault/mcp-server/packaging/install-daemon.sh")
+        print("  wundervault-agent --migrate     # then repair each agent and re-enrol")
+        print()
 
     # Fetch encrypted blob
     req = _req.Request(f"{base_url}/api/setup/agent/{token}", headers={"User-Agent": ua})
@@ -341,13 +582,23 @@ def main():
         sys.exit(1)
 
     # Derive key and decrypt blob
-    key = hashlib.pbkdf2_hmac("sha256", passphrase.encode(), b"wv-agent-setup-v1", 100000, dklen=32)
     raw = server["encrypted_blob"].replace('-', '+').replace('_', '/')
     raw += '=' * ((4 - len(raw) % 4) % 4)
     blob = base64.b64decode(raw)
-    try:
-        plaintext = AESGCM(key).decrypt(blob[:12], blob[12:], None)
-    except Exception:
+
+    # v2 first, then v1. The iteration count went from 100,000 to 600,000 — matching the
+    # vault KDF and the current OWASP figure — and the salt carries the version so a link
+    # minted just before the deploy still opens for the rest of its fifteen minutes. Drop
+    # the v1 branch once no v1 link can exist.
+    plaintext = None
+    for _salt, _iters in ((b"wv-agent-setup-v2", 600000), (b"wv-agent-setup-v1", 100000)):
+        _key = hashlib.pbkdf2_hmac("sha256", passphrase.encode(), _salt, _iters, dklen=32)
+        try:
+            plaintext = _aesgcm()(_key).decrypt(blob[:12], blob[12:], None)
+            break
+        except Exception:
+            continue
+    if plaintext is None:
         print("Error: Decryption failed — wrong passphrase or corrupted link.")
         sys.exit(1)
 
