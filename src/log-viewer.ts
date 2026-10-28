@@ -36,6 +36,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import * as path from 'node:path';
 import { load, defaultStorePath, type NetworkShape } from './network-store.js';
 import { viewerPath } from './paths.js';
+import { WORDMARK_PATH, WORDMARK_VIEWBOX } from './brand.js';
 import type { KeyObject } from 'node:crypto';
 import { forEachLineIn, Verifier, shortFingerprint, type ActivityLine, type Problem } from './activity-log.js';
 import type { CheckResult } from './activity-anchor.js';
@@ -139,8 +140,19 @@ export function verdictOf(a: ActivityView): { level: 'ok' | 'bad' | 'unknown'; l
 }
 
 /** Escape for embedding inside an HTML text node or attribute. */
+/**
+ * Direction controls (U+061C, U+200E/F, U+202A-202E, U+2066-2069) are invisible and make text
+ * DISPLAY in a different order from the one recorded: an address or a reason written with one
+ * can read as something else. This page is where an owner checks what an agent did, so the
+ * controls are shown as visible codes, never obeyed. The same expression is in the page script.
+ */
+const BIDI = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+function showBidi(s: string): string {
+  return String(s).replace(BIDI, (c) => `⟨U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}⟩`);
+}
+
 function esc(s: string): string {
-  return String(s)
+  return showBidi(s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
@@ -160,8 +172,14 @@ function embedJson(value: unknown): string {
     .replace(/>/g, '\\u003e')
     .replace(/&/g, '\\u0026')
     .replace(/\u2028/g, '\\u2028')
-    .replace(/\u2029/g, '\\u2029');
+    .replace(/\u2029/g, '\\u2029')
+    // Direction controls as JSON escapes: the page still gets the exact value, and the file
+    // never carries one raw (a viewer of the source would be fooled by it as well).
+    .replace(BIDI, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
 }
+
+/** The check's result in words, shown above its sentences; the colour only repeats it. */
+const VERDICT_LABEL = { ok: 'Checks out', bad: 'Problem found', unknown: 'Not confirmed' } as const;
 
 export function renderViewer(shape: NetworkShape, storePath: string, activity?: ActivityView): string {
   const verdict = activity ? verdictOf(activity) : null;
@@ -171,13 +189,19 @@ export function renderViewer(shape: NetworkShape, storePath: string, activity?: 
     reason: l.reason ?? '', outcome: l.outcome, status: l.status ?? null, approval: l.approval ?? '',
     detail: l.detail ?? '', extra: l.extra ?? {}, signed: !!l.sig,
   }));
-  const rows = shape.seen.map((s) => ({
-    entryId: s.entryId,
-    origin: s.origin,
-    firstSeen: s.firstSeen,
-    lastSeen: s.lastSeen,
-    count: s.count,
-    purposes: Array.isArray(s.purposes) ? s.purposes : [],
+  // Each row is normalised here, so a damaged record shows as a damaged value instead of
+  // stopping the page script (purposes: [null] used to throw in render(), which also kept the
+  // activity table from appearing) or carrying a raw string into a sum.
+  const str = (v: unknown) => (typeof v === 'string' ? v : v == null ? '' : String(v));
+  // A record that is not an object at all (null, a number) is still a row: marked damaged.
+  const rows = shape.seen.map((rec) => (rec && typeof rec === 'object' ? rec
+    : { entryId: '(damaged record)' } as unknown as NetworkShape['seen'][number])).map((s) => ({
+    entryId: str(s.entryId),
+    origin: str(s.origin),
+    firstSeen: str(s.firstSeen),
+    lastSeen: str(s.lastSeen),
+    count: Number.isFinite(Number(s.count)) ? Number(s.count) : 0,
+    purposes: Array.isArray(s.purposes) ? s.purposes.filter((x): x is string => typeof x === 'string') : [],
   }));
 
   return `<!doctype html>
@@ -190,65 +214,125 @@ export function renderViewer(shape: NetworkShape, storePath: string, activity?: 
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <title>Wundervault — your broker's log</title>
+<meta name="color-scheme" content="dark light">
+<script>
+  // Before first paint, so a saved Light or Dark does not flash the other one. A file page may
+  // refuse storage outright; then the page simply starts on Auto.
+  try { var m = localStorage.getItem('wv-log-theme');
+        if (m === 'light' || m === 'dark') document.documentElement.setAttribute('data-theme', m); } catch (e) {}
+</script>
 <style>
+  /* Wundervault's own tokens (burnbox app/static/css/site.css, 1.0). Dark is the default, as on
+     the site. Green is a text colour only in dark: on white it is 1.7:1, so light mode draws
+     text and thin lines in ink and keeps the green for fills — the site's own rule. The site's
+     dimmest grey (#5d7a6c) is not used for text: it is 3.9:1 on the dark panels. */
   :root{
-    --paper:#EFEEE9; --surface:#FBFAF7; --surface-2:#E6E5DE;
-    --ink:#1C2124; --ink-2:#414A4C; --muted:#6B7470;
-    --rule:#D3D2C9; --rule-strong:#B6B5AA; --accent:#2E6F63; --warn:#96661A;
+    color-scheme:dark;
+    --bg:#060a08; --panel:#0b1014; --panel2:#0d141a; --fg:#d8efe2; --muted:#a2b9ac;
+    --border:#19261f; --border-strong:#4b6a5a; --brand:#3ce078; --brand-on:#04130a;
+    --label:#3ce078; --focus:#3ce078; --danger:#ff5a5a; --danger-on:#04130a;
+    --grid:rgba(60,224,120,.055);
+    --glow:drop-shadow(0 0 7px rgba(60,224,120,.55)) drop-shadow(0 0 18px rgba(60,224,120,.25));
+    --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --read:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   }
-  @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
-    --paper:#121517; --surface:#191D20; --surface-2:#22272A;
-    --ink:#E9E7E1; --ink-2:#C2C7C5; --muted:#8F9996;
-    --rule:#2C3236; --rule-strong:#414A4E; --accent:#63B3A2; --warn:#D7A448;
+  @media (prefers-color-scheme: light){:root:not([data-theme="dark"]){
+    color-scheme:light;
+    --bg:#fafafa; --panel:#fff; --panel2:#f3f4f4; --fg:#0e1410; --muted:#526058;
+    --border:#dee1de; --border-strong:#8a958f; --label:#0e1410; --focus:#0e1410; --danger:#c2261c; --danger-on:#fff;
+    --grid:rgba(60,224,120,.11); --glow:none;
   }}
-  :root[data-theme="dark"]{
-    --paper:#121517; --surface:#191D20; --surface-2:#22272A;
-    --ink:#E9E7E1; --ink-2:#C2C7C5; --muted:#8F9996;
-    --rule:#2C3236; --rule-strong:#414A4E; --accent:#63B3A2; --warn:#D7A448;
+  :root[data-theme="light"]{
+    color-scheme:light;
+    --bg:#fafafa; --panel:#fff; --panel2:#f3f4f4; --fg:#0e1410; --muted:#526058;
+    --border:#dee1de; --border-strong:#8a958f; --label:#0e1410; --focus:#0e1410; --danger:#c2261c; --danger-on:#fff;
+    --grid:rgba(60,224,120,.11); --glow:none;
   }
   *{box-sizing:border-box}
-  body{background:var(--paper);color:var(--ink);margin:0;padding:0 20px;
-    font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
-  .wrap{max-width:1000px;margin:0 auto;padding-block:40px 80px}
-  h1{font-size:clamp(22px,4vw,30px);margin:0 0 6px;letter-spacing:-.01em}
-  .sub{color:var(--ink-2);margin:0 0 4px;max-width:70ch}
-  .path{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted);
-    word-break:break-all;margin:0 0 24px}
-  .seal{border:1px solid var(--rule);border-left:3px solid var(--accent);background:var(--surface);
-    padding:12px 16px;margin:0 0 26px;font-size:13.5px;color:var(--ink-2);border-radius:0 3px 3px 0}
+  html{background:var(--bg)}
+  body{margin:0;color:var(--fg);font:15px/1.6 var(--read);background-color:var(--bg);
+    background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+    background-size:40px 40px}
+  ::selection{background:var(--brand);color:var(--brand-on)}
+  .top{border-bottom:1px solid var(--border);background:var(--bg)}
+  .top-in,.wrap{max-width:1040px;margin:0 auto;padding-inline:20px}
+  .top-in{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding-block:18px}
+  .wordmark{display:block;height:17px;width:auto;color:var(--label);filter:var(--glow);flex:none}
+  .theme{display:inline-flex;border:1px solid var(--border-strong);border-radius:6px;overflow:hidden}
+  .theme button{border:0;border-radius:0;background:transparent;color:var(--muted);padding:7px 12px;
+    font:600 12px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase}
+  .theme button+button{border-left:1px solid var(--border-strong)}
+  .theme button[aria-pressed="true"]{background:var(--brand);color:var(--brand-on)}
+  .wrap{padding-block:36px 72px}
+  .eyebrow{margin:0 0 10px;font:600 12px/1.4 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--label)}
+  h1{font:700 clamp(26px,4.5vw,40px)/1.15 var(--mono);letter-spacing:-.01em;margin:0 0 12px}
+  .sub{color:var(--muted);margin:0 0 6px;max-width:70ch;font-size:16px}
+  .path{font:12px/1.5 var(--mono);color:var(--muted);word-break:break-all;margin:0 0 24px}
+  .seal{border:1px solid var(--border);border-left:3px solid var(--brand);background:var(--panel);
+    padding:12px 16px;margin:0 0 26px;font-size:13.5px;color:var(--muted);border-radius:6px}
   .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:0 0 18px}
-  input[type=search]{flex:1 1 260px;min-width:0;padding:9px 12px;font:inherit;font-size:14px;
-    background:var(--surface);color:var(--ink);border:1px solid var(--rule-strong);border-radius:3px}
-  button{padding:9px 12px;font:inherit;font-size:13px;background:var(--surface);color:var(--ink);
-    border:1px solid var(--rule-strong);border-radius:3px;cursor:pointer}
-  button:hover{background:var(--surface-2)}
+  input[type=search]{flex:1 1 260px;min-width:0;padding:10px 12px;font:14px var(--read);
+    background:var(--panel);color:var(--fg);border:1px solid var(--border-strong);border-radius:6px}
+  input[type=search]::placeholder{color:var(--muted)}
+  button{padding:9px 14px;font:600 12px/1.2 var(--mono);letter-spacing:.06em;background:var(--panel);color:var(--fg);
+    border:1px solid var(--border-strong);border-radius:6px;cursor:pointer}
+  button:hover{border-color:var(--brand)}
+  :focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+  /* Inside the group, which clips its corners: draw the ring inside the button, and on the
+     pressed (green) one in the dark ink that reads on green. */
+  .theme button:focus-visible{outline-offset:-4px}
+  .theme button[aria-pressed="true"]:focus-visible{outline-color:var(--brand-on)}
+  /* High-contrast modes replace our colours, so the chosen mode also gets a mark that survives. */
+  @media (forced-colors: active){.theme button[aria-pressed="true"]{outline:2px solid CanvasText;outline-offset:-4px;text-decoration:underline}}
   .count{font-size:13px;color:var(--muted)}
-  .tablewrap{overflow-x:auto;border:1px solid var(--rule);border-radius:3px}
-  table{border-collapse:collapse;width:100%;min-width:640px;background:var(--surface);font-size:13.5px}
-  th,td{text-align:left;padding:10px 13px;border-bottom:1px solid var(--rule);vertical-align:top}
-  th{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);
-    background:var(--surface-2);cursor:pointer;white-space:nowrap;user-select:none}
+  .tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:6px;background:var(--panel)}
+  table{border-collapse:collapse;width:100%;min-width:640px;background:var(--panel);font-size:13.5px}
+  th,td{text-align:left;padding:10px 13px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{font:600 11px/1.4 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);
+    background:var(--panel2);cursor:pointer;white-space:nowrap;user-select:none}
+  tbody tr:hover td{background:var(--panel2)}
   tr:last-child td{border-bottom:none}
-  td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-  .origin{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
-  .when{white-space:nowrap;color:var(--ink-2);font-size:12.5px}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;font-family:var(--mono)}
+  .origin{font-family:var(--mono);word-break:break-all}
+  .when{white-space:nowrap;color:var(--muted);font-size:12.5px}
   .why{margin:8px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:4px}
-  .why li{font-size:12.5px;color:var(--muted);border-left:2px solid var(--rule);padding-left:9px}
-  .why time{color:var(--ink-2)}
-  mark{background:var(--warn);color:var(--paper);border-radius:2px;padding:0 2px}
+  .why li{font-size:12.5px;color:var(--muted);border-left:2px solid var(--border-strong);padding-left:9px}
+  .why time{color:var(--fg)}
+  mark{background:var(--brand);color:var(--brand-on);border-radius:2px;padding:0 2px}
   .empty{padding:36px 16px;text-align:center;color:var(--muted)}
-  footer{margin-top:26px;font-size:12px;color:var(--muted);line-height:1.7}
-  h2{font-size:19px;margin:34px 0 10px}
-  .verdict{border:1px solid var(--rule);border-left:3px solid var(--muted);background:var(--surface);
-    padding:12px 16px;margin:0 0 18px;font-size:14px;border-radius:0 3px 3px 0}
+  footer{margin-top:30px;padding-top:18px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);line-height:1.7}
+  .foot-mark{display:block;margin-bottom:4px;font:700 12px/1.4 var(--mono);letter-spacing:.16em;color:var(--fg)}
+  h2{font:700 18px/1.3 var(--mono);margin:36px 0 12px}
+  .verdict{border:1px solid var(--border);border-left:3px solid var(--muted);background:var(--panel);
+    padding:12px 16px;margin:0 0 18px;font-size:14px;border-radius:6px}
   .verdict p{margin:0 0 4px}
-  .verdict.ok{border-left-color:var(--accent)} .verdict.bad{border-left-color:#B3261E;background:var(--surface-2)}
-  .fp{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted);white-space:nowrap}
+  .wrap > p,.verdict p,.seal,footer{overflow-wrap:anywhere}
+  .verdict.ok{border-left-color:var(--brand)} .verdict.bad{border-left-color:var(--danger)}
+  .verdict .state{display:inline-block;margin:0 0 8px;padding:3px 8px;border-radius:4px;
+    font:700 11px/1.3 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+    background:var(--panel2);color:var(--muted);border:1px solid var(--border-strong)}
+  .verdict.ok .state{background:var(--brand);color:var(--brand-on);border-color:var(--brand)}
+  .verdict.bad .state{background:var(--danger);color:var(--danger-on);border-color:var(--danger)}
+  .res.bad{color:var(--danger);font-weight:600}
+  .fp{font:12px/1.5 var(--mono);color:var(--muted);white-space:nowrap}
   .minor{display:block;font-size:12.5px;color:var(--muted)}
   @media (max-width:560px){table{min-width:480px}}
+  @media (max-width:420px){.wordmark{height:12px} .theme button{padding:7px 7px;font-size:10.5px;letter-spacing:.04em}
+    .top-in{gap:8px} .top-in,.wrap{padding-inline:16px}}
 </style>
 </head><body>
+<header class="top">
+  <div class="top-in">
+    <svg class="wordmark" role="img" aria-label="Wundervault" viewBox="${WORDMARK_VIEWBOX}"><path fill="currentColor" d="${WORDMARK_PATH}"/></svg>
+    <div class="theme" role="group" aria-label="Appearance">
+      <button type="button" data-mode="light" aria-pressed="false">Light</button>
+      <button type="button" data-mode="dark" aria-pressed="false">Dark</button>
+      <button type="button" data-mode="auto" aria-pressed="true">Auto</button>
+    </div>
+  </div>
+</header>
 <div class="wrap">
+  <p class="eyebrow">Broker log · this computer</p>
   <h1>Your broker's log</h1>
   <p class="sub">Every use of a secret by an agent on this computer: when, which agent and secret,
   where it went, the reason it gave, and what happened. Wundervault holds none of it, only a
@@ -261,13 +345,12 @@ export function renderViewer(shape: NetworkShape, storePath: string, activity?: 
 
   <div class="bar">
     <input type="search" id="q" placeholder="Search agent, secret, destination, or reason…" autocomplete="off">
-    <button id="theme" type="button">Light / dark</button>
     <span class="count" id="count"></span>
   </div>
 
   ${activity ? `<h2>Every use</h2>
-  <div class="verdict ${verdict!.level}" id="verdict">${verdict!.lines.map((x) => `<p>${esc(x)}</p>`).join('')}</div>
-  <div class="tablewrap">
+  <div class="verdict ${verdict!.level}" id="verdict"><p class="state">${VERDICT_LABEL[verdict!.level]}</p>${verdict!.lines.map((x) => `<p>${esc(x)}</p>`).join('')}</div>
+  <div class="tablewrap" tabindex="0" role="region" aria-label="Every use">
     <table>
       <thead><tr><th>When</th><th>Agent · secret</th><th>What</th><th>Result</th><th>Line</th></tr></thead>
       <tbody id="uses"></tbody>
@@ -277,7 +360,7 @@ export function renderViewer(shape: NetworkShape, storePath: string, activity?: 
   <p class="count" id="use-count"></p>
   <button id="use-more" type="button" hidden>Show 2,000 more</button>
   <h2>Destinations, at a glance</h2>` : ''}
-  <div class="tablewrap">
+  <div class="tablewrap" tabindex="0" role="region" aria-label="Destinations">
     <table>
       <thead><tr>
         <th data-k="origin">Destination</th>
@@ -292,7 +375,9 @@ export function renderViewer(shape: NetworkShape, storePath: string, activity?: 
   <div class="empty" id="empty" hidden>Nothing matches that.</div>
 
   <footer>
-    Generated ${esc(new Date().toISOString())} from the broker's files.<br>
+    <span class="foot-mark">WUNDERVAULT</span>
+    A snapshot of the broker's files, made ${esc(new Date().toISOString())}. It does not update:
+    run the command again to see newer activity.<br>
     The "Line" column shows each line's number and fingerprint, so you can compare a line with
     the one your vault page shows for this computer.
   </footer>
@@ -303,11 +388,22 @@ const USES = ${embedJson(uses)};
 let sortKey = 'lastSeen', sortDir = -1;
 
 const $ = (id) => document.getElementById(id);
-const fmt = (iso) => { const d = new Date(iso); return isNaN(+d) ? String(iso ?? '') : d.toLocaleString(); };
+// Direction controls are shown, not obeyed (see showBidi in log-viewer.ts).
+const BIDI = /[\\u061C\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069]/g;
+const show = (s) => String(s).replace(BIDI, (c) => '⟨U+' + c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0') + '⟩');
+// A real date is formatted by the browser, and some locales (Arabic, Hebrew) put direction
+// marks in it. Those come from the browser, not the agent, so they are dropped rather than shown.
+// A value that itself carries a direction control is never parsed: Date() can accept a string
+// with a "(comment)" and drop the comment, control and all.
+const fmt = (iso) => {
+  const raw = String(iso ?? '');
+  if (raw.search(BIDI) >= 0) return show(raw);
+  const d = new Date(raw); return isNaN(+d) ? show(raw) : d.toLocaleString().replace(BIDI, '');
+};
 
 // Build every cell with textContent, never innerHTML. Origins and purposes are written by
 // the agent, and this page is opened by someone who may already suspect that agent.
-function text(tag, cls, s){ const e = document.createElement(tag); if (cls) e.className = cls; e.textContent = s; return e; }
+function text(tag, cls, s){ const e = document.createElement(tag); if (cls) e.className = cls; e.textContent = show(s); return e; }
 
 function mark(el, q){
   if (!q) return el;
@@ -323,8 +419,9 @@ function mark(el, q){
 
 function render(){
   const q = $('q').value.trim().toLowerCase();
-  const hit = (r) => !q || r.origin.toLowerCase().includes(q) || r.entryId.toLowerCase().includes(q)
-    || r.purposes.some(p => p.toLowerCase().includes(q));
+  // Searched as shown: a direction control is on screen as ⟨U+202E⟩, so searching "U+202E" finds it.
+  const hit = (r) => !q || show(r.origin).toLowerCase().includes(q) || show(r.entryId).toLowerCase().includes(q)
+    || r.purposes.some(p => show(p).toLowerCase().includes(q));
   const rows = DATA.filter(hit).sort((a, b) => {
     const x = a[sortKey], y = b[sortKey];
     if (x === y) return 0;
@@ -365,12 +462,13 @@ function render(){
 
 const KIND = { call: 'Call', ssh: 'SSH session', ssh_closed: 'SSH session ended', pay: 'Payment', sign: 'Signature', pruned: 'Old lines removed' };
 const OUTCOME = { sent: 'Sent', failed: 'Failed', refused: 'Refused', error: 'Error', opened: 'Opened', closed: 'Closed', signed: 'Signed', removed: 'Removed' };
+const BAD_OUTCOME = new Set(['failed', 'refused', 'error']);
 const APPROVAL = { asked: 'asked you', approved: 'you approved', not_approved: 'not approved' };
 let usesShown = 2000;
 function renderUses(){
   const body = $('uses'); if (!body) return;
   const q = $('q').value.trim().toLowerCase();
-  const hay = (u) => [u.agent, u.key, u.address, u.reason, u.outcome, u.detail, u.method, String(u.seq), u.fp].join(' ').toLowerCase();
+  const hay = (u) => show([u.agent, u.key, u.address, u.reason, u.outcome, u.detail, u.method, String(u.seq), u.fp].join(' ')).toLowerCase();
   const rows = USES.filter((u) => !q || hay(u).includes(q));
   body.replaceChildren();
   for (const u of rows.slice(0, usesShown)){
@@ -394,7 +492,7 @@ function renderUses(){
     if (ex) what.appendChild(text('span', 'minor', ex));
     tr.appendChild(what);
     const res = document.createElement('td');
-    res.appendChild(text('span', null, (OUTCOME[u.outcome] || u.outcome) + (u.status ? ' · HTTP ' + u.status : '')));
+    res.appendChild(text('span', BAD_OUTCOME.has(u.outcome) ? 'res bad' : 'res', (OUTCOME[u.outcome] || u.outcome) + (u.status ? ' · HTTP ' + u.status : '')));
     if (APPROVAL[u.approval]) res.appendChild(text('span', 'minor', APPROVAL[u.approval]));
     if (u.detail) res.appendChild(mark(text('span', 'minor', u.detail), q));
     tr.appendChild(res);
@@ -415,11 +513,17 @@ document.querySelectorAll('th[data-k]').forEach(th => th.addEventListener('click
   sortKey = k;
   render();
 }));
-$('theme').addEventListener('click', () => {
-  const cur = document.documentElement.getAttribute('data-theme');
-  const dark = cur ? cur === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
-  document.documentElement.setAttribute('data-theme', dark ? 'light' : 'dark');
-});
+// Light / Dark / Auto. Auto is no attribute at all: the stylesheet follows the system setting
+// by itself, live. Remembered when the browser allows storage on a file page; when it throws,
+// the choice still holds for this visit.
+function setMode(m, save){
+  if (m === 'light' || m === 'dark') document.documentElement.setAttribute('data-theme', m);
+  else { m = 'auto'; document.documentElement.removeAttribute('data-theme'); }
+  document.querySelectorAll('.theme button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === m)));
+  if (save) { try { localStorage.setItem('wv-log-theme', m); } catch (e) {} }
+}
+setMode(document.documentElement.getAttribute('data-theme'), false);
+document.querySelectorAll('.theme button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode, true)));
 render();
 renderUses();
 </script>
@@ -540,26 +644,71 @@ export function openInBrowser(target: string): boolean {
   } catch { return false; }
 }
 
+/** What resolveSudoUser reads from the machine — injectable, so every platform is testable anywhere. */
+export interface SudoLookup {
+  platform: NodeJS.Platform;
+  env: NodeJS.ProcessEnv;
+  uid: number | undefined;
+  run: (cmd: string, args: string[]) => string;
+}
+
+function liveLookup(): SudoLookup {
+  return {
+    platform: process.platform,
+    env: process.env,
+    uid: (process as unknown as { getuid?: () => number }).getuid?.(),
+    // Bounded: a stalled directory service (LDAP, SSSD, Open Directory) must end in the refusal
+    // below, not leave a root command hanging.
+    run: (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', timeout: 10_000 }),
+  };
+}
+
 /**
- * Who invoked sudo, resolved through NSS rather than by reading /etc/passwd.
+ * One account's uid, gid and home, through the system's own account lookup — never by
+ * reading /etc/passwd, which only sees local accounts (an LDAP or SSSD user is a valid sudo
+ * user with no line there).
  *
- * `getent` goes through the name service switch, so it sees accounts from LDAP, SSSD and
- * anything else the machine is configured with. Parsing /etc/passwd directly only sees
- * local accounts, and on an enterprise host that means a valid user resolves to nothing.
+ * Linux: `getent passwd`, which goes through the name service switch. macOS has no getent
+ * (2026-10-28: `--destinations` refused on every Mac with "spawnSync getent ENOENT"); its
+ * equivalent is `dscacheutil -q user`, which goes through Directory Services. It is named by
+ * its full path because this runs as root: a bare name would be looked up on a PATH that sudo
+ * may have kept from the user, and anything the user's agents can write to could answer it.
  */
-export function resolveSudoUser(): { uid: number; gid: number; home: string } | null {
-  const uid = (process as unknown as { getuid?: () => number }).getuid?.();
-  const sudoUser = process.env.SUDO_USER;
-  if (uid !== 0 || !sudoUser || sudoUser === 'root') return null;
+/** A whole number written as digits, or NaN. Number('') is 0, which would read an empty field as root. */
+function digits(s: string | undefined): number {
+  return s !== undefined && /^\d+$/.test(s.trim()) ? Number(s.trim()) : NaN;
+}
+
+function lookupAccount(name: string, l: SudoLookup): { uid: number; gid: number; home: string } | null {
+  if (l.platform === 'darwin') {
+    const out = l.run('/usr/bin/dscacheutil', ['-q', 'user', '-a', 'name', name]);
+    const rec: Record<string, string> = {};
+    for (const line of out.split('\n')) {
+      if (!line.trim()) { if (Object.keys(rec).length) break; continue; }   // first record only
+      const i = line.indexOf(':');
+      if (i > 0) rec[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+    }
+    if (rec.name !== name) return null;
+    return { uid: digits(rec.uid), gid: digits(rec.gid), home: rec.dir ?? '' };
+  }
+  const f = l.run('getent', ['passwd', name]).trim().split(':');
+  if (f.length < 6) return null;
+  return { uid: digits(f[2]), gid: digits(f[3]), home: f[5] };
+}
+
+/** Who invoked sudo, through the system's account lookup (lookupAccount). */
+export function resolveSudoUser(l: SudoLookup = liveLookup()): { uid: number; gid: number; home: string } | null {
+  const sudoUser = l.env.SUDO_USER;
+  if (l.uid !== 0 || !sudoUser || sudoUser === 'root') return null;
   // A SUDO_USER that is PRESENT but unresolvable is an error, not a non-sudo run.
   //
   // Returning null there meant carrying on as root and writing the page through root's own
   // path resolution — the caller cannot open the result, and the root path-following this
   // whole change removed would be back. If we were invoked under sudo we either become
   // that user or we stop.
-  let out: string;
+  let who: { uid: number; gid: number; home: string } | null;
   try {
-    out = execFileSync('getent', ['passwd', sudoUser], { encoding: 'utf8' }).trim();
+    who = lookupAccount(sudoUser, l);
   } catch (e) {
     throw new Error(
       `Ran under sudo as '${sudoUser}', but that account could not be resolved ` +
@@ -568,15 +717,22 @@ export function resolveSudoUser(): { uid: number; gid: number; home: string } | 
       `must not do that with root's authority.`,
     );
   }
-  const f = out.split(':');
-  const u = Number(f[2]); const g = Number(f[3]);
-  if (f.length < 6 || !Number.isInteger(u) || !Number.isInteger(g) || u === 0 || !f[5]) {
+  // Group 0 is refused as well as user 0: dropping to it would keep root's group.
+  if (!who || !Number.isInteger(who.uid) || !Number.isInteger(who.gid) || who.uid === 0 || who.gid === 0 || !who.home) {
     throw new Error(
-      `Ran under sudo as '${sudoUser}', but its passwd entry is unusable. ` +
+      `Ran under sudo as '${sudoUser}', but its account entry is unusable. ` +
       `Refusing to continue as root.`,
     );
   }
-  return { uid: u, gid: g, home: f[5] };
+  // sudo records the invoking uid itself. A name that resolves to a different account is not
+  // the person who ran the command, so do not become it.
+  if (l.env.SUDO_UID !== undefined && Number(l.env.SUDO_UID) !== who.uid) {
+    throw new Error(
+      `Ran under sudo as '${sudoUser}' (uid ${l.env.SUDO_UID}), but that name resolves to uid ` +
+      `${who.uid}. Refusing to continue as root.`,
+    );
+  }
+  return who;
 }
 
 /**
@@ -592,19 +748,27 @@ export function resolveSudoUser(): { uid: number; gid: number; home: string } | 
  * something they could have written anyway. Order matters: supplementary groups, then the
  * gid, then the uid — after setuid there is no privilege left to drop the others with.
  */
-export function dropToSudoUser(who: { uid: number; gid: number }): void {
-  const p = process as unknown as {
-    setgroups?: (g: number[]) => void;
-    setgid?: (g: number) => void;
-    setuid?: (u: number) => void;
-    getuid?: () => number;
-  };
-  try { p.setgroups?.([who.gid]); } catch { /* not always permitted; the uid drop is what matters */ }
+export interface ProcessIds {
+  setgroups?: (g: number[]) => void;
+  setgid?: (g: number) => void;
+  setuid?: (u: number) => void;
+  getuid?: () => number;
+  getgid?: () => number;
+  getgroups?: () => number[];
+}
+
+export function dropToSudoUser(who: { uid: number; gid: number },
+                               p: ProcessIds = process as unknown as ProcessIds): void {
+  const refuse = (why: string) => new Error(`Refusing to continue: could not drop root privileges before writing (${why}).`);
+  // Root's supplementary groups go first, and that is not optional: a process that changed
+  // its uid but kept group 0 (or macOS's admin) can still read and write what those groups
+  // can. Until 2.0.2 a failure here was ignored.
+  try { p.setgroups?.([who.gid]); } catch (e) { throw refuse(`setgroups: ${(e as Error).message}`); }
   p.setgid?.(who.gid);
   p.setuid?.(who.uid);
-  if (p.getuid?.() !== who.uid) {
-    throw new Error('Refusing to continue: could not drop root privileges before writing.');
-  }
+  if (p.getuid?.() !== who.uid) throw refuse('uid');
+  if (p.getgid && p.getgid() !== who.gid) throw refuse('gid');
+  if (p.getgroups && p.getgroups().includes(0)) throw refuse('still in group 0');
 }
 
 /**

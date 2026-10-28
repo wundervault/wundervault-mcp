@@ -147,7 +147,13 @@ async function serveHeldNotice(holder: Holder): Promise<void> {
 
 // ── Run ──────────────────────────────────────────────────────────────────────
 
-const claim = await acquireCredential(VERSION, { share: true });
+// Demo mode (WUNDERVAULT_MOCK) answers every call with a canned reply and never reaches the
+// broker, so it holds no credential and has nothing for copies to contend over. Directory
+// scanners start several copies at once with no agent name: before 2.0.2 every copy after the
+// first served only vault_status, and Glama listed Wundervault with one tool (2026-10-27).
+const DEMO = process.env.WUNDERVAULT_MOCK === '1' || process.env.WUNDERVAULT_MOCK === 'true';
+const claim = DEMO ? { ok: true as const, role: 'demo' as const }
+  : await acquireCredential(VERSION, { share: true });
 if (!claim.ok) {
   if (claim.reason) console.error(`[wundervault-mcp] ${claim.reason}`);
   // Bound nothing, so this process holds nothing: it installs no release

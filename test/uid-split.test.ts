@@ -619,10 +619,12 @@ describe('a root process must not follow paths an agent controls', () => {
     expect(src).toMatch(/renameSync/);
   });
 
-  it('resolves the sudo user through NSS, not by parsing /etc/passwd', () => {
-    // An LDAP or SSSD account is a valid sudo user with no line in /etc/passwd.
+  it('resolves the sudo user through the system lookup, not by parsing /etc/passwd', () => {
+    // An LDAP or SSSD account is a valid sudo user with no line in /etc/passwd. The lookup's
+    // behaviour on each platform is driven in log-viewer.test.ts ('who ran sudo').
     const src = fs.readFileSync(path.join(ROOT, 'src', 'log-viewer.ts'), 'utf8');
-    expect(src).toMatch(/execFileSync\('getent', \['passwd'/);
+    expect(src).toMatch(/l\.run\('getent', \['passwd'/);
+    expect(src).toMatch(/l\.run\('\/usr\/bin\/dscacheutil'/);
     expect(src).not.toMatch(/readFileSync\('\/etc\/passwd'/);
   });
 

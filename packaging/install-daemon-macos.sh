@@ -68,8 +68,27 @@ if [ "$MODE" = uninstall ]; then
   # configuration nobody can read any more, and the next install's bootstrap has nothing to
   # replace. Ask launchd what is true rather than trusting the exit code.
   launchctl bootout "system/${LABEL}" 2>/dev/null || true
-  if launchctl print "system/${LABEL}" >/dev/null 2>&1; then
-    echo "ERROR: the job is still loaded after bootout." >&2
+  # bootout returns before launchd has finished: a broker still closing its connections stays
+  # loaded for a few seconds, and checking at once refused a clean uninstall (2026-10-28, on a
+  # Mac; the same command a few seconds later worked). Give it up to 15 seconds to go.
+  #
+  # `launchctl print` exits 0 for a loaded job and 113 for "Could not find service" (measured
+  # on macOS, 2026-10-28). Any other failure is launchd not answering, which proves nothing
+  # either way, so only 113 counts as gone.
+  job_state() { if launchctl print "system/${LABEL}" >/dev/null 2>&1; then echo 0; else echo $?; fi; }
+  waited=0
+  state=$(job_state)
+  while [ "$state" = 0 ] && [ "$waited" -lt 15 ]; do
+    sleep 1
+    waited=$((waited + 1))
+    state=$(job_state)
+  done
+  if [ "$state" != 113 ]; then
+    if [ "$state" = 0 ]; then
+      echo "ERROR: the job is still loaded ${waited} seconds after bootout." >&2
+    else
+      echo "ERROR: launchd did not say whether the job is gone (launchctl print exited ${state})." >&2
+    fi
     echo "       Refusing to remove ${PLIST_PATH} — deleting it now would leave the" >&2
     echo "       broker running from a definition you can no longer see or replace." >&2
     echo "       Try:  sudo launchctl bootout system/${LABEL}" >&2

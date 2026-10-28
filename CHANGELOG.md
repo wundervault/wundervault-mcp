@@ -4,6 +4,34 @@ Changes to `@wundervault/mcp-server`: the MCP server, the broker (`wundervault-a
 installers. The full history, with the website's changes beside it, is at
 <https://wundervault.com/changelog>.
 
+## [2.0.2] — 2026-10-28
+
+### Improved
+
+- **Your broker's log looks like Wundervault.** `sudo wundervault-agent --destinations` opens a page in
+  the site's design: the Wundervault header, a Light / Dark / Auto switch, and the check result in words
+  ("Checks out", "Problem found", "Not confirmed"). It still loads nothing and cannot reach the network,
+  and it now says that it is a snapshot: run the command again for newer activity.
+- **The log shows hidden direction characters.** If text an agent wrote contains invisible
+  right-to-left controls, the page shows them as visible codes (for example `⟨U+202E⟩`), so an address
+  or a reason cannot display as something other than what was recorded.
+- **The log's tables can be reached and scrolled with the keyboard.**
+- **Demo mode (`WUNDERVAULT_MOCK=1`) needs no agent name, and any number of copies can run at once**,
+  each with all five vault tools. Directories that scan MCP servers now see the full set.
+- **The MCP Registry entry describes version 2**: the broker, and enrolling with `wundervault-agent --enrol`.
+
+### Fixed
+
+- `sudo wundervault-agent --destinations` works on macOS. It looked up your account with a Linux-only
+  tool and stopped before opening the page.
+- The macOS uninstaller (`install-daemon-macos.sh --uninstall`) waits up to 15 seconds for the broker to
+  stop, instead of refusing while it is still closing its connections.
+- `--destinations` gives up root completely before it writes the page: if root's extra groups cannot be
+  dropped as well as its user, it stops instead of carrying on with them.
+- A damaged record in the destination store shows as a damaged value; it no longer stops the page from
+  showing the rest of the log.
+- CI runs on Node.js 22 and 24, the versions 2.0 supports (it was still testing Node.js 20).
+
 ## [2.0.1] — 2026-10-27
 
 ### Improved
