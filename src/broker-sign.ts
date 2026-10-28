@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { hasIdentity, loadOrCreateIdentity } from './broker-key.js';
+import { sudoHint } from './launcher.js';
 
 /**
  * Phase 6 — signing a request so the server can tell the broker from a holder of its key.
@@ -104,7 +105,7 @@ export function signerFromIdentity(): BrokerSigner | null {
     // That refusal must not be swallowed into "unsigned is fine": a machine with a broken
     // key should fail its requests loudly, not quietly fall back to a weaker path.
     throw new Error(
-      'This machine has a broker key that cannot be used. Run `sudo wundervault-agent '
-      + '--pair` to inspect it, or fix its ownership and mode.');
+      `This machine has a broker key that cannot be used. Run ${sudoHint('--pair')} to inspect `
+      + 'it, or fix its ownership and mode.');
   }
 }

@@ -90,11 +90,16 @@ Windows and macOS have their own installers; see
 [wundervault.com/install](https://wundervault.com/install). The installer downloads nothing
 and is short enough to read first.
 
-**3. Pair the broker with your account:**
+**3. Pair the broker with your account.** Run the pairing command the installer printed last. It
+names node and the broker by their full paths, for example:
 
 ```bash
-sudo wundervault-agent --pair
+sudo /usr/bin/node /usr/bin/wundervault-agent --pair
 ```
+
+Use full paths with `sudo`, not bare names: `sudo` may look a name up on your own PATH, and a folder
+on it that you (and so your agents) can write could hold another program by that name. That goes for
+node too, because the broker's launcher starts with `#!/usr/bin/env node`.
 
 Check that the fingerprint it shows matches the one in your vault, then confirm.
 
@@ -187,7 +192,7 @@ If something on Windows or macOS fails, tell us what it printed:
 - **A log on your computer.** Every call is recorded by the broker, signed, and checked
   against a copy of its chain we hold, so a changed log is detected. For "run without asking"
   secrets, where the secret went and why stays on your computer; we never see it.
-  `sudo wundervault-agent --destinations` opens it.
+  `sudo /usr/bin/node /usr/bin/wundervault-agent --destinations` opens it (full paths, as for pairing).
 - **HTTPS only**, with real certificate checks; redirects are not followed; private network
   addresses are refused unless you allowed one for that secret.
 

@@ -51,7 +51,8 @@ function prefix(name: string, launcher = true): { pkg: string; bin: string } {
 
 function run(which: keyof typeof SCRIPTS, selfDir: string, pathDirs: string[]): { exec: string; out: string; err: string } {
   const file = path.join(tmp, 'pick.sh');
-  fs.writeFileSync(file, `${picker(which)}\npick_broker "$1"\nprintf 'EXEC=%s\\n' "$EXEC"\n`);
+  // The installers keep the caller's PATH as USER_PATH (2.0.3) and look the broker up only there.
+  fs.writeFileSync(file, `USER_PATH=$PATH\n${picker(which)}\npick_broker "$1"\nprintf 'EXEC=%s\\n' "$EXEC"\n`);
   // Only the tools the function uses, so no real wundervault-agent on this machine is ever found.
   const tools = path.join(tmp, 'tools');
   if (!fs.existsSync(tools)) {
@@ -125,7 +126,9 @@ for (const which of ['linux', 'macos'] as const) {
     it('mentions --migrate once, inside the block, after the pair line', () => {
       const migrate = echoes.filter((l) => l.includes('--migrate'));
       expect(migrate).toHaveLength(1);
-      const pairAt = echoes.findIndex((l) => l.includes('1. Pair this computer, once:   sudo ${AGENT_CMD} --pair'));
+      // 2.0.3: the pair line names the checked node as well as the broker.
+      const node = which === 'linux' ? '${SERVICE_NODE}' : '${NODE}';
+      const pairAt = echoes.findIndex((l) => l.includes(`1. Pair this computer, once:   sudo ${node} \${AGENT_CMD} --pair`));
       const nextAt = echoes.findIndex((l) => l.includes('Next, in this order:'));
       expect(nextAt).toBeGreaterThan(-1);
       expect(pairAt).toBe(nextAt + 1);
@@ -140,17 +143,20 @@ for (const which of ['linux', 'macos'] as const) {
   });
 }
 
-describe('the next steps use the short command only when it runs the installed copy', () => {
+describe('the next steps always name the installed copy by its full path (2.0.3)', () => {
+  // 2.0.1 printed the short name when PATH found the installed copy. 2.0.3: never — after sudo a
+  // bare name may be looked up on the user's own PATH, where an agent could have put another.
   for (const which of ['linux', 'macos'] as const) {
-    it(`${which}: short when PATH finds that copy; full path for an older copy first, none on PATH, or a space`, () => {
+    it(`${which}: full path whether the user's PATH finds that copy, an older one first, or none; quoted with a space`, () => {
       const text = fs.readFileSync(SCRIPTS[which], 'utf8');
-      const block = between(text, '  AGENT_CMD=wundervault-agent', 'echo "Next, in this order:"');
+      const block = between(text, '  # The full path, always:', 'echo "Next, in this order:"');
       const helper = which === 'macos' ? between(text, 'real_path() {', '\n}\n') + '\n' : '';
       const fresh = prefix('usr');
       const stale = prefix('usr-local');
       const spaced = prefix('Vault Tools');
       const file = path.join(tmp, 'next.sh');
-      fs.writeFileSync(file, `${helper}EXEC="$1"\n${block}\nprintf 'CMD=%s\\n' "$AGENT_CMD"\n`);
+      // sudo_path_warning (2.0.3) is tested on its own in installer-root-path; a stand-in here.
+      fs.writeFileSync(file, `${helper}sudo_path_warning() { :; }\nEXEC="$1"\nUSER_PATH=$PATH\n${block}\nprintf 'CMD=%s\\n' "$AGENT_CMD"\n`);
       const tools = path.join(tmp, 'tools2');
       fs.mkdirSync(tools);
       for (const t of ['readlink', 'dirname', 'basename']) {
@@ -159,13 +165,13 @@ describe('the next steps use the short command only when it runs the installed c
       const go = (exec: string, dirs: string[]) => spawnSync('/bin/sh', ['-eu', file, exec],
         { encoding: 'utf8', env: { PATH: [...dirs, tools].join(':') } }).stdout;
       const own = path.join(fresh.bin, 'wundervault-agent');
-      expect(go(own, [fresh.bin])).toContain('CMD=wundervault-agent\n');
+      const same = go(own, [fresh.bin]);
+      expect(same).toContain(`CMD=${own}\n`);
+      expect(same).not.toContain('different copy');
       const olderFirst = go(own, [stale.bin, fresh.bin]);
       expect(olderFirst).toContain(`CMD=${own}`);
-      expect(olderFirst).toContain(`wundervault-agent on PATH (${path.join(stale.bin, 'wundervault-agent')}) is a different copy`);
-      const nowhere = go(own, []);
-      expect(nowhere).toContain(`CMD=${own}`);
-      expect(nowhere).toContain("isn't on PATH here");
+      expect(olderFirst).toContain(`wundervault-agent on your PATH (${path.join(stale.bin, 'wundervault-agent')}) is a different copy`);
+      expect(go(own, [])).toContain(`CMD=${own}`);
       const sp = path.join(spaced.bin, 'wundervault-agent');
       expect(go(sp, [])).toContain(`CMD="${sp}"`);
     });

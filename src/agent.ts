@@ -55,6 +55,7 @@ import { BrokerOps, type ActivitySink } from './broker-ops.js';
 import { ActivityLog } from './activity-log.js';
 import { Anchorer } from './activity-anchor.js';
 import type { BrokeredOp } from './ssh-agent.js';
+import { sudoHint } from './launcher.js';
 
 /**
  * The per-agent socket request cap.
@@ -1459,7 +1460,7 @@ class AgentDaemon {
             // would hand every agent the record of where all the others sent secrets.
             socket.write(JSON.stringify({
               error: 'destinations are not served over this socket. Run: ' +
-                     'sudo wundervault-agent --destinations',
+                     sudoHint('--destinations'),
             }) + '\n');
           } else if (msg.action === 'ping') {
             // Liveness only. This used to return every agent name on the machine, which

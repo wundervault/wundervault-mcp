@@ -1,7 +1,8 @@
 /**
  * install-daemon-macos.sh --uninstall, run on Linux against stand-ins for launchctl, id,
  * uname, sleep and rm. The stand-ins only record what they were asked, so nothing here can
- * stop a real service or delete a real file whatever the script does.
+ * stop a real service or delete a real file whatever the script does. The run uses a copy
+ * whose PATH pin names the stand-ins; the shipped script cannot be pointed at them.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync, existsSync } from 'node:fs';
@@ -31,7 +32,14 @@ case "$1" in
          [ "$n" -lt ${loadedFor} ] && exit 0 || exit ${after} ;;
   *) exit 0 ;;
 esac`);
-  const r = spawnSync('/bin/sh', [SCRIPT, '--uninstall'], {
+  // The shipped script pins PATH to the system directories (2.0.3), which is exactly what keeps
+  // stand-ins like these from running as root. A COPY points that one line at them instead.
+  const pin = 'PATH=/usr/bin:/bin:/usr/sbin:/sbin\n';
+  const text = readFileSync(SCRIPT, 'utf8');
+  if (text.split(pin).length !== 2) throw new Error('the PATH pin line is not in the script exactly once');
+  const copy = path.join(dir, 'install-daemon-macos.sh');
+  writeFileSync(copy, text.replace(pin, `PATH=${dir}:/usr/bin:/bin\n`));
+  const r = spawnSync('/bin/sh', [copy, '--uninstall'], {
     env: { PATH: `${dir}:/usr/bin:/bin` }, encoding: 'utf8',
   });
   const calls = existsSync(path.join(dir, 'calls')) ? readFileSync(path.join(dir, 'calls'), 'utf8') : '';

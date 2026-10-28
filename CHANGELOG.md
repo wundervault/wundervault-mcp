@@ -4,6 +4,44 @@ Changes to `@wundervault/mcp-server`: the MCP server, the broker (`wundervault-a
 installers. The full history, with the website's changes beside it, is at
 <https://wundervault.com/changelog>.
 
+## [2.0.3] — 2026-10-28
+
+### Security
+
+- **The broker installers run only the system's own tools.** They are the one step that runs as root,
+  and they found tools such as `launchctl` and `id` on the PATH of whoever ran `sudo`. On a Mac that
+  PATH usually starts with `/opt/homebrew/bin`, a folder your account (and so every agent) can write,
+  so a program planted there could have run as root. The installers now use only `/usr/bin`, `/bin`,
+  `/usr/sbin` and `/sbin`, and use your PATH only to find `node` and `wundervault-agent`.
+- **Node and the broker must be reachable only through things root alone can change**: the file,
+  every folder above it, and every link on the way and the folder each sits in. A root-owned file in a
+  folder your account can write can be swapped, and the service starts it by that path. Every file
+  in the broker's package must be root's too, and a folder whose access list lets someone else change
+  it is refused, as is any link in the package — or in a folder one of its links leads to — that passes
+  through a folder someone else can change. The service file each installer writes from (the macOS
+  plist, the Linux unit) is held to the same rule: it decides what the service runs. A check that
+  cannot finish (a folder it cannot read) is a refusal, never a pass. The Linux installer now checks
+  all of this too, before it runs `node` at all. If yours does not pass, the installer says which file
+  or folder and how to install somewhere safe.
+- **The installers start over with an empty environment**, so nothing you exported (`NODE_OPTIONS`, a
+  dynamic-loader or OpenSSL setting) can make the tools they run load other code. Until that is done
+  they run nothing by name: the Mac's `sh` turns shell functions passed in the environment into
+  commands — even one called `[` — so the first lines use only what such a function cannot replace.
+- **The installers tell you when sudo itself is exposed.** If the PATH that sudo uses on your computer
+  includes a folder someone other than root can change (on a Mac, usually `/opt/homebrew/bin`; an empty
+  entry or an empty PATH, which means whatever folder you are in, counts too), every
+  `sudo` command you type — `sudo npm install` included — could run a program an agent put there. The
+  installers are not affected, but they now say so, name the folder, and give the one line to add to
+  sudo's settings (`Defaults secure_path=…`) that closes it.
+- **The Linux service names its `node`**, like the macOS one: before, systemd looked `node` up on its
+  own PATH at every start, so a `node` someone put later in an earlier folder of that PATH would have
+  become the broker's interpreter.
+- **Every `sudo` command the broker and its installers print names `node` and the broker by their full
+  paths**, and so do the README's pairing steps. `sudo` may look a name up on your own PATH, and the
+  broker's launcher finds `node` the same way (`#!/usr/bin/env node`), so naming the broker alone was
+  not enough. A command is printed only when both pass the same root-only check as the installers
+  (access lists included); otherwise the message points to the command your installer printed.
+
 ## [2.0.2] — 2026-10-28
 
 ### Improved

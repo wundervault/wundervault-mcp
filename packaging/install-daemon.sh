@@ -16,6 +16,198 @@
 
 set -eu
 
+# Root runs this, so nothing from the caller may steer it. Its first command restarts it with an
+# EMPTY environment (by full path, so nothing is looked up): NODE_OPTIONS, an OpenSSL configuration,
+# whatever the caller exported and sudo let through never reaches the tools below. Only the
+# caller's PATH (as USER_PATH: to FIND node and wundervault-agent, and to check sudo's own PATH) and
+# sudo's record of who ran it (SUDO_UID, SUDO_GID, SUDO_USER) come along. Every tool comes from the
+# system's own directories: macOS's sudo keeps the caller's PATH, which usually begins with
+# /opt/homebrew/bin, a folder the user — and so every agent — can write (2.0.3).
+case "${1:-}" in
+  --clean-env) ;;
+  *) exec /usr/bin/env -i "USER_PATH=${PATH:-}" "SUDO_UID=${SUDO_UID:-}" "SUDO_GID=${SUDO_GID:-}" \
+       "SUDO_USER=${SUDO_USER:-}" PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/sh "$0" --clean-env "$@" ;;
+esac
+shift
+USER_PATH=${USER_PATH:-}
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+# --clean-env marks the restart. Typed by hand it skips nothing: it is honoured only when the
+# environment is exactly what the restart produces (plus what sh adds: PWD, OLDPWD, SHLVL, _). A
+# value with a newline in it (a PATH carrying a second line) fails this too, so nothing is smuggled.
+# Until it passes, nothing is run by a bare name. macOS's sh (bash 3.2) turns BASH_FUNC_x%% variables
+# into functions — `[`, `env`, `sed` and `echo` included, measured — so with the flag typed by hand
+# and such a variable let through, a bare name could run someone's function as root (review round
+# 5). A name with a slash is never imported; `case`, `exec`, `shift` and `export` cannot be replaced.
+# An imported function is exported again, so it shows up in env's list and fails the check.
+_dirty=$(/usr/bin/env | /usr/bin/sed -E -n '/^(PATH|USER_PATH|SUDO_UID|SUDO_GID|SUDO_USER|PWD|OLDPWD|SHLVL|_)=/!p')
+case $_dirty in
+  '') ;;
+  *) exec /usr/bin/env -i /bin/sh -c 'echo "ERROR: --clean-env is the installer'"'"'s own restart. Run it without that flag." >&2; exit 1' ;;
+esac
+# Nothing from the caller's environment may make the tools below load other code: node reads
+# NODE_OPTIONS (--require a file) and NODE_PATH, and the dynamic loaders read the LD_ and DYLD_
+# variables. sudo usually drops these; with `sudo -E` or a permissive policy it does not.
+unset NODE_OPTIONS NODE_PATH NODE_REPL_EXTERNAL_MODULE NODE_EXTRA_CA_CERTS \
+  LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH \
+  DYLD_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH BASH_ENV ENV CDPATH \
+  OPENSSL_CONF OPENSSL_ENGINES OPENSSL_MODULES GCONV_PATH 2>/dev/null || true
+
+# >>> root-only chain
+# A file the broker runs (node, or the broker itself) must be reachable only through things root
+# alone can change: every folder from / down, every symbolic link on the way and the folder each
+# link sits in, and the file itself. A root-owned file is not enough — whoever can write its FOLDER
+# can rename it away and put another in its place — and checking only the path as given and its
+# final target is not enough either: a link in between, in a folder someone else can write, can be
+# pointed elsewhere later (2.0.3 review). So the path is walked one component at a time and each
+# link is followed where it leads. A link's own mode is never judged (it is always 777 on Linux);
+# the folder it sits in is.
+# Sets CHAIN_BAD and returns 1 at the first thing that fails. GNU stat (-c) or BSD stat (-f).
+root_only_entry() {
+  _om=$(stat -c '%U %a' "$1" 2>/dev/null) || _om=$(stat -f '%Su %Lp' "$1" 2>/dev/null) || {
+    CHAIN_BAD="$1 cannot be examined"; return 1; }
+  _o=${_om% *}; _m=${_om##* }
+  while [ ${#_m} -gt 3 ]; do _m=${_m#?}; done
+  while [ ${#_m} -lt 3 ]; do _m=0$_m; done
+  if [ "$_o" != root ]; then CHAIN_BAD="$1 is owned by $_o, not root"; return 1; fi
+  case "$(printf '%s' "$_m" | cut -c2-3)" in
+    *[2367]*) CHAIN_BAD="$1 is writable by group or others (mode $_m)"; return 1 ;;
+  esac
+  # An access control list can grant what the mode does not. macOS lists the entries under
+  # `ls -lde` whatever marker ls shows (an @ for extended attributes hides the + for a list), and
+  # only an entry that ALLOWS a change is refused (system folders carry "deny" entries). Linux
+  # has no -e; a + after the mode there means a list, and any list is refused.
+  if _e=$(ls -lde "$1" 2>/dev/null); then
+    if printf '%s\n' "$_e" | sed -n '2,$p' | grep -E -q 'allow.*(write|add_file|add_subdirectory|delete|append|chown|security)'; then
+      CHAIN_BAD="$1 has an access control list that lets others change it"; return 1
+    fi
+  else
+    case "$(ls -ld "$1" 2>/dev/null | cut -c11)" in
+      +) CHAIN_BAD="$1 has an access control list"; return 1 ;;
+    esac
+  fi
+  return 0
+}
+root_only_chain() {
+  case "$1" in /*) ;; *) CHAIN_BAD="$1 is not a full path"; return 1 ;; esac
+  root_only_entry / || return 1
+  _cur=/; _rest=${1#/}; _hops=0
+  while [ -n "$_rest" ]; do
+    case "$_rest" in */*) _c=${_rest%%/*}; _rest=${_rest#*/} ;; *) _c=$_rest; _rest="" ;; esac
+    case "$_c" in ''|.) continue ;; ..) _cur=$(dirname -- "$_cur"); continue ;; esac
+    _next=${_cur%/}/$_c
+    if [ -L "$_next" ]; then
+      _hops=$((_hops + 1))
+      [ "$_hops" -le 40 ] || { CHAIN_BAD="$1 goes through too many symbolic links"; return 1; }
+      _t=$(readlink "$_next") || { CHAIN_BAD="$_next cannot be read"; return 1; }
+      case "$_t" in /*) _cur=/; _t=${_t#/} ;; esac
+      _rest=$_t${_rest:+/$_rest}
+      continue
+    fi
+    [ -e "$_next" ] || { CHAIN_BAD="$_next does not exist"; return 1; }
+    root_only_entry "$_next" || return 1
+    _cur=$_next
+  done
+  return 0
+}
+# <<< root-only chain
+# >>> sudo path check
+# sudo hands this script the PATH it uses for every command run through it. If that PATH has a
+# folder that someone other than root can change (on a Mac, usually /opt/homebrew/bin), every
+# `sudo <command>` on this computer — `sudo npm install`, `sudo node`, a pairing step typed from
+# memory — can be answered by a program an agent put there. This script is not exposed (it uses
+# system tools only), but the owner's other sudo commands are, and only sudo's own secure_path
+# setting closes that. So say so, with the exact line to add.
+sudo_path_check() {
+  SUDO_PATH_BAD=""
+  [ -n "${SUDO_UID:-}" ] || return 0
+  # An empty entry means the current folder. sh keeps an empty field between two colons but drops
+  # one at the end (and splits an empty PATH into nothing), so those are spelled out as "." first.
+  _up=$USER_PATH
+  case "$_up" in ''|*:) _up="$_up." ;; esac   # an empty PATH is one empty entry (round 5)
+  set -f; _ifs=$IFS; IFS=:
+  for _d in $_up; do
+    [ -n "$_d" ] || _d=.
+    case "$_d" in /*) [ -d "$_d" ] || continue ;; esac
+    root_only_chain "$_d" || { SUDO_PATH_BAD="$_d — ${CHAIN_BAD}"; break; }
+  done
+  IFS=$_ifs; set +f
+  # The secure_path to recommend: the usual folders that ARE root-only here.
+  SAFE_PATH=""
+  for _d in /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
+    [ -d "$_d" ] && root_only_chain "$_d" && SAFE_PATH="${SAFE_PATH:+$SAFE_PATH:}$_d"
+  done
+  return 0
+}
+sudo_path_warning() {
+  [ -n "$SUDO_PATH_BAD" ] || return 0
+  cat >&2 <<EOM
+
+WARNING: sudo on this computer looks commands up in a folder someone other than root can change:
+  $SUDO_PATH_BAD
+Your agents run as you, so any program they put there can stand in for a command you run with
+sudo — npm, node, or anything else — and run as root. This installer uses system tools only and
+is not affected, but your other sudo commands are. To fix it for good, run
+  sudo /usr/sbin/visudo -f /etc/sudoers.d/secure_path
+and add this one line:
+  Defaults secure_path="${SAFE_PATH}"
+EOM
+}
+# <<< sudo path check
+# >>> package scan
+# The broker loads more than its entry file: every module in its package and, through links,
+# modules elsewhere. All of it must be root's (2.0.3). Sets PKG_BAD and returns 1 on the first
+# problem. A scan that cannot finish is a problem too, never a pass.
+package_scan() {
+  PKG_BAD=""
+  # Files and folders, through links to folders (-L): owned by root, writable by no one else.
+  _out=$(find -L "$1" ! -type l \( ! -user root -o -perm -020 -o -perm -002 \) -print 2>/dev/null) || {
+    PKG_BAD="$1 could not be scanned completely"; return 1; }
+  _f=$(printf '%s\n' "$_out" | sed -n '1p')
+  [ -z "$_f" ] || { PKG_BAD="$_f can be changed by someone other than root"; return 1; }
+  # Every link — in the package, and in every folder a link leads to — walked to where it leads,
+  # so a link nested inside a linked folder is checked like one in the package itself.
+  _todo=$1; _done=; _n=0
+  set -f; _ifs=$IFS; IFS='
+'
+  while [ -n "$_todo" ]; do
+    _d=$(printf '%s\n' "$_todo" | sed -n '1p'); _todo=$(printf '%s\n' "$_todo" | sed '1d')
+    case "
+$_done
+" in *"
+$_d
+"*) continue ;; esac
+    _done="$_done
+$_d"
+    _n=$((_n + 1))
+    [ "$_n" -le 500 ] || { IFS=$_ifs; set +f; PKG_BAD="$1 links to too many folders"; return 1; }
+    _links=$(find "$_d" -type l -print 2>/dev/null) || {
+      IFS=$_ifs; set +f; PKG_BAD="$_d could not be scanned completely"; return 1; }
+    for _l in $_links; do
+      root_only_chain "$_l" || { IFS=$_ifs; set +f; PKG_BAD="${CHAIN_BAD} — reached through $_l"; return 1; }
+      if [ -d "$_l" ]; then
+        _t=$(CDPATH= cd -P -- "$_l" 2>/dev/null && pwd -P) || {
+          IFS=$_ifs; set +f; PKG_BAD="$_l cannot be followed"; return 1; }
+        _todo="$_todo
+$_t"
+      fi
+    done
+  done
+  IFS=$_ifs; set +f
+  # Access control lists anywhere in it: macOS find has -acl; Linux ls marks one with a +.
+  if [ "$(uname -s)" = Darwin ]; then
+    _out=$(find -L "$1" -acl -print 2>/dev/null) || {
+      PKG_BAD="$1 could not be scanned for access control lists"; return 1; }
+    _f=$(printf '%s\n' "$_out" | sed -n '1p')
+  else
+    _out=$(ls -lRL "$1" 2>/dev/null) || { PKG_BAD="$1 could not be scanned for access control lists"; return 1; }
+    _f=$(printf '%s\n' "$_out" | grep -m 1 '^[-d][rwxsStT-]\{9\}+' || true)
+  fi
+  [ -z "$_f" ] || { PKG_BAD="$1 has an access control list ($_f), so someone other than root may change it"; return 1; }
+  return 0
+}
+# <<< package scan
+
 ACCOUNT=wundervault
 STATE_DIR=/var/lib/wundervault
 UNIT_NAME=wundervault-agent.service
@@ -49,6 +241,8 @@ command -v systemctl >/dev/null 2>&1 || {
   echo "systemd not found. This installer is for systemd Linux; see the docs for other init systems." >&2
   exit 1
 }
+sudo_path_check
+sudo_path_warning
 
 if [ "$MODE" = uninstall ]; then
   echo "Stopping and removing the secret broker (${UNIT_NAME})…"
@@ -85,7 +279,7 @@ pick_broker() {
       _own="$_bin/wundervault-agent"
     fi
   fi
-  _first=$(command -v wundervault-agent 2>/dev/null || true)
+  _first=$( PATH=$USER_PATH; command -v wundervault-agent 2>/dev/null || true )
   if [ -n "$_own" ]; then
     EXEC="$_own"
     if [ -n "$_first" ] && [ "$(readlink -f "$_first")" != "$(readlink -f "$_own")" ]; then
@@ -186,6 +380,46 @@ SERVICE_NODE=$(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   echo "Install ${NODE_NEED} from nodejs.org or your distribution, system-wide." >&2
   exit 1
 }
+# The service's node and the broker are checked before either runs as root (the version check
+# just below runs node), and before either is written into the unit.
+REAL_SERVICE_NODE=$(readlink -f "$SERVICE_NODE" 2>/dev/null || echo "$SERVICE_NODE")
+# Paths go into a service definition (a plist or a unit) and into printed commands, each with its
+# own quoting rules. Rather than escape for three parsers, only plain path characters are accepted.
+for F in "$EXEC" "$REAL_EXEC" "$SERVICE_NODE" "$REAL_SERVICE_NODE"; do
+  case "$F" in
+    *[!A-Za-z0-9_./@+-]*)
+      echo "ERROR: $F contains a character (a space, or a quote or symbol) this installer will not" >&2
+      echo "put into a service definition. Install node and the broker under a plain path such as" >&2
+      echo "/usr/local or /opt/wundervault. Nothing has been changed." >&2
+      exit 1 ;;
+  esac
+done
+for F in "$EXEC" "$REAL_EXEC" "$SERVICE_NODE" "$REAL_SERVICE_NODE"; do
+  root_only_chain "$F" || {
+    cat >&2 <<EOM
+ERROR: ${CHAIN_BAD}.
+
+The broker runs $F. Anyone who can replace it — or rename it away inside a folder they can
+write — can replace the broker, and with it everything the broker holds. Your agents run as
+you, so a folder you can write is a folder they can write. (A /usr/local made writable for
+npm's convenience is the usual cause.)
+
+Install node and the broker as root, somewhere only root can write (your distribution's
+nodejs package puts node in /usr/bin), for example:
+  sudo npm install -g --prefix /usr @wundervault/mcp-server
+  sudo sh $0 --exec /usr/bin/wundervault-agent
+Nothing has been changed.
+EOM
+    exit 1
+  }
+done
+PKG_DIR=$(CDPATH= cd -- "$(dirname -- "$REAL_EXEC")/.." && pwd -P)
+package_scan "$PKG_DIR" || {
+  echo "ERROR: ${PKG_BAD}." >&2
+  echo "The broker runs everything in ${PKG_DIR}. Reinstall it with sudo npm install -g, as root." >&2
+  echo "Nothing has been changed." >&2
+  exit 1
+}
 SERVICE_NODE_VERSION=$("$SERVICE_NODE" -p process.version 2>/dev/null || echo unknown)
 node_ok "$SERVICE_NODE_VERSION" || {
   echo "ERROR: $SERVICE_NODE is Node.js $SERVICE_NODE_VERSION, which lacks the October 21, 2026 security fix." >&2
@@ -195,6 +429,9 @@ node_ok "$SERVICE_NODE_VERSION" || {
 
 UNIT_SRC="${HERE}/${UNIT_NAME}"
 [ -f "$UNIT_SRC" ] || { echo "Missing unit template: $UNIT_SRC" >&2; exit 1; }
+# The template becomes a root-started service definition, so it is held to the same rule as the
+# programs: changeable only by root (an agent editing it could add a command run as root).
+root_only_chain "$UNIT_SRC" || { echo "ERROR: ${CHAIN_BAD}. That is the service template; reinstall the package as root. Nothing has been changed." >&2; exit 1; }
 
 echo "This will:"
 echo "  1. create the system account '${ACCOUNT}' for the secret broker (no login, no home)"
@@ -380,7 +617,14 @@ fi
 # ── 3. the unit ──────────────────────────────────────────────────────────────
 # The template is shipped alongside this script and read from disk rather than written
 # inline, so what lands in /etc/systemd/system is the file you reviewed in the repo.
-sed "s|^ExecStart=.*|ExecStart=${EXEC}|" "$UNIT_SRC" > "$UNIT_PATH"
+# node by its full path: with ExecStart=<broker> alone, systemd would find node through the
+# script's `#!/usr/bin/env node` on its own PATH at every start, and a node someone put later in an
+# earlier, writable folder of that PATH would become the broker's interpreter (2.0.3).
+sed "s|^ExecStart=.*|ExecStart=${SERVICE_NODE} ${EXEC}|" "$UNIT_SRC" > "$UNIT_PATH"
+grep -q "^ExecStart=${SERVICE_NODE} ${EXEC}\$" "$UNIT_PATH" || {
+  echo "ERROR: the installed unit does not name the interpreter ${SERVICE_NODE}. Refusing to continue." >&2
+  rm -f "$UNIT_PATH"; exit 1
+}
 
 # No sealed key on this machine? Then the unit must not ask systemd for one: a missing
 # credential source is fatal (243/CREDENTIALS), and a broker that will not start is worse
@@ -447,21 +691,21 @@ if systemctl is-active --quiet "$UNIT_NAME"; then
   # The short command only when it runs the copy just installed (review rounds 1-2): an older
   # copy first on PATH, --exec, or a prefix that isn't on PATH at all would otherwise send the
   # owner to the wrong program, or to none. Quoted when the path has a space in it.
-  AGENT_CMD=wundervault-agent
-  _onpath=$(command -v wundervault-agent 2>/dev/null || true)
-  if [ -z "$_onpath" ] || [ "$(readlink -f "$_onpath")" != "$(readlink -f "$EXEC")" ]; then
-    case "$EXEC" in *" "*) AGENT_CMD="\"$EXEC\"" ;; *) AGENT_CMD="$EXEC" ;; esac
+  # The full path, always: a bare name after `sudo` may be looked up on the user's own PATH, where a
+  # folder they — and their agents — can write could hold another wundervault-agent (2.0.3).
+  case "$EXEC" in *" "*) AGENT_CMD="\"$EXEC\"" ;; *) AGENT_CMD="$EXEC" ;; esac
+  _onpath=$( PATH=$USER_PATH; command -v wundervault-agent 2>/dev/null || true )
+  if [ -n "$_onpath" ] && [ "$(readlink -f "$_onpath")" != "$(readlink -f "$EXEC")" ]; then
     echo
-    if [ -n "$_onpath" ]; then
-      echo "Note: wundervault-agent on PATH ($_onpath) is a different copy, so the steps below"
-      echo "      use the full path of the one installed. Remove the other copy to use the short command."
-    else
-      echo "Note: wundervault-agent isn't on PATH here, so the steps below use its full path."
-    fi
+    echo "Note: wundervault-agent on your PATH ($_onpath) is a different copy. Use the full path"
+    echo "      below, and remove the other copy."
   fi
+  sudo_path_warning
   echo
   echo "Next, in this order:"
-  echo "  1. Pair this computer, once:   sudo ${AGENT_CMD} --pair"
+  # node by name too: the launcher starts `#!/usr/bin/env node`, and sudo may find node on the
+  # caller's PATH. The node named here passed root_only_chain.
+  echo "  1. Pair this computer, once:   sudo ${SERVICE_NODE} ${AGENT_CMD} --pair"
   echo "     It prints a code and a fingerprint. Type the code into your vault and check the"
   echo "     fingerprint matches before you confirm. Neither value is a secret."
   echo "  2. Only if this computer ran Wundervault version 1, as your normal user (no sudo):"

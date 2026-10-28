@@ -40,6 +40,7 @@ import { WORDMARK_PATH, WORDMARK_VIEWBOX } from './brand.js';
 import type { KeyObject } from 'node:crypto';
 import { forEachLineIn, Verifier, shortFingerprint, type ActivityLine, type Problem } from './activity-log.js';
 import type { CheckResult } from './activity-anchor.js';
+import { sudoHint } from './launcher.js';
 
 /**
  * The full activity log, as the page shows it (2026-10-13). Read as root by the CLI, verified
@@ -816,7 +817,7 @@ export async function collectShape(
       `  store: ${storePath}\n` +
       `It belongs to the broker's own account, which is what stops your agents\n` +
       `reading where every other agent has sent its secrets.\n\n` +
-      `  sudo wundervault-agent --destinations\n`,
+      `  ${sudoHint('--destinations')}\n`,
     );
   }
 
@@ -832,7 +833,7 @@ export async function collectShape(
           `should belong to the broker's wundervault account at 0700.\n`
         : `It belongs to the broker's own account, which is what stops your agents\n` +
           `reading where every other agent has sent its secrets.\n\n` +
-          `  sudo wundervault-agent --destinations\n`) +
+          `  ${sudoHint('--destinations')}\n`) +
       `Refusing to show you an empty page, which is what this used to do.`,
     );
   }

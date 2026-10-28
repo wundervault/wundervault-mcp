@@ -401,7 +401,8 @@ describe('management socket', () => {
     const { d } = await freshDaemon({ profiles: [profile('A')] }); daemon = d;
     const res = await speak(path.join(dir, 'run', 'mgmt', 'agent.sock'), { action: 'destinations' });
     expect(res.shape).toBeUndefined();
-    expect(res.error).toMatch(/sudo wundervault-agent --destinations/);
+    // The broker names itself by the path it was started as (2.0.3), so only the shape is fixed here.
+    expect(res.error).toMatch(/Run: sudo \S+( \S+)? --destinations/);
   });
 
   it('is reachable without group membership, because the link is the lock', async () => {

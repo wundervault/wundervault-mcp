@@ -47,9 +47,16 @@ first; reading it before the user runs it is a good idea.
 
 ## Step 3 — The user pairs the broker with their account
 
+The user runs the pairing command the installer printed last, which names node and the broker by
+their full paths, for example:
+
 ```bash
-sudo wundervault-agent --pair
+sudo /usr/bin/node /usr/bin/wundervault-agent --pair
 ```
+
+Give full paths, never bare names, with `sudo`: a name may be looked up on the user's own PATH, and
+a folder there that the user (or an agent) can write could hold another program. That includes node,
+because the broker's launcher starts with `#!/usr/bin/env node`.
 
 The user checks that the fingerprint it shows matches the one in their vault at
 https://wundervault.com, then confirms there. They need a free account first.
