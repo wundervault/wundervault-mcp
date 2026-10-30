@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
-  constants, closeSync, createReadStream, fchmodSync, fstatSync, lstatSync, mkdirSync,
-  openSync, readdirSync, writeSync,
+  constants, chmodSync, closeSync, createReadStream, fchmodSync, fstatSync, fsyncSync,
+  lstatSync, mkdirSync, openSync, readdirSync, writeSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Transform } from 'node:stream';
@@ -220,6 +220,25 @@ function makeDirectory(path: string): void {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
   }
   realDirectory(path);
+  chmodSync(path, 0o755);
+}
+
+function syncDirectory(path: string): void {
+  if (process.platform === 'win32') return;
+  const fd = openSync(path, constants.O_RDONLY);
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function syncDirectories(path: string): void {
+  if (process.platform === 'win32') return;
+  for (const entry of readdirSync(path, { withFileTypes: true })) {
+    if (entry.isDirectory()) syncDirectories(join(path, entry.name));
+  }
+  syncDirectory(path);
 }
 
 function parents(root: string, relative: string): string {
@@ -249,6 +268,7 @@ async function writeEntry(bytes: Bytes, size: number, path: string, mode: number
       writeAll(fd, chunk);
       hash.update(chunk);
     });
+    fsyncSync(fd);
     return hash.digest('hex');
   } finally {
     closeSync(fd);
@@ -318,6 +338,7 @@ export async function extractApp(
       });
     });
     for (const name of required) if (!files.has(name)) fail(`missing required file app/${name}`);
+    syncDirectories(stagingDir);
   } catch (error) {
     throw fixedError(error);
   }
@@ -347,6 +368,7 @@ export async function extractNodeMember(
       });
       if (!seen) fail('node member missing');
     });
+    syncDirectory(dirname(destFile));
   } catch (error) {
     throw fixedError(error);
   }

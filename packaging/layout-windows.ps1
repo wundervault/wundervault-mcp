@@ -98,8 +98,9 @@ function Set-LayoutAcl {
         [void]$Acl.AddAccessRule($Rule)
     }
     if ($Request) {
-        # No AppendData, Delete, ChangePermissions, or TakeOwnership.
-        $RequestRights = [System.Security.AccessControl.FileSystemRights]'WriteData, ReadData, Synchronize'
+        # Node opens O_WRONLY with GENERIC_WRITE, which needs the complete Write set.
+        # No Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, or TakeOwnership.
+        $RequestRights = [System.Security.AccessControl.FileSystemRights]'Read, Write, Synchronize'
         $Rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
             $Broker, $RequestRights,
             [System.Security.AccessControl.InheritanceFlags]::None, $Propagation, $Allow
@@ -155,14 +156,41 @@ $script:Manifest = $null
 if (Test-Path -LiteralPath $Root) {
     Assert-RealPath $Root
     if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
-        throw "Won't adopt a folder it didn't make: $Root"
-    }
-    Assert-RealPath (Join-Path $Root 'state')
-    Assert-RealPath $ManifestPath
-    $script:Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
-    if ($script:Manifest.format -ne 'wundervault-layout-1' -or
-        $script:Manifest.root -ne $Root -or $script:Manifest.platform -ne 'win') {
-        throw 'Not our manifest.'
+        # Only the exact, empty skeleton of our first run may be adopted.
+        if ($Action -ne 'install' -or
+            -not (Test-Path -LiteralPath $Root -PathType Container)) {
+            throw "Won't adopt a folder it didn't make: $Root"
+        }
+        $Children = @(Get-ChildItem -LiteralPath $Root -Force)
+        if ($Children.Count -ne 3) {
+            throw "Won't adopt a folder it didn't make: $Root"
+        }
+        foreach ($Name in @('versions', 'bin', 'state')) {
+            $Path = Join-Path $Root $Name
+            if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+                throw "Won't adopt a folder it didn't make: $Root"
+            }
+            Assert-RealPath $Path
+            if (@(Get-ChildItem -LiteralPath $Path -Force).Count -ne 0) {
+                throw "Won't adopt a folder it didn't make: $Root"
+            }
+        }
+        foreach ($Path in @($Root) + @($Children | ForEach-Object { $_.FullName })) {
+            $Owner = (Get-Acl -LiteralPath $Path).GetOwner(
+                [System.Security.Principal.SecurityIdentifier]
+            ).Value
+            if ($Owner -notin @($SystemSid.Value, $AdminsSid.Value)) {
+                throw "Won't adopt a folder it didn't make: $Root"
+            }
+        }
+    } else {
+        Assert-RealPath (Join-Path $Root 'state')
+        Assert-RealPath $ManifestPath
+        $script:Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+        if ($script:Manifest.format -ne 'wundervault-layout-1' -or
+            $script:Manifest.root -ne $Root -or $script:Manifest.platform -ne 'win') {
+            throw 'Not our manifest.'
+        }
     }
 }
 
@@ -179,7 +207,11 @@ function Save-Manifest {
     } finally {
         $Stream.Dispose()
     }
-    Move-Item -LiteralPath $Temp -Destination $ManifestPath -Force
+    if ([System.IO.File]::Exists($ManifestPath)) {
+        [System.IO.File]::Replace($Temp, $ManifestPath, $null)
+    } else {
+        [System.IO.File]::Move($Temp, $ManifestPath)
+    }
 }
 
 function Test-Owned {
@@ -233,7 +265,11 @@ function Write-LayoutFile {
     } finally {
         $Stream.Dispose()
     }
-    Move-Item -LiteralPath $Temp -Destination $Path -Force
+    if ([System.IO.File]::Exists($Path)) {
+        [System.IO.File]::Replace($Temp, $Path, $null)
+    } else {
+        [System.IO.File]::Move($Temp, $Path)
+    }
 }
 
 if ($Action -eq 'uninstall') {
@@ -287,11 +323,15 @@ if ($BrokerSid.Value -in @($SystemSid.Value, $AdminsSid.Value, $UsersSid.Value))
 }
 
 if ($null -eq $script:Manifest) {
-    [void](New-Item -ItemType Directory -Path $Root)
+    if (-not (Test-Path -LiteralPath $Root)) {
+        [void](New-Item -ItemType Directory -Path $Root)
+    }
     Set-LayoutAcl $Root $true $true $AdminsSid
     foreach ($Name in @('versions', 'bin', 'state')) {
         $Path = Join-Path $Root $Name
-        [void](New-Item -ItemType Directory -Path $Path)
+        if (-not (Test-Path -LiteralPath $Path)) {
+            [void](New-Item -ItemType Directory -Path $Path)
+        }
         Set-LayoutAcl $Path $true ($Name -ne 'state') $AdminsSid
     }
     $script:Manifest = [pscustomobject]@{
@@ -441,7 +481,8 @@ Set-LayoutAcl -Path $RequestPath -Directory $false -Public $false -Owner $System
 Set-LayoutAcl $StatusPath $false $true $SystemSid
 
 # Read the ACLs back. Do not trust a successful Set-Acl alone.
-$Allowed = [System.Security.AccessControl.FileSystemRights]'WriteData, ReadData, Synchronize'
+$Allowed = [System.Security.AccessControl.FileSystemRights]'Read, Write, Synchronize'
+$Forbidden = [System.Security.AccessControl.FileSystemRights]'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
 $RequestAcl = Get-Acl -LiteralPath $RequestPath
 $BrokerRules = @($RequestAcl.GetAccessRules(
     $true, $true, [System.Security.Principal.SecurityIdentifier]
@@ -449,8 +490,9 @@ $BrokerRules = @($RequestAcl.GetAccessRules(
 if ($BrokerRules.Count -ne 1 -or
     $BrokerRules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
     [int64]$BrokerRules[0].FileSystemRights -ne [int64]$Allowed -or
+    ([int64]$BrokerRules[0].FileSystemRights -band [int64]$Forbidden) -ne 0 -or
     $BrokerRules[0].IsInherited) {
-    throw 'Broker request permissions are not exactly WriteData, ReadData, Synchronize.'
+    throw 'Broker request permissions are not exactly Read, Write, Synchronize.'
 }
 $DirectoryAcl = Get-Acl -LiteralPath $Spool
 $DirectoryRules = @($DirectoryAcl.GetAccessRules(

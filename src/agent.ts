@@ -754,6 +754,9 @@ class AgentDaemon {
         for (const route of routes()) {
           try { await route.post(id, state, detail); return; } catch { /* try the next account */ }
         }
+        // Every account failed (the server is down, say): throw, so the relay does not mark this
+        // status delivered and sends it again on the next poll (review round 1, C-F2).
+        throw new Error('status not delivered');
       },
     };
     this.updatePoller = startPolling({

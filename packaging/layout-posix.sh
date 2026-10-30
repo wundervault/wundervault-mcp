@@ -135,8 +135,18 @@ secure_dir() {
 
 if [ -e "$ROOT" ] || [ -L "$ROOT" ]; then
     safe_dir "$ROOT"
-    [ -f "$MANIFEST" ] && [ ! -L "$MANIFEST" ] ||
-        die "won't adopt a folder it didn't make: $ROOT"
+    if [ ! -f "$MANIFEST" ] || [ -L "$MANIFEST" ]; then
+        [ "$ACTION" = install ] || die "no managed manifest"
+        # Only the exact, empty skeleton of our first run may be adopted.
+        for dir in versions bin state; do
+            safe_dir "$ROOT/$dir"
+            [ -z "$(/usr/bin/find "$ROOT/$dir" ! -path "$ROOT/$dir" -prune -print)" ] ||
+                die "won't adopt a folder it didn't make: $ROOT"
+        done
+        EXTRA=$(/usr/bin/find "$ROOT" ! -path "$ROOT" \
+            ! -path "$ROOT/versions" ! -path "$ROOT/bin" ! -path "$ROOT/state" -prune -print)
+        [ -z "$EXTRA" ] || die "won't adopt a folder it didn't make: $ROOT"
+    fi
     safe_dir "$ROOT/state"
 fi
 
@@ -240,17 +250,20 @@ switch (op) {
         !['wundervault-mcp', 'wundervault-agent'].includes(path.basename(p))) {
       throw new Error('invalid launcher path');
     }
-    if (!m.launchers.some(x => x.path === p)) {
-      const st = fs.lstatSync(p);
-      if (!st.isFile() && !st.isSymbolicLink()) throw new Error('invalid launcher');
-      m.launchers.push({
-        path: p,
-        original_target: st.isSymbolicLink() ? fs.readlinkSync(p) : 'file'
-      });
-      add(p, 'link');
-      add(p + '.wv-orig', st.isSymbolicLink() ? 'link' : 'file');
-      save();
+    const st = fs.lstatSync(p);
+    if (!st.isFile() && !st.isSymbolicLink()) throw new Error('invalid launcher');
+    const target = st.isSymbolicLink() ? fs.readlinkSync(p) : 'file';
+    const entry = m.launchers.find(x => x.path === p);
+    if (entry) {
+      entry.original_target = target;
+    } else {
+      m.launchers.push({ path: p, original_target: target });
     }
+    add(p, 'link');
+    const kind = st.isSymbolicLink() ? 'link' : 'file';
+    add(p + '.wv-orig', kind);
+    m.paths.find(x => x.path === p + '.wv-orig').kind = kind;
+    save();
     break;
   }
   case 'restore':
@@ -342,6 +355,108 @@ claim() {
     fi
 }
 
+LOCK_TEMP=
+release_lock() {
+    if [ -n "$LOCK_TEMP" ]; then
+        # Do not remove a successor's lock if ours was broken while we were running.
+        if [ "$LOCK_TEMP" -ef "$ROOT/state/lock" ]; then
+            /bin/rm -f "$ROOT/state/lock"
+        fi
+        /bin/rm -f "$LOCK_TEMP"
+    fi
+}
+
+take_lock() {
+    LOCK_TEMP=$ROOT/state/lock.tmp.$$
+    (
+        umask 077
+        set -C
+        # No trailing newline: the updater reads this with /^(\d+) (\d+)$/ (src/updater.ts acquireLock).
+        printf '%s %s' "$$" "$("$NODE" --input-type=commonjs -e 'process.stdout.write(String(Date.now()))')" > "$LOCK_TEMP"
+    )
+    trap release_lock 0
+    trap 'exit 1' 1 2 15
+    lock_deadline=$(( $(/bin/date +%s) + 120 ))
+    while ! /bin/ln "$LOCK_TEMP" "$ROOT/state/lock" 2>/dev/null; do
+        lock_now=$(/bin/date +%s)
+        [ "$lock_now" -lt "$lock_deadline" ] || die "updater lock held for 120 seconds"
+        [ ! -L "$ROOT/state/lock" ] || die "updater lock is a symlink"
+        if [ ! -e "$ROOT/state/lock" ]; then
+            continue
+        fi
+        [ -f "$ROOT/state/lock" ] || die "updater lock is not a regular file"
+        if [ "$PLATFORM" = linux ]; then
+            lock_mtime=$(/usr/bin/stat -c %Y "$ROOT/state/lock" 2>/dev/null) || continue
+        else
+            lock_mtime=$(/usr/bin/stat -f %m "$ROOT/state/lock" 2>/dev/null) || continue
+        fi
+        lock_stale=no
+        if [ "$((lock_now - lock_mtime))" -gt 1200 ]; then
+            lock_stale=yes
+        else
+            lock_pid=
+            lock_started=
+            IFS=' ' read -r lock_pid lock_started < "$ROOT/state/lock" || :
+            case "$lock_pid" in
+                ''|0|*[!0-9]*) ;;
+                *)
+                    if ! /bin/kill -0 "$lock_pid" 2>/dev/null; then
+                        lock_stale=yes
+                    fi
+                    ;;
+            esac
+        fi
+        if [ "$lock_stale" = yes ]; then
+            /bin/rm -f "$ROOT/state/lock"
+        else
+            /bin/sleep 1
+        fi
+    done
+}
+
+CAPTURE_LAUNCHERS=
+LINK_LAUNCHERS=
+plan_launchers() {
+    # This interface is a space-separated pair, not shell source or a glob.
+    # shellcheck disable=SC2086
+    set -- $LAUNCHERS
+    [ "$#" = 2 ] || die "--launchers must contain exactly two paths without whitespace"
+    SEEN_MCP=no
+    SEEN_AGENT=no
+    for launcher do
+        case "$launcher" in /*) ;; *) die "launcher must be absolute" ;; esac
+        name=${launcher##*/}
+        case "$name" in
+            wundervault-mcp) [ "$SEEN_MCP" = no ] || die "duplicate launcher"; SEEN_MCP=yes ;;
+            wundervault-agent) [ "$SEEN_AGENT" = no ] || die "duplicate launcher"; SEEN_AGENT=yes ;;
+            *) die "unexpected launcher basename" ;;
+        esac
+        if [ -e "$launcher.wv-orig" ] || [ -L "$launcher.wv-orig" ]; then
+            manifest launcher-known "$launcher" || die "unmanaged launcher backup"
+            if [ -e "$launcher" ] || [ -L "$launcher" ]; then
+                if [ -L "$launcher" ] &&
+                    [ "$(/usr/bin/readlink "$launcher")" = "$ROOT/bin/$name" ]; then
+                    continue
+                fi
+                [ -f "$launcher" ] || die "launcher changed since installation"
+                resolved=$(/usr/bin/readlink -f "$launcher") ||
+                    die "launcher changed since installation"
+                case "$resolved" in
+                    */@wundervault/mcp-server/*) ;;
+                    *) die "launcher changed since installation" ;;
+                esac
+                CAPTURE_LAUNCHERS="$CAPTURE_LAUNCHERS $launcher"
+            fi
+        elif [ -e "$launcher" ] || [ -L "$launcher" ]; then
+            [ -f "$launcher" ] || [ -L "$launcher" ] || die "invalid launcher"
+            CAPTURE_LAUNCHERS="$CAPTURE_LAUNCHERS $launcher"
+        else
+            continue
+        fi
+        LINK_LAUNCHERS="$LINK_LAUNCHERS $launcher"
+    done
+}
+
 if [ "$ACTION" = uninstall ]; then
     manifest check
     if [ "$PLATFORM" = linux ]; then
@@ -379,19 +494,26 @@ if [ ! -e "$ROOT" ]; then
     /bin/mkdir -p "$ROOT"
     secure_dir "$ROOT" 0755
     /bin/mkdir "$ROOT/versions" "$ROOT/bin" "$ROOT/state"
-    secure_dir "$ROOT/versions" 0755
-    secure_dir "$ROOT/bin" 0755
     secure_dir "$ROOT/state" 0700
-    manifest init
 else
-    manifest check
     for dir in "$ROOT" "$ROOT/versions" "$ROOT/bin" "$ROOT/state"; do
         safe_dir "$dir"
     done
-    secure_dir "$ROOT" 0755
-    secure_dir "$ROOT/versions" 0755
-    secure_dir "$ROOT/bin" 0755
-    secure_dir "$ROOT/state" 0700
+fi
+take_lock
+
+if [ -f "$MANIFEST" ]; then
+    manifest check
+fi
+# Validate both launchers without changing either, the manifest, or the running version.
+plan_launchers
+
+secure_dir "$ROOT" 0755
+secure_dir "$ROOT/versions" 0755
+secure_dir "$ROOT/bin" 0755
+secure_dir "$ROOT/state" 0700
+if [ ! -f "$MANIFEST" ]; then
+    manifest init
 fi
 
 HIGHEST=$(manifest highest)
@@ -505,35 +627,16 @@ EOF
     /bin/chmod 0755 "$ROOT/bin/$name"
 done
 
-# This interface is a space-separated pair, not shell source or a glob.
+# All launcher checks passed before the switch. Capture npm's replacement too, so uninstall
+# restores the most recently installed npm launcher rather than a stale copy.
 # shellcheck disable=SC2086
-set -- $LAUNCHERS
-[ "$#" = 2 ] || die "--launchers must contain exactly two paths without whitespace"
-SEEN_MCP=no
-SEEN_AGENT=no
-for launcher do
-    case "$launcher" in /*) ;; *) die "launcher must be absolute" ;; esac
-    name=${launcher##*/}
-    case "$name" in
-        wundervault-mcp) [ "$SEEN_MCP" = no ] || die "duplicate launcher"; SEEN_MCP=yes ;;
-        wundervault-agent) [ "$SEEN_AGENT" = no ] || die "duplicate launcher"; SEEN_AGENT=yes ;;
-        *) die "unexpected launcher basename" ;;
-    esac
-    if [ -e "$launcher.wv-orig" ] || [ -L "$launcher.wv-orig" ]; then
-        manifest launcher-known "$launcher" || die "unmanaged launcher backup"
-        if [ -e "$launcher" ] || [ -L "$launcher" ]; then
-            [ -L "$launcher" ] &&
-                [ "$(/usr/bin/readlink "$launcher")" = "$ROOT/bin/$name" ] ||
-                die "launcher changed since installation"
-            continue
-        fi
-    elif [ -e "$launcher" ] || [ -L "$launcher" ]; then
-        manifest launcher "$launcher"
-        /bin/mv "$launcher" "$launcher.wv-orig"
-    else
-        continue
-    fi
-    /bin/ln -s "$ROOT/bin/$name" "$launcher"
+for launcher in $CAPTURE_LAUNCHERS; do
+    manifest launcher "$launcher"
+    /bin/mv -f "$launcher" "$launcher.wv-orig"
+done
+# shellcheck disable=SC2086
+for launcher in $LINK_LAUNCHERS; do
+    /bin/ln -s "$ROOT/bin/${launcher##*/}" "$launcher"
 done
 
 claim "$SPOOL" dir

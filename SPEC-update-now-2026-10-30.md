@@ -1,4 +1,4 @@
-# SPEC — "Update now": the broker updates itself, with the owner's say-so (2026-10-30, rev 1)
+# SPEC — "Update now": the broker updates itself, with the owner's say-so (2026-10-30, rev 2)
 
 Part 1 of 3 that ship TOGETHER in one release (owner 2026-10-30): **U** Update now (this file) ·
 **C** service catalogue + named parts · **L** locking names and setups away from our server. U is
@@ -9,6 +9,43 @@ Built in low-token mode: oai writes the code from this spec, Claude verifies (an
 `src/updater*.ts`, `src/release-verify.ts`, `src/tar-read.ts`, the stubs and the installer changes).
 
 rev 1 = rev 0 + the design review in `.buildreview-update/round-0-triage.json`.
+rev 2 = rev 1 + what building, the real-machine test and review round 1 settled. **Where the
+text below disagrees with this list, this list wins:**
+
+- **No per-file list in the record.** `app` is `{url, sha256}`. The archive's SHA-256 is signed and
+  checked before it is opened, so its content is already signed; the list was 550 KB for the real
+  package (too big to sign through the vault) and added nothing. The reader checks every entry BY
+  RULE before writing it (plain files/folders only, `APP_PATH` names, no case-insensitive
+  duplicates, nothing under a file, per-file and total caps) and requires `REQUIRED_APP_FILES`.
+- **Archive dialects:** POSIX ustar (our packer) and GNU (`ustar  \0`, what nodejs.org ships — found
+  against the real node-v22.23.4 archive); a GNU header has no name prefix.
+- **Order life is 24 hours** (was 15 min), so a laptop asleep at Update now still gets it. Single use
+  (seen list, terminal list, server ids) and forward-only, so a longer life adds no risk. Received/
+  working orders with no answer for 2 h become `failed: no answer from the computer`.
+- **The order id is chosen by the browser and is the server's id**, sealed inside; a broker refuses an
+  order filed under another id. That lets any later broker process (the update restarts it) relay
+  the updater's status.
+- **Owner POST uses the site's standard one-use passkey check** (`require_passkey_check`, ≤ 5 min,
+  spent by this request) plus CSRF — not a challenge bound to the ciphertext. The order is sealed in
+  the browser; someone holding the unlocked session could seal any order anyway.
+- **Inferred install:** the server may mark an order installed from a reported broker version only
+  after 15 min without a real status, and a real result may still replace that guess.
+- **Reopen notice:** "Reopen <app> when convenient to use the new version" whenever an agent's
+  copy is older than its broker. Gentle and never a required step.
+- **The install root is wholly ours** (created by us, refused if it pre-exists unless it is our empty
+  skeleton from an interrupted first run; installer and updater are its only writers). Uninstall
+  removes it and the spool entirely; launchers are restored.
+- **Windows request.json:** the broker gets Read + Write + Synchronize (Node opens O_WRONLY as
+  GENERIC_WRITE) and still no Delete, ChangePermissions or TakeOwnership. Descriptor files are
+  replaced with File.Replace / File.Move, never Move-Item.
+- **Installer and updater share `state/lock`** (POSIX), created with its content atomically.
+- **Release order:** the site's `LATEST_MCP_VERSION` moves only after `release.json` and
+  `release.json.sigs` are uploaded, so the vault never offers a version that can't be verified.
+- **Durable terminal list** `state/orders.json`; a `rollback failed` is committed (no retry loop);
+  every extracted file and folder is fsynced before the switch; the updater sets umask 022.
+- **The updater must recognise itself as the program when started through the `current` link**
+  (systemd/launchd/tasks do exactly that): compare real paths. Found on the real machine.
+
 
 ## Why
 
@@ -201,7 +238,9 @@ the tooling), `src/tar-read.ts` (reader). Entry `dist/updater.js`.
   AAD = `wv-broker-order-v1|<broker fingerprint>`. Plaintext:
   `{"v":1,"type":"update","broker":"<fingerprint>","version":"X.Y.Z","order_id","issued_at","expires_at"}`.
   Refuse unless it decrypts; `broker` is this broker; not expired (≤ 15 min life, ≤ 2 min skew);
-  `order_id` unseen (last 100 kept in the broker's state); version > its own.
+  `order_id` unseen (last 100 kept in the broker's state); version > its own; and `order_id` equals the
+  id the server filed the order under (the browser chooses it, so a broker restarted by the update
+  can still relay the updater's status for it).
 - **Hand over:** truncate + write `request.json` in place. **Relay** `status.json` changes to our
   server (fixed states; the detail passed through ≤ 200 chars).
 - **Store compatibility rule** (applies to every future release): a release may only change the
@@ -212,7 +251,7 @@ the tooling), `src/tar-read.ts` (reader). Entry `dist/updater.js`.
 
 - **Record** `release.json` (canonical JSON, UTF-8, no trailing newline):
   `{"format":"wundervault-release-1","version":"X.Y.Z",
-  "app":{"url","sha256","files":[{"path","sha256","size"}…]},
+  "app":{"url","sha256"},
   "node":{"version":"N","linux-x64":{"url","sha256","member":"node-vN-linux-x64/bin/node"},
   "linux-arm64":…,"darwin-x64":…,"darwin-arm64":…,"win-x64":{"url","sha256"},"win-arm64":…},
   "notes_url"}` (Node: official `.tar.gz` on Linux/macOS, the standalone `node.exe` on Windows).
@@ -290,7 +329,7 @@ server's "latest" (machines already updated move forward with a fix release).
    refused; no request is written.
 9. A request at or below `highest.json` installs nothing — including after a rollback and after an
    installer re-run.
-10. With CORRECTLY SIGNED test fixtures (a test key compiled into a `-test` build): a record whose
+10. (rev 2: entries are checked by rule, not against a list.) With CORRECTLY SIGNED test fixtures (a test key compiled into a `-test` build): a record whose
     version differs from the request, an archive with a symlink / hard link / device / `..` path /
     absolute path / duplicate path / unlisted file / missing file / wrong per-file hash, a Node
     archive without the expected member, and a URL off the U6 hosts each end `failed`/`refused`
@@ -316,7 +355,7 @@ server's "latest" (machines already updated move forward with a fix release).
     (no download happens).
 18. Our server can't produce an order a broker accepts (well-formed order sealed with a wrong key is
     refused), and the server code has no path that decrypts one.
-19. `POST …/orders` without an assertion, with a stale one (> 2 min), a reused challenge, or an
+19. (rev 2: the site's one-use passkey check.) `POST …/orders` without CSRF, or without a fresh unspent passkey check, is refused; with both it is stored. Superseded text follows: without an assertion, with a stale one (> 2 min), a reused challenge, or an
     assertion bound to a different broker/version/ciphertext is refused; the right one is stored.
 20. The vault page shows each broker's version, "Update available" only when behind, the status
     lines in U7 and the "reopen <app>" line, at 320 px wide with no horizontal scroll.

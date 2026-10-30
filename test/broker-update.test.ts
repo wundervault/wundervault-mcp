@@ -52,7 +52,7 @@ describe('openOrder', () => {
       issued_at: new Date(now - 10 * 60_000).toISOString(),
       expires_at: new Date(now - 3 * 60_000).toISOString(),
     }, 'expired'],
-    ['too-long life', { expires_at: new Date(now + 16 * 60_000).toISOString() }, 'malformed'],
+    ['too-long life', { expires_at: new Date(now + 25 * 60 * 60_000).toISOString() }, 'malformed'],
     ['future issue', {
       issued_at: new Date(now + 3 * 60_000).toISOString(),
       expires_at: new Date(now + 10 * 60_000).toISOString(),

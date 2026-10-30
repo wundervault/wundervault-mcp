@@ -107,9 +107,9 @@ describe('update layout scripts', () => {
 
   it('uses explicit Windows permissions and absolute program paths', () => {
     expect(windows).toContain("$ErrorActionPreference = 'Stop'");
-    expect(windows).toContain(
-      "[System.Security.AccessControl.FileSystemRights]'WriteData, ReadData, Synchronize'",
-    );
+    // Review round 1 (B-B1): Node opens O_WRONLY as GENERIC_WRITE, so the broker needs Read, Write and
+    // Synchronize on request.json — still never Delete, ChangePermissions or TakeOwnership.
+    expect(windows).toMatch(/FileSystemRights\]'Read, Write, Synchronize'/);
     expect(windows).toContain('-Broker $BrokerSid -Request $true');
     expect(windows).toContain('[int64]$BrokerRules[0].FileSystemRights -ne [int64]$Allowed');
     expect(windows).toContain('Broker must have no rights on the spool directory.');

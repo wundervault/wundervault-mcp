@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { generateKeyPairSync, sign, createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { ReleaseKey } from './release-keys.js';
 import {
   DEFAULT_LIMITS,
@@ -105,6 +105,7 @@ function atomicJson(file: string, value: unknown, mode = 0o600): void {
   try {
     fs.rmSync(temp, { force: true });
     fd = fs.openSync(temp, 'wx', mode);
+    fs.fchmodSync(fd, mode);
     fs.writeFileSync(fd, JSON.stringify(value));
     fs.fsyncSync(fd);
     fs.closeSync(fd);
@@ -128,55 +129,66 @@ function removeTree(file: string): void {
 }
 
 function acquireLock(file: string, startedAt: number): (() => void) | null {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    let fd: number;
-    try {
-      fd = fs.openSync(file, 'wx', 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      let stale = false;
+  const temp = `${file}.tmp-${process.pid}`;
+  const contents = `${process.pid} ${startedAt}`;
+  let fd: number | undefined;
+  try {
+    fs.rmSync(temp, { force: true });
+    fd = fs.openSync(temp, 'wx', 0o600);
+    fs.fchmodSync(fd, 0o600);
+    fs.writeFileSync(fd, contents);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const text = fs.readFileSync(file, 'utf8');
-        const match = /^(\d+) (\d+)$/.exec(text);
-        if (!match) {
-          stale = true;
-        } else {
-          const pid = Number(match[1]);
-          const at = Number(match[2]);
-          stale = !Number.isSafeInteger(pid) || pid <= 0 || startedAt - at > 20 * 60_000;
-          if (!stale) {
-            try {
-              process.kill(pid, 0);
-            } catch (probeError) {
-              stale = (probeError as NodeJS.ErrnoException).code === 'ESRCH';
+        // Publish only a complete lock; another process never sees an empty one.
+        fs.linkSync(temp, file);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        let stale = false;
+        try {
+          const stat = fs.statSync(file);
+          const text = fs.readFileSync(file, 'utf8');
+          const match = /^(\d+) (\d+)$/.exec(text);
+          const pid = match ? Number(match[1]) : NaN;
+          const at = match ? Number(match[2]) : NaN;
+          if (!Number.isSafeInteger(pid) || pid <= 0 ||
+              !Number.isSafeInteger(at) || at < 0) {
+            stale = startedAt - stat.mtimeMs > 20 * 60_000;
+          } else {
+            stale = startedAt - at > 20 * 60_000;
+            if (!stale) {
+              try {
+                process.kill(pid, 0);
+              } catch (probeError) {
+                stale = (probeError as NodeJS.ErrnoException).code === 'ESRCH';
+              }
             }
           }
+        } catch (readError) {
+          if ((readError as NodeJS.ErrnoException).code === 'ENOENT') continue;
+          throw readError;
         }
-      } catch (readError) {
-        if ((readError as NodeJS.ErrnoException).code === 'ENOENT') continue;
-        throw readError;
+        if (!stale) return null;
+        fs.rmSync(file, { force: true });
+        continue;
       }
-      if (!stale) return null;
-      fs.rmSync(file, { force: true });
-      continue;
+      return () => {
+        // A run older than twenty minutes must not remove its successor's lock.
+        try {
+          if (fs.readFileSync(file, 'utf8') === contents) fs.unlinkSync(file);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+      };
     }
-    const contents = `${process.pid} ${startedAt}`;
-    try {
-      fs.writeFileSync(fd, contents);
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    return () => {
-      // A run older than twenty minutes must not remove its successor's lock.
-      try {
-        if (fs.readFileSync(file, 'utf8') === contents) fs.unlinkSync(file);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      }
-    };
+    return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    fs.rmSync(temp, { force: true });
   }
-  return null;
 }
 
 function readJournal(file: string): Journal | null {
@@ -191,6 +203,25 @@ function readJournal(file: string): Journal | null {
     throw new Error('journal');
   }
   return value as unknown as Journal;
+}
+
+function ordersIn(file: string): string[] {
+  const value = readJson(file);
+  if (value === null) return [];
+  if (!Array.isArray(value) || value.length > 200 ||
+      !value.every(id => typeof id === 'string' && ORDER_ID.test(id))) {
+    throw new Error('order history');
+  }
+  return value;
+}
+
+function rememberOrder(file: string, id: string): void {
+  if (!ORDER_ID.test(id)) return;
+  const orders = ordersIn(file);
+  if (!orders.includes(id)) {
+    orders.push(id);
+    atomicJson(file, orders.slice(-200));
+  }
 }
 
 function versionsIn(file: string): string[] {
@@ -276,12 +307,15 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
   const stateDir = path.join(d.root, 'state');
   const versionsDir = path.join(d.root, 'versions');
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(stateDir, 0o700);
   fs.mkdirSync(versionsDir, { recursive: true, mode: 0o755 });
+  fs.chmodSync(versionsDir, 0o755);
   const unlock = acquireLock(path.join(stateDir, 'lock'), d.now());
   if (!unlock) return 'busy';
 
   const journalFile = path.join(stateDir, 'journal.json');
   const highestFile = path.join(stateDir, 'highest.json');
+  const ordersFile = path.join(stateDir, 'orders.json');
   const statusFile = path.join(d.spool, 'status.json');
   let active = UNSPECIFIED;
   let temp: string | null = null;
@@ -291,6 +325,8 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
     const value: Status = {
       ...order, state, detail: detail.slice(0, 200), at: new Date(d.now()).toISOString(),
     };
+    // Persist deduplication before making a terminal status visible.
+    if (TERMINAL.has(state)) rememberOrder(ordersFile, order.order_id);
     atomicJson(statusFile, value, 0o644);
   };
   const journal = (phase: Journal['phase'], from: string | null, to: string | null, order: Order): void => {
@@ -316,15 +352,14 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
     if (from !== null) {
       try {
         d.writeDescriptor(from);
+        syncDirectory(d.root);
         ok = await restartAndCheck(d, from);
       } catch {
         ok = false;
       }
     }
-    if (ok) {
-      appendHistory(stateDir, [from]);
-      journal('committed', from, from, order);
-    }
+    if (ok) appendHistory(stateDir, [from]);
+    journal('committed', from, from, order);
     atomicJson(path.join(stateDir, 'failed.json'), [order.version]);
     prune(d, from);
     status(order, ok ? 'rolled back' : 'rollback failed', 'new version not healthy');
@@ -349,7 +384,10 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
         if (await restartAndCheck(d, order.version)) finish(order, pending.from);
         else await rollback(order, pending.from);
       } else {
-        if (pending.from !== null) d.writeDescriptor(pending.from);
+        if (pending.from !== null) {
+          d.writeDescriptor(pending.from);
+          syncDirectory(d.root);
+        }
         journal('committed', pending.from, pending.from, order);
         removeTree(path.join(versionsDir, `${order.version}.staging`));
         status(order, 'failed', 'interrupted');
@@ -402,9 +440,13 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
     }
     atomicJson(malformedFile, { count: 0 });
     active = order;
+    if (ordersIn(ordersFile).includes(order.order_id)) return pending ? 'done' : 'idle';
     const previousStatus = readJson(statusFile);
     if (object(previousStatus) && previousStatus.order_id === order.order_id &&
-        TERMINAL.has(previousStatus.state as State)) return pending ? 'done' : 'idle';
+        TERMINAL.has(previousStatus.state as State)) {
+      rememberOrder(ordersFile, order.order_id);
+      return pending ? 'done' : 'idle';
+    }
 
     const running = d.readDescriptor();
     const highest = readJson(highestFile);
@@ -451,6 +493,7 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
     temp = path.join(d.root, `tmp-${order.order_id}`);
     removeTree(temp);
     fs.mkdirSync(temp, { mode: 0o700 });
+    fs.chmodSync(temp, 0o700);
     const appArchive = path.join(temp, 'app.tar.gz');
     const nodeArchive = path.join(temp, d.platform.startsWith('win-') ? 'node.exe' : 'node.tar.gz');
     const deadline = d.now() + 10 * 60_000;
@@ -473,6 +516,7 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
     staging = path.join(versionsDir, `${order.version}.staging`);
     removeTree(staging);
     fs.mkdirSync(staging, { mode: 0o755 });
+    fs.chmodSync(staging, 0o755);
     try {
       await extractApp(appArchive, staging, REQUIRED_APP_FILES, d.limits);
       await d.installNode(staging, record, temp);
@@ -497,6 +541,7 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
     staging = null;
     syncDirectory(versionsDir);
     d.writeDescriptor(order.version);
+    syncDirectory(d.root);
     journal('switched', running, order.version, order);
     if (await restartAndCheck(d, order.version)) finish(order, running);
     else await rollback(order, running);
@@ -609,6 +654,7 @@ export async function selfTestMain(): Promise<boolean> {
 }
 
 export async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
+  process.umask(0o022);
   const problem = checkEnv(env);
   if (problem) {
     console.error(`updater: ${problem}`);
@@ -626,7 +672,20 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<numb
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Am I the program that was started? Compared by REAL path: systemd, launchd and the Windows task
+// start this file through /opt/wundervault/current (a link), and Node resolves that link for
+// import.meta.url, so comparing the unresolved argv[1] said "no" and the scheduled updater exited
+// having done nothing (found on a real systemd install, 2026-10-30).
+function startedAsProgram(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (startedAsProgram()) {
   void main(process.argv.slice(2), process.env).then(
     code => process.exit(code),
     () => process.exit(2),

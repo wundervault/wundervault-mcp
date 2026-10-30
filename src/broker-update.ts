@@ -108,7 +108,7 @@ export function openOrder(
     const issued = isoTime(order.issued_at);
     const expires = isoTime(order.expires_at);
     if (!version || !own || !Number.isFinite(issued) || !Number.isFinite(expires) ||
-        !Number.isFinite(nowMs) || expires <= issued || expires - issued > 15 * 60_000) {
+        !Number.isFinite(nowMs) || expires <= issued || expires - issued > 24 * 60 * 60_000) {
       return { ok: false, reason: 'malformed' };
     }
     if (order.broker !== fingerprint) return { ok: false, reason: 'wrong broker' };

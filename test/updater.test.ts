@@ -472,7 +472,8 @@ describe('updater flow', () => {
     await runOnce(f.d);
     expect(f.status()).toMatchObject({ state: 'rollback failed', detail: 'new version not healthy' });
     expect(f.calls.restart).toBe(2);
-    expect(json(path.join(f.state, 'journal.json')).phase).toBe('switched');
+    // Round 1 (A-F5): a failed rollback is committed, so later ticks don't restart the broker again.
+    expect(json(path.join(f.state, 'journal.json')).phase).toBe('committed');
   });
 
   it('resumes switching when the descriptor already points at the new folder', async () => {
