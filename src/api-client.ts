@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import { hmacForApiKey, decryptVaultKey } from './crypto.js';
 import type { BrokerSigner } from './broker-sign.js';
 import type { VaultEntry, ProfileResponse, SecretsResponse, SecretResponse } from './types.js';
+import { pinAccountFor, resolveEntry, resolveList } from './entry-view.js';
+import type { SetupPins } from './setup-seal.js';
 import { VERSION } from './version.js';
 
 const TIMEOUT = 30_000;
@@ -65,6 +67,7 @@ export class AgentVaultAPI {
      * outcome — not a quiet downgrade to the weaker path.
      */
     private signer: BrokerSigner | null = null,
+    private pins: SetupPins | null = null,
   ) {
     this.hmacB64 = hmacForApiKey(apiKey, encKey);
   }
@@ -252,7 +255,29 @@ export class AgentVaultAPI {
   }
 
   async listSecrets(): Promise<SecretsResponse> {
-    return this.fetchJson<SecretsResponse>('/agent/vault/secrets');
+    const resp = await this.fetchJson<SecretsResponse>('/agent/vault/secrets');
+    if (!this.pins) return resp;
+    const result = await resolveList(resp, {
+      vaultKey: () => this.ensureVaultKey(),
+      pins: this.pins,
+      account: pinAccountFor(this.apiKey),
+    });
+    return { entries: result.entries };
+  }
+
+  private async resolveSecret(resp: SecretResponse, id: string): Promise<SecretResponse> {
+    if (!this.pins) return resp;
+    const result = await resolveEntry(resp, {
+      requestedId: id,
+      vaultKey: () => this.ensureVaultKey(),
+      pins: this.pins,
+      account: pinAccountFor(this.apiKey),
+      withValue: true,
+    });
+    if (!result.ok) {
+      throw Object.assign(new Error(result.message), { code: result.code });
+    }
+    return result.entry;
   }
 
   /**
@@ -267,7 +292,9 @@ export class AgentVaultAPI {
    */
   async getSecret(id: string): Promise<SecretResponse> {
     try {
-      return await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, { purpose: '' });
+      return await this.resolveSecret(
+        await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, { purpose: '' }), id,
+      );
     } catch (err: any) {
       // Tier-2 gate: the 403 detail carries a pending approval-request id.
       // Park here and poll it so the human's approval resolves this same
@@ -281,7 +308,9 @@ export class AgentVaultAPI {
       // a refusal even when the owner simply had not looked yet. The same words as every tool,
       // with the secret's name (review round 1, F2), which this refused fetch never returned.
       if (outcome !== 'approved') throw new ApprovalNotGiven(outcome, await this.quotedNameOf(id));
-      return await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, { purpose: '' });
+      return await this.resolveSecret(
+        await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, { purpose: '' }), id,
+      );
     }
   }
 

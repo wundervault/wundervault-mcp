@@ -358,6 +358,9 @@ export class SetupPins {
     return this.enqueue(async () => {
       if (this.unreadable || !this.state) throw new Error('refuse: pins unreadable');
       if (!accountId || !entryId || !validRev(rev)) throw new Error('Invalid pin');
+      // Listing pins every entry on every call; write only when a pin actually moves.
+      const current = this.state.entries.get(entryId);
+      if (this.state.accounts.has(accountId) && current !== undefined && current >= rev) return;
       const next: PinState = {
         accounts: new Map(this.state.accounts),
         entries: new Map(this.state.entries),

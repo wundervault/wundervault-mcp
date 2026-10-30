@@ -1,3 +1,5 @@
+import type { Setup } from './setup-seal.js';
+
 export interface VaultEntry {
   id: string;
   secret_name: string;
@@ -6,6 +8,15 @@ export interface VaultEntry {
   entry_mode?: string;
   /** Ids of the signed operations the entry offers. */
   operations?: string[];
+  agent_id?: string;
+  rev?: number;
+  setup_ciphertext?: string;
+  setup_nonce?: string;
+  vault_locked?: boolean;
+  setup?: Setup;
+  name?: string;
+  exec_config?: Record<string, unknown> | string;
+  allowed_private_origins?: string;
 }
 
 export interface Credentials {
@@ -56,4 +67,11 @@ export interface SecretResponse {
    */
   policy_ciphertext?: string | null;
   policy_nonce?: string | null;
+  agent_id?: string;
+  id?: string;
+  rev?: number;
+  setup_ciphertext?: string;
+  setup_nonce?: string;
+  vault_locked?: boolean;
+  setup?: Setup;
 }

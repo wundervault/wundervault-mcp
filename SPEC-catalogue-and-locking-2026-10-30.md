@@ -59,6 +59,15 @@ the MCP worktree `~/wv-build/mcp-brand` at 7a63849.
     256 KiB · 512 KiB; larger is refused before sealing (signature details may be 72 KiB, `agent.py`
     498–500; signed operations may be 256 KiB, `dashboard.py` 1543–1544, kept as a map of op id →
     {definition, signature} with `definition.op` equal to its key, ≤ 50 ops).
+18. **Broker seam (Claude, build):** the broker opens sealed setups in ONE place,
+    `src/entry-view.ts`, called by `AgentVaultAPI.getSecret`/`listSecrets`. It returns today's
+    entry shape (`name`, `entry_mode`, `exec_config`, `operations`, `allowed_private_origins`)
+    derived ONLY from the opened setup (server plaintext fields are dropped, never merged), plus
+    `setup`. Pins key the account by SHA-256 of the agent's API key (the broker's own identity —
+    a server-chosen id can't dodge a pin); AAD uses the response's `agent_id` and the REQUESTED
+    entry id (a response for another id is refused). ssh / wallet / sign values are always `raw`.
+    A stamped `signed_set` with `parts-1` is handed to the stamp code as today's JSON object
+    (`JSON.stringify(oauth1FromParts(parts))`).
 17. **Server logs name nothing.** Log lines that carry a key's name, op ids, header names, hosts
     or origins (e.g. `dashboard.py` 1617 `ops=sorted(ops.keys())`) log ids and counts instead; a
     test greps every `log.*(` call site in the routes L touches.
