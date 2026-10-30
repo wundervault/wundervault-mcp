@@ -68,6 +68,12 @@ the MCP worktree `~/wv-build/mcp-brand` at 7a63849.
     entry id (a response for another id is refused). ssh / wallet / sign values are always `raw`.
     A stamped `signed_set` with `parts-1` is handed to the stamp code as today's JSON object
     (`JSON.stringify(oauth1FromParts(parts))`).
+19. **OPEN (must land in this release): seal wallet / signing / recipe approval details.** Today a
+    payment, signature or recipe approval request carries a plaintext `detail` (payee + amount,
+    digest, recipe) that the server holds only while pending. On a locked account those stay on
+    today's path (gate bit decides the kind: payment/signature need `gate == "operation"`,
+    recipe needs `gate != "operation"`); the broker's signing-ops should seal `detail` the way
+    web calls do, and the owner's browser open it. Site agent.py keeps the plaintext path until then.
 17. **Server logs name nothing.** Log lines that carry a key's name, op ids, header names, hosts
     or origins (e.g. `dashboard.py` 1617 `ops=sorted(ops.keys())`) log ids and counts instead; a
     test greps every `log.*(` call site in the routes L touches.
