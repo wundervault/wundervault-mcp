@@ -68,6 +68,22 @@ the MCP worktree `~/wv-build/mcp-brand` at 7a63849.
     entry id (a response for another id is refused). ssh / wallet / sign values are always `raw`.
     A stamped `signed_set` with `parts-1` is handed to the stamp code as today's JSON object
     (`JSON.stringify(oauth1FromParts(parts))`).
+20. **Owner writes (Claude, build).** Revisions are kept by the server, not trusted from callers:
+    a SQLAlchemy before-update hook bumps `rev` by 1 whenever any L1 plaintext column or blob of a
+    `persistent_secrets` / `agent_vault_entries` row changes, and new column `sealed_rev` records the
+    rev at which the row's blob was last written. Sealed writes go through NEW routes
+    (`app/routes/sealed_writes.py`): `PUT /dashboard/vault/secrets/{id}/meta`
+    `{base_rev, meta_ciphertext, meta_nonce, meta_salt, gate}` and
+    `PUT /dashboard/agent-vault/entry/{id}/setup` `{base_rev, setup_ciphertext, setup_nonce}` —
+    compare-and-swap: refused 409 `{error:'stale', rev}` unless `base_rev == rev`; on success
+    `rev = sealed_rev = base_rev + 1` (the browser sealed with AAD rev `base_rev + 1`). Readiness
+    and lock count a row as sealed only when `sealed_rev == rev`. While unlocked the browser
+    dual-writes: today's route, then the sealed PUT. On a locked account every route that writes
+    an L1 plaintext field refuses 409 `vault_locked`; creating a key or an agent copy on a locked
+    account goes through the sealed routes too (`POST /dashboard/vault/secrets/sealed`,
+    `POST /dashboard/agent-vault/sealed`, carrying the value ciphertext exactly as today plus the
+    blob, name stored as ""). Owner actions' activity rows on a locked account take an optional
+    `label` {ciphertext, nonce, salt} from the browser and a purpose without the name.
 19. **OPEN (must land in this release): seal wallet / signing / recipe approval details.** Today a
     payment, signature or recipe approval request carries a plaintext `detail` (payee + amount,
     digest, recipe) that the server holds only while pending. On a locked account those stay on
