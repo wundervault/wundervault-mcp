@@ -1,0 +1,142 @@
+{
+  "setups": [
+    {
+      "vault_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "agent_id": "00112233445566778899aabbccddeeff",
+      "entry_id": "102132435465768798a9bacbdcedfe0f",
+      "rev": 7,
+      "nonce_hex": "000102030405060708090a0b",
+      "setup": {
+        "v": 1,
+        "rev": 7,
+        "value_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "value_format": "parts-1",
+        "name": "Alpaca",
+        "shape": "key_id",
+        "service": "alpaca",
+        "delivery": "http",
+        "binding": {
+          "v": 2,
+          "placements": [
+            {
+              "in": "header",
+              "name": "apca-api-key-id",
+              "template": "{part:id}"
+            },
+            {
+              "in": "header",
+              "name": "apca-api-secret-key",
+              "template": "{part:secret}"
+            }
+          ]
+        },
+        "ssh_hosts": [],
+        "private_origins": [],
+        "known_addresses": [
+          "https://api.alpaca.markets"
+        ],
+        "approval": "first_use",
+        "operations": [],
+        "chain": null
+      },
+      "plaintext_padded_len": 1024,
+      "ciphertext_b64": "77NUy/5lspMXa2SqXUsfPUtjbJwiJzlyRAAqhb/yEZ0XkHVb5pumpmNJ5MpMyaYxUcd/X419Nanz3uetBRKD+ef29h6fJfJyku5N73+VlQ+bBnOlRLn7zBu8JTVfEDGs/2BR6hJVsDu2bHhBqOkhHiU6iF9qUptWOcx/IsrR4icZh7XTBC46dPYyCi3+1oslH91rd5CsDW0k7Max1Q16cQW2sJwaBgrwm9YNaLg5u0436le3VbGE+Xi7GlLNmgD/y0JeVdFvp/cOfQn1B+I4j4LUoBznbQvbJqTNk1NxALMMBK1h2jsJovMcWE6xSUkNRzuJ2NUDO5SsOKIfntrVBb6Zr40ZvPN+C7b/Br1PQ8yCO+L4sLzxfJXbFAzeJOS88WiXbYAcnfiE/+qLmrH/jWxjGMXT0XJ91lcstsR7js8/4ZWQtl715NqZIUGLjw2NVy4ILnW7KsBq4zRJBHXAoD5dR9rb30DCEX9YOYIs90Y1WefM2CLHDYXyrJkis7LqscAg/Zorj/d2AWJ3y11OUoYiz/vUU8lwpaUr2YYLl5g8h7kmXrmpm5bRWSH/7Siy1CVTZZxsAmyuZaO4rshovKNkFgesOLbdzMb3rMKv8pEcOCLhVyVxGUqo6M6uGp8/IsQH1C4HUfIpPWjk+gl1j9dDnM2yfnQftJ/HtKy6F4gYP7OGthNPFqI8CuJEVvkjN0d7EQJD4GyqhxgXgNJ2SpWYP8K+iD+juJW8W6nngwkTdVuhWzIinBlV4XehXFk+Q9AKJrrNgUszzoxiSGY1d7THugy0GQ+/54TAND9IzdTSoTbr0HHmq3PzgUoxSyrKArSnWLkxkYhddoB/p6CUzVFfDmBatQUFxJ5ZpPQorxVV4bUvBVmJZpPZbHMGkSDoXrse/FRPUOV8Dk4qvnoXeoI1LT/ltwVFmzZDuatYV03xeRBVQY0PSdt0pXh6EZgXFMkEfmLbOEkLCQO+BF2uhUdgZBA4KyqVCpV70Avua5DuFieGYx2GuuI7S7pwk88N0TQr+GPThhR8liH34MsA4anEEuUo3xLW8ITPPhTiqOSLJ6w77jV4dHXMQkE0Fr6Kc5+dYDBEbmxC45htJksZi7dM5jEdctZUF0AHghDGE2rYWCVCJOTv9m7QGG7K5tPKJconyEeqwjgruA7sQv+WQSeF4m6xg9+fGDOKMfkdqyrDaZpus8Jbtm+PlGZDHpiCvRtGZEaC+tdzzwF/UVp60/ZN0TXvWI6HEzkaxUQc3tLrzk4oQYCeZfXSaYKh4Ctb6Dk5mwPa/KyizqsnftLW0E/oJtT5Pbxb1YUSCha/qddAYtAVF4Q5iFhqzfW+aDn26bElHMikDaLbQQZsM9DXzCErl0GbDB410a5vd2dmj/k="
+    },
+    {
+      "vault_key_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "agent_id": "legacy-agent_2",
+      "entry_id": "legacy-entry_3",
+      "rev": 1,
+      "nonce_hex": "101112131415161718191a1b",
+      "setup": {
+        "v": 1,
+        "rev": 1,
+        "value_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "value_format": "raw",
+        "name": "Production SSH",
+        "shape": "ssh_key",
+        "service": null,
+        "delivery": "ssh",
+        "binding": null,
+        "ssh_hosts": [
+          "deploy.example.test"
+        ],
+        "private_origins": [],
+        "known_addresses": [],
+        "approval": "first_use",
+        "operations": [],
+        "chain": null
+      },
+      "plaintext_padded_len": 1024,
+      "ciphertext_b64": "290o41ImZ9xs1wRa0svOmqK9iafyZQgx/jGw9c9DXa8Z6xneCIxT8SN/hHzKadIZx9O6FsDrV02+JiePtOHrLASaC4jXnm09wsG7rcM7LOwN2TRMnXLuswAlnI+v2xyEfIeRfuWvvgpnNftn3JgMm2chIEfwufCqb+fu80EwmaSZLs5hVKqQS0XAwGrd7ampKouLrQkeQLpjWwURaqlwj30RlIrKWSwmX/5RBiGICQoTglS2FUe8Sab6GIfVYCi92fN+aBkZ2SGl1dFt85xbV4OdlWq9V6CQx8QUz7PUUj3zzyAtbvmfO4EU2h+vT2XXrXBasBp4csQ+EGuU+1V9+Xzlv8jkiboWSruFNelCqHSklJWld/9FqEHPxXBmlXUV2E8ZODWqGihU+vQNH4q8vfG/BpjsY416jk2hxNgcU5Ur0tRBQaykHiZEgsUvWjm3USzWt61GKfQaU2iJ2D/v/MWisN04Z5kmjXwMif0MZl//F0qRKDpq/asRQh018z8E0ItmEgzuQDELOydnHidDzisxszx1bMKFjHVGM95maOhFO5llIckCXwcXhLZkIo24CMAVVAaN/Pm9LURQKgB+xxKvvqT5SF3wZz43u5y/yXBF1Q7Dauf3TI0NBwau4n1qfOPcwMF39X6Z4+x70C70+lPjcivyfJa0S4asY1y4nhpUM7E5sHv+FAdPpTP8EMxwA8XIRyasYIc7/x2LCRw4pjZGS7owWSWcVCA0RqWoeSc6o+Rreyifp/HAQBwqWb0HgFApIYEmOwjACD11jMXxBXtxMi+wY/glXGwHQ0QLYutRHYCQx5U7Dvi7sI3CFFu4d7o0lRqIS/XOSyjQZrbWYYxJfqDNuEZo562SSnyI7KcunsicVPtn+IpmHm4N+6gTxGh90ecDDGUU/N9v5UNHG634BOsETqDf0r1FnjwQi21RCHwP+N66o0G+6pN8W/OOnUgvPO7NrwM/Rnq4d+pvhZ+RBVX6Ml1Nkv8nhTo+XBAw2NhSsq2G2QQPssauTQk6XytKNGU5OXdNrFNm6lL/fMRnUjfeR0rC3mCyZwQiil8DtvjnpVvZj1tMfOL8mc5rqRvrB/6NVPolcHGzRpSaVS5oKqxwq0R6bplHPQcQlQnWpg6pQeM+/7xidvvUYq5W1fpWQ0KMUvdKFv5mBszq+8vKDCmDJ4FYV/qOB2GVxsQCMphlFtWx7bwKQMsg3xtkX96IVpZUpMrJoLI4au6p4Kazjck1eTAMTtlSX0/PvF1q5FHxbPpXXbJk7xAYlQS6r8IE7WLZ7+qSulS/viPFBRPfrUsaevZVkScQyM13KN0faqq9Ma7dhEUHmORONerlEbFIbDvT1gFmkwSpyOI1fzJq7AbT+0liaHcOgcCeeok="
+    },
+    {
+      "vault_key_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "agent_id": "ffeeddccbbaa99887766554433221100",
+      "entry_id": "0123456789abcdef0123456789abcdef",
+      "rev": 42,
+      "nonce_hex": "f0e0d0c0b0a0908070605040",
+      "setup": {
+        "v": 1,
+        "rev": 42,
+        "value_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        "value_format": "raw",
+        "name": "\u7f72\u540d \ud83d\udd10 caf\u00e9",
+        "shape": "signing_key",
+        "service": null,
+        "delivery": "sign",
+        "binding": null,
+        "ssh_hosts": [],
+        "private_origins": [],
+        "known_addresses": [],
+        "approval": "always",
+        "operations": [],
+        "chain": null
+      },
+      "plaintext_padded_len": 1024,
+      "ciphertext_b64": "+u8MNUnVHYcDUBJQXB4g0OOGnaDd2SsEqQ8fkn959h8kLgR7CEnnP+9aH49NC46z7I7RB2qX4wSQB1yLUD2NHKA9NS29nJ6xMHgsRKgBNAt9UgP7HYz68RZebFkm2PvHdJUoMsM5yEyhW9/SGM93rGP0VHNUdK743dlYjac8ZrQVal8zExRaDfA6RkKfrzX/H5I4Li8/Fd63I9GvM/4h8w0+sxym6lgYyN+tmyy8HqJMzdp6o5Z71KNFrbOOSd9VE2Qm4hYCn2Ktv+dLVPJZz8p/Ahgxwq8arzlpkH1UfFaFvmuNTuKvqokcJ1gLqjqWVrtu6XjAMC4zjAypnPJdfT++udYaspEJFuWcR8KwEV4l5vd8SPJOGhQjyK8LBIJTKIhq/LZKcQK+4COkAgmyGXJFqUbUgN6982bhh/UPns8UsonVf4QU9Pwtqj91I7BFcsEa1F9pQMM8fpbqHOSVTQ8+xh3qgcAgU2oGolFqsUwz56aK5nnFuUAFfvj3shv/hNxTigPDeIZr2WeONa/LV0iM49tU6gctoJ79Hitpjvagrk1wDS0zKFzDvkvDHzQZvqxvH5vTKYiQpDo3FCasm+0jZCMLKvbw6+t4mGhueu9u5FzErUnMDzQvI8Mf/86UpBIgdQ2JgmQ09craghoRFecx/yqRdlC63PqYgtn+IKvik1K4Pnb9PLEnFKn8/bonPEgS5vWgcr2hxs9XaNzXxbFStJQCysIlAi/XoDmkT+SZ/tA0vsGDEColTZe8OPAE9EAAjNXbkpofUm/2iEfHMqnt4U4X2C7NR4UReVk14fFXEhXQQ49AMmWbPIfSyapqsoOUPPx13dDMqtFoMqs4n6aYgls8YoDIT+uN2xASR595GAzG7dTf4Id+r1VZoRFWfmZv1TxggEluglPJclnD9NXhi/5eE0Z+W60lyxKOQ/RiruqjRqjgWMEEnJPLI1zW4s9hLLTs6FCB/EaZpP0hpJj7qCZHR+t71nU9N/hHv4fmudIf3vAZdcldW0I6WU2TsXwp1XCYM9L8NeThu1s+lqM7bkDLO4eu3gfUy0H9ENYoyrbIr9SPELWJYJDLpmSnzbVVd26wzgKafTCYsMexsMyXaWm8dJdj9q6zyzcDF6ZZ14kLVQJrTA3rpi7bB23J0wS/sLKxgGEz1eNiKzm9kSk8e8f2hKki3foQAMcQoA+/0DAEplVi11LegPWnxz1LTICU3Rwsm5QnlTAlpgkGvXIMIPWhwrkEdj9sgnJKHGTcToV66tgJNKOfXC5j2RQStHzcod1c9EOw+ky2wqvueNZDtKENEc4v6FcrX04zzQEJOvwca2U33tBfiWHHr4mCKwj8pYoavAfHnvnN5dWAO/AxN6JvfcZ+VSuTG1TdFVY="
+    }
+  ],
+  "t2_matches": [
+    {
+      "vault_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "fields": {
+        "kind": "web",
+        "origin": "https://api.example.test",
+        "method": "GET",
+        "path": "/status",
+        "entry_id": "102132435465768798a9bacbdcedfe0f"
+      },
+      "mac_hex": "78ff334ea9dfb32bd60ccf05dfe52c7a9cc7a3ea5871bbc002387e4835205238"
+    },
+    {
+      "vault_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "fields": {
+        "kind": "web",
+        "origin": "https://api.example.test",
+        "method": "POST",
+        "path": "/transfer",
+        "entry_id": "102132435465768798a9bacbdcedfe0f"
+      },
+      "mac_hex": "bda6237cc97c50ee7276610f93b512f80041656e9910c6a711c535f5d81a4bab"
+    }
+  ],
+  "t2_details": [
+    {
+      "vault_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "agent_id": "00112233445566778899aabbccddeeff",
+      "request_id": "1234567890abcdef1234567890abcdef",
+      "nonce_hex": "202122232425262728292a2b",
+      "detail": {
+        "name": "Example key",
+        "kind": "web",
+        "origin": "https://api.example.test",
+        "method": "GET",
+        "path": "/status",
+        "reason": "Check service health"
+      },
+      "plaintext_padded_len": 256,
+      "ciphertext_b64": "4IqIc/pVq9hCvDCxbj8e1sZcP7CrJXjRfrCgtCw4N48y4f5aK2UMhn76box7VZ/Ep5LJdr8VLCe7Gu1mjrQjsN7mMq6mvLefOHOqWuS1NjQ61AuNxj3khDXpw0RVoMXRatWY8sZDRMk3GqeDXMhbLJz20C6rILwl4yuhFLn8w3qSp2w+Hm/1EQ+OwoqwKq2pKD7zAq2BaAMkms1AwI48yB1NwFq4Pgi2cu/nuZBghtPftcEpcLsfcJV/vVIamz9ExTAxDZM9JCKiEgUe7kXUEf4rq9wMorLP+ucm/HStpktYQkHku56tspjrMvG8FjzBKBHn6DMW33N5JX1DYcNOnylvsfPPeMXIb5+tysuNrUg="
+    }
+  ]
+}
