@@ -382,6 +382,38 @@ export function renderPlacements(
   };
 }
 
+/** Apply placements to the actual request path, including its existing query. */
+export function applyPlacements(
+  binding: BindingV2,
+  parts: Record<string, string>,
+  agentPath: string,
+): { headers: Record<string, string>; path: string } {
+  const headers: Record<string, string> = {};
+  let path = agentPath;
+  for (const p of binding.placements) {
+    if (p.in === 'stamp') continue;
+    const token = placeholder(p.template);
+    if (!token) throw new Error('invalid placement template');
+    const value = token.basic
+      ? checkedBasicToken(part(parts, token.ids[0]!), part(parts, token.ids[1]!))
+      : part(parts, token.ids[0]!);
+    if (p.in === 'path') {
+      const placement = legacyPlacement(p, token);
+      const problem = pathBindingProblem(placement, value, path);
+      if (problem) throw new Error(problem);
+      path = pathWithKey(placement, value, path);
+    } else {
+      const rendered = p.template.replace(token.token, () => value);
+      if (p.in === 'header') headers[p.name.toLowerCase()] = rendered;
+      else {
+        const sep = path.includes('?') ? '&' : '?';
+        path += `${sep}${encodeURIComponent(p.name)}=${encodeURIComponent(rendered)}`;
+      }
+    }
+  }
+  return { headers, path };
+}
+
 /** Include URL spellings for every part, not only the ones placed in a query. */
 export function secretFormsAll(binding: PartsBinding, parts: Record<string, string>): string[] {
   const forms: string[] = [];
@@ -428,7 +460,7 @@ export function scrub(text: string, forms: readonly string[]): string {
 
 export function oauth1FromParts(parts: Record<string, string>): OAuth1Value {
   const problem = partsProblem(parts, 'signed_set');
-  if (problem) throw new Error(problem);
+  if (problem) return (() => { throw new Error(problem); })();
   return {
     consumer_key: part(parts, 'consumer_key'),
     consumer_secret: part(parts, 'consumer_secret'),

@@ -56,9 +56,11 @@ import {
 } from './http-broker.js';
 import { verifyOperationDefinition, validateArguments } from './opdef.js';
 import { recordDestination, newDestinationNotice, emitToStderr } from './network-store.js';
-import { runtimeDir } from './paths.js';
+import { runtimeDir, systemRoot } from './paths.js';
 import type { VaultEntry } from './types.js';
-import { bindingFromExecConfig, looksLikePrivateKey, validateAgentHeaders, pathBindingProblem } from './delivery.js';
+import { BEARER, bindingFromExecConfig, looksLikePrivateKey, secretForms, validateAgentHeaders, pathBindingProblem } from './delivery.js';
+import { checkAgentHeaders, oauth1FromParts, readValue, scrub as scrubParts, secretFormsAll, validateBindingV2, type BindingV2, type Shape } from './parts.js';
+import { SetupPins, sealT2Detail, t2MatchMac, newRequestId } from './setup-seal.js';
 import { renderDetail } from './render.js';
 import { SigningState } from './wallet.js';
 import { validateRecipe, recipeSha256, describeRecipe, computeStamp, parseStampedValue, looksLikeOAuth1Value, type Recipe, type StampedValue } from './stamp.js';
@@ -160,8 +162,10 @@ export class BrokerOps {
     signer: BrokerSigner | null = signerFromIdentity(),
     state: SigningState = new SigningState(),
     private readonly depsOverride: Partial<Deps> = {},
+    opts: { pinsPath?: string } = {},
   ) {
-    this.api = new AgentVaultAPI(apiKey, loadEncryptionKey(encKeyB64), vaultUrl, signer);
+    const pins = new SetupPins(opts.pinsPath ?? path.join(systemRoot(), 'setup-pins.json'));
+    this.api = new AgentVaultAPI(apiKey, loadEncryptionKey(encKeyB64), vaultUrl, signer, pins);
     this.state = state;
   }
 
@@ -305,7 +309,32 @@ export class BrokerOps {
     // before the key is decrypted: a binding the server sent that this broker would not
     // have accepted from the owner refuses the call. It is not repaired and it does not
     // fall back to a bearer token — see delivery.ts.
-    const bound = bindingFromExecConfig(coerceCfg(s.exec_config));
+    const hasV2Binding = (s.setup?.binding as { v?: unknown } | undefined)?.v === 2;
+    const partsPath = !!s.setup && (hasV2Binding || s.setup.value_format === 'parts-1');
+    const legacySinglePart = partsPath && !hasV2Binding && s.setup!.shape === 'api_key';
+    let partsBinding: BindingV2 | undefined;
+    if (partsPath && !legacySinglePart) {
+      // validateBindingV2 reads a v1 binding as well (a signed set's {in:'stamp'} included).
+      const checked = validateBindingV2(s.setup!.binding, s.setup!.shape as Shape, 'http');
+      if (!checked.ok) {
+        return err(`Refused: this entry's delivery setting is not one the broker accepts `
+          + `(${checked.field}: ${checked.message}). Nothing was sent. The owner can set how the secret `
+          + `is sent in the dashboard.`, 'BAD_BINDING');
+      }
+      // Only a v2 binding is a placement list; a v1 stamp (a signed set) stays on the stamp path.
+      if (checked.binding.v === 2) partsBinding = checked.binding;
+    }
+
+    // The legacy definition builder needs a single binding. For v2 it only builds the
+    // request image: performOperation receives the real placements separately and owns
+    // all credential placement. A stamp still uses the existing stamp definition.
+    const bound = bindingFromExecConfig(hasV2Binding && partsBinding
+      ? {
+        credential_binding: partsBinding.placements.length === 1 && partsBinding.placements[0].in === 'stamp'
+          ? { in: 'stamp' }
+          : { in: 'header', name: 'Authorization', template: 'Bearer {secret}' },
+      }
+      : coerceCfg(s.exec_config));
     if (!bound.ok) {
       return err(`Refused: this entry's delivery setting is not one the broker accepts `
         + `(${bound.field}: ${bound.reason}). Nothing was sent. The owner can set how the secret `
@@ -344,7 +373,9 @@ export class BrokerOps {
     // would then be reading a reply to a request it did not make.
     let agentHeaders: Record<string, string> = {};
     if (agentReq) {
-      const h = validateAgentHeaders(agentReq.headers, binding);
+      const h = partsBinding
+        ? checkAgentHeaders(agentReq.headers, partsBinding)
+        : validateAgentHeaders(agentReq.headers, binding);
       if (!h.ok) return err(`Refused: ${h.field}: ${h.reason}. Nothing was sent.`, 'BAD_REQUEST');
       agentHeaders = h.headers;
     }
@@ -352,13 +383,28 @@ export class BrokerOps {
     const vaultKey = await this.api.ensureVaultKey();
     const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
     try {
-      const secret = new TextDecoder().decode(bytes);
-      if (looksLikePrivateKey(secret)) {
+      let secret = new TextDecoder().decode(bytes);
+      let parts: Record<string, string> | undefined;
+      if (partsPath) {
+        const value = readValue(secret, s.setup!.value_format, 'http', s.setup!.shape as Shape);
+        if (!value.ok) {
+          return err(`Refused: this key could not be read (${value.reason}). Nothing was sent.`, 'BAD_VALUE');
+        }
+        parts = value.parts;
+        if (operationId && Object.keys(parts).length !== 1) {
+          return err('Refused: signed operations work with single-part keys only. Nothing was sent.', 'BAD_REQUEST');
+        }
+        secret = stampRecipe
+          ? JSON.stringify(oauth1FromParts(parts))
+          : Object.values(parts)[0];
+      }
+      const values = parts ? Object.values(parts) : [secret];
+      if (values.some((value) => looksLikePrivateKey(value))) {
         return err('Refused: this entry holds a private key, which is never sent to a web service. '
           + 'Nothing was sent. If it is an SSH key, the owner can set it to SSH (with the servers '
           + 'it may sign in to) in the dashboard, and then use vault_ssh_exec.', 'WRONG_KIND');
       }
-      if (!stampRecipe && looksLikeOAuth1Value(secret)) {
+      if (!stampRecipe && values.some((value) => looksLikeOAuth1Value(value))) {
         return err('Refused: this entry holds OAuth 1.0a keys (X and others: an API key and secret, an access '
           + 'token and secret), which are never sent as they are: the service would refuse them, and both '
           + 'secrets would go with them. Nothing was sent. The owner can set this entry to "Signed requests" '
@@ -379,7 +425,13 @@ export class BrokerOps {
           return err(`Entry has no operation "${operationId}".`
             + (known.length ? ` Available: ${known.join(', ')}.` : ' It defines none.'));
         }
-        const verified = verifyOperationDefinition(entryId, slot.definition, slot.signature, bytes, operationId);
+        const operationKey = parts ? new TextEncoder().encode(secret) : bytes;
+        let verified: ReturnType<typeof verifyOperationDefinition>;
+        try {
+          verified = verifyOperationDefinition(entryId, slot.definition, slot.signature, operationKey, operationId);
+        } finally {
+          if (operationKey !== bytes) operationKey.fill(0);
+        }
         if (!verified.ok || !verified.definition) return err(`Refused: ${verified.reason}`);
         const argCheck = validateArguments(verified.definition, callArgs);
         if (!argCheck.ok) return err(`Refused: ${argCheck.reason}`);
@@ -394,8 +446,25 @@ export class BrokerOps {
         label = `${def.route.method} ${originString(r.origin)}${r.path || '/'}`;
         // Before anything is recorded or approved: a key that cannot go in the address
         // would otherwise spend a tier-2 approval on a call that was never going to be sent.
-        const problem = pathBindingProblem(binding, secret, def.route.path);
-        if (problem) return err(`Refused: ${problem} Nothing was sent.`, 'BAD_REQUEST');
+        if (!partsBinding) {
+          const problem = pathBindingProblem(binding, secret, def.route.path);
+          if (problem) return err(`Refused: ${problem} Nothing was sent.`, 'BAD_REQUEST');
+        } else {
+          for (const placement of partsBinding.placements) {
+            if (placement.in !== 'path') continue;
+            const match = /\{part:([a-z][a-z0-9_]{0,31})\}/.exec(placement.template);
+            if (!match) continue;
+            const pathBinding = { ...placement, template: placement.template.replace(match[0], '{secret}') };
+            const pathBound = bindingFromExecConfig({ credential_binding: pathBinding });
+            if (!pathBound.ok) {
+              return err(`Refused: this entry's delivery setting is not one the broker accepts `
+                + `(${pathBound.field}: ${pathBound.reason}). Nothing was sent. The owner can set how the secret `
+                + `is sent in the dashboard.`, 'BAD_BINDING');
+            }
+            const problem = pathBindingProblem(pathBound.binding, parts![match[1]], def.route.path);
+            if (problem) return err(`Refused: ${problem} Nothing was sent.`, 'BAD_REQUEST');
+          }
+        }
       }
 
       const bodyHash = agentReq?.body !== undefined
@@ -404,7 +473,16 @@ export class BrokerOps {
       // The address the agent asked for, before the key is added — scrubbed anyway, so a
       // key that somehow reached the path never reaches the log.
       rec.method = def.route.method;
-      rec.address = String(scrubSecret(`${originString(def.origin)}${def.route.path}`, secret));
+      // Every part, longest first: an agent may know a key's non-secret half (an id, a
+      // username) and put it in its own path; nothing the broker shows repeats a part.
+      const shownForms = parts
+        ? (partsBinding ? secretFormsAll(partsBinding, parts)
+          : Object.values(parts).flatMap((value) => secretForms(BEARER, value)))
+        : [];
+      const scrubShown = (text: string): string => parts
+        ? scrubParts(text, shownForms)
+        : String(scrubSecret(text, secret));
+      rec.address = scrubShown(`${originString(def.origin)}${def.route.path}`);
       rec.body_sha256 = bodyHash;
 
       // Recorded here, in the broker, which is the first time this has actually worked.
@@ -414,18 +492,49 @@ export class BrokerOps {
       // no longer owns the evidence; until now the audited party was still the writer.
       const originStr = originString(def.origin);
       const { isNew } = recordDestination(entryId, originStr, undefined, purpose);
+      const known = Array.isArray(s.setup?.known_addresses) ? s.setup.known_addresses : [];
+      const firstSighting = isNew && !known.includes(originStr);
 
       const isTier2 = String(s.access_tier ?? '1') === '2';
       const destination = isTier2
         ? { origin: originStr, method: def.route.method, path: def.route.path, body_sha256: bodyHash }
         : {};
+      let lockedCheck: {
+        entry_id: string; first_sighting: boolean; request_id?: string;
+        detail_ciphertext?: string; detail_nonce?: string; match_mac?: string;
+      } | undefined;
+      if (s.vault_locked === true) {
+        lockedCheck = { entry_id: entryId, first_sighting: firstSighting };
+        if (isTier2) {
+          const requestId = newRequestId();
+          try {
+            const detail = sealT2Detail(vaultKey, s.agent_id ?? '', requestId, {
+              name: s.name ?? '', kind: 'web', origin: originStr,
+              method: def.route.method, path: def.route.path, reason: purpose.slice(0, 200),
+            });
+            if (!detail.ok) {
+              return err('Refused: this approval request could not be sealed. Nothing was sent.', 'BAD_REQUEST');
+            }
+            lockedCheck = {
+              ...lockedCheck, request_id: requestId,
+              detail_ciphertext: detail.ciphertext, detail_nonce: detail.nonce,
+              match_mac: t2MatchMac(vaultKey, {
+                kind: 'web', origin: originStr, method: def.route.method,
+                path: def.route.path, entry_id: entryId,
+              }),
+            };
+          } catch {
+            return err('Refused: this approval request could not be sealed. Nothing was sent.', 'BAD_REQUEST');
+          }
+        }
+      }
 
       // The purpose goes with the destination: tier 2 only, where the owner is approving
       // this one call and needs to read why. Tier 1 sends neither (network-shape decision).
-      const verdict = await this.api.checkOperation({
-        entry_id: entryId, purpose: isTier2 ? purpose.slice(0, 200) : '', first_sighting: isNew,
+      const verdict = await this.api.checkOperation((lockedCheck ?? {
+        entry_id: entryId, purpose: isTier2 ? purpose.slice(0, 200) : '', first_sighting: firstSighting,
         ...destination,
-      });
+      }) as never);
 
       if (!verdict.allowed) {
         rec.approval = 'asked';
@@ -441,10 +550,10 @@ export class BrokerOps {
           return err(`${why}\n\nThe owner sees exactly: ${def.route.method} `
             + `${originString(def.origin)}${def.route.path}`);
         }
-        const second = await this.api.checkOperation({
+        const second = await this.api.checkOperation((lockedCheck ?? {
           entry_id: entryId, purpose: purpose.slice(0, 200), origin: originStr,
           method: def.route.method, path: def.route.path, body_sha256: bodyHash,
-        });
+        }) as never);
         if (!second.allowed) {
           rec.approval = 'not_approved';
           return err(`${second.message ?? 'This call needs owner approval.'}\n\n`
@@ -463,17 +572,17 @@ export class BrokerOps {
       } catch { approvedOrigins = []; }
 
       let noticeForAgent = '';
-      if (isNew) {
+      if (firstSighting) {
         const notice = newDestinationNotice(
-          s.name ?? entryId, originStr, def.route.method, def.route.path, verdict.tier,
+          s.name ?? entryId, originStr, def.route.method, scrubShown(def.route.path), verdict.tier,
           !operationId, verdict.emailed === true,
         );
         emitToStderr(notice);
         noticeForAgent = notice.toolNote;
       }
 
-      // A stamped entry may hold {"id", "secret"}, or OAuth 1.0a's four values; only the
-      // secrets are MAC keys, and only they are scrubbed (ids are sent in the clear by design).
+      // A legacy stamped entry may hold {"id", "secret"}, or OAuth 1.0a's four values;
+      // only the secrets are MAC keys. Parts-format entries also scrub the ids below.
       let stamped: StampedValue | null = null;
       if (stampRecipe) {
         try { stamped = parseStampedValue(secret, stampRecipe); } catch (e) {
@@ -481,13 +590,19 @@ export class BrokerOps {
         }
       }
       rec.outcome = 'sending';
-      const result = await performOperation(
+      let result = await performOperation(
         def, operationId ? callArgs : (typeof agentReq?.body === 'string'
           ? agentReq.body
           : ((agentReq?.body ?? {}) as Record<string, unknown>)),
-        stamped ? stamped.secret : secret, approvedOrigins,
+        stamped ? stamped.secret : (partsBinding ? '' : secret), approvedOrigins,
         stamped ? (img) => computeStamp(stampRecipe!, img, stamped) : undefined,
+        partsBinding && parts && !stamped ? { binding: partsBinding, parts } : undefined,
       );
+      if (parts && stamped) {
+        for (const value of Object.values(parts).sort((a, b) => b.length - a.length)) {
+          result = scrubSecret(result, value) as typeof result;
+        }
+      }
       if (result.status) rec.status = result.status;
       if (!result.ok && /internal or reserved address/.test(result.error ?? '')
           && !isApprovedPrivateOrigin(def.origin, approvedOrigins)) {

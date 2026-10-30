@@ -18,6 +18,8 @@ import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
 import type { OperationDefinition, CredentialBinding } from './opdef.js';
 import { filterResponse } from './opdef.js';
 import { renderCredential, secretForms, pathBindingProblem, pathWithKey } from './delivery.js';
+import { applyPlacements, secretFormsAll, scrub as scrubParts } from './parts.js';
+import type { BindingV2 } from './parts.js';
 import type { RequestImage, StampResult } from './stamp.js';
 import { VERSION } from './version.js';
 
@@ -50,6 +52,18 @@ export function scrubSecret(value: unknown, secret: string): unknown {
       out[k.split(secret).join('[REDACTED]')] = scrubSecret(v, secret);
     }
     return out;
+  }
+  return value;
+}
+
+function scrubAll(value: unknown, forms: readonly string[]): unknown {
+  if (typeof value === 'string') return scrubParts(value, forms);
+  if (Array.isArray(value)) return value.map((v) => scrubAll(v, forms));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .map(([k, v]) => [scrubParts(k, forms), scrubAll(v, forms)]),
+    );
   }
   return value;
 }
@@ -278,16 +292,31 @@ export async function performOperation(
    * It holds the key; this function never sees it except to scrub the reply.
    */
   stamper?: (img: RequestImage) => StampResult,
+  parts?: { binding: BindingV2; parts: Record<string, string> },
 ): Promise<CallResult> {
   const { scheme, host, port } = def.origin;
   if (scheme !== 'https') return { ok: false, error: 'Only https origins are permitted.' };
+  if (parts && (stamper || def.credential_binding.in === 'stamp'
+      || parts.binding.placements.some((p) => p.in === 'stamp'))) {
+    return { ok: false, error: 'Refused: a stamp cannot be combined with parts. Nothing was sent.' };
+  }
+
+  const forms: string[] = [];
+  if (parts) {
+    try {
+      forms.push(...secretFormsAll(parts.binding, parts.parts));
+    } catch {
+      return { ok: false, error: 'Refused: invalid credential parts. Nothing was sent.' };
+    }
+  }
 
   const ownerApproved = isApprovedPrivateOrigin(def.origin, approvedPrivateOrigins);
   let pinned: { address: string; family: number };
   try {
     pinned = await resolvePinned(host, ownerApproved);
   } catch (e) {
-    return { ok: false, error: `Refused: ${e instanceof Error ? e.message : String(e)}` };
+    const error = `Refused: ${e instanceof Error ? e.message : String(e)}`;
+    return { ok: false, error: parts ? scrubParts(error, forms) : error };
   }
 
   const headers: Record<string, string> = { ...(def.static_headers ?? {}) };
@@ -313,8 +342,28 @@ export async function performOperation(
   // The credential goes in last, so nothing in the definition's static headers can
   // shadow it. validateShape already refuses a definition that names both.
   let path = def.route.path;
-  const forms = secretForms(def.credential_binding, secret);
-  if (def.credential_binding.in === 'stamp') {
+  if (!parts) forms.push(...secretForms(def.credential_binding, secret));
+  if (parts) {
+    let placed: ReturnType<typeof applyPlacements>;
+    try {
+      placed = applyPlacements(parts.binding, parts.parts, path);
+    } catch (e) {
+      return {
+        ok: false,
+        error: scrubParts(`Refused: ${e instanceof Error ? e.message : String(e)} Nothing was sent.`, forms),
+      };
+    }
+    for (const [name, value] of Object.entries(placed.headers)) {
+      if (has(name)) {
+        return {
+          ok: false,
+          error: scrubParts(`Refused: the request already sends ${name}, and the key goes there too. Nothing was sent.`, forms),
+        };
+      }
+      headers[name] = value;
+    }
+    path = placed.path;
+  } else if (def.credential_binding.in === 'stamp') {
     if (!stamper) return { ok: false, error: 'Refused: a stamped key needs a stamp. Nothing was sent.' };
     // The image is the request exactly as it will go, BEFORE any placement (spec §F28).
     const q = path.indexOf('?');
@@ -368,6 +417,7 @@ export async function performOperation(
       settled = true;
       // Unknown outcome only: with a status the caller already knows the request arrived.
       if (!r.ok && r.status === undefined && connected && changesSomething) r = { ...r, error: `${r.error}${mayHaveRun}` };
+      if (parts && r.error !== undefined) r = { ...r, error: scrubParts(r.error, forms) };
       resolve(r);
     };
     // A 2xx whose reply is too big to return still happened. Reported as a success with
@@ -445,7 +495,9 @@ export async function performOperation(
       (stream as NodeJS.ReadableStream).on('end', () => {
         if (over) return finish(tooBig(status, ''));
         const ok = status >= 200 && status < 300;
-        const scrub = (v: unknown) => forms.reduce<unknown>((acc, f) => scrubSecret(acc, f), v);
+        const scrub = (v: unknown) => parts
+          ? scrubAll(v, forms)
+          : forms.reduce<unknown>((acc, f) => scrubSecret(acc, f), v);
         // Without this a 4xx came back as a bare ok:false with no explanation at all.
         // The upstream's own message is not repeated, whatever its type: it holds the
         // credential and could put it in the body. No body at all, here — not left to

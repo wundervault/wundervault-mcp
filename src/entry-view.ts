@@ -29,7 +29,7 @@ const modes = {
 
 const responseFields = [
   'encrypted_content', 'content_nonce', 'access_tier', 'alert_email', 'directive',
-  'directive_signature', 'id', 'agent_id', 'rev',
+  'directive_signature', 'id', 'agent_id', 'rev', 'vault_locked',
 ] as const;
 
 function refused(reason: string): EntryResult<never> {
@@ -111,8 +111,16 @@ export async function resolveEntry<T extends EntryResponse>(
     view.entry_mode = modes[setup.delivery];
 
     const config: Record<string, unknown> = { delivery: setup.delivery };
+    // Today's binding check refuses unknown fields, and the vault page marks a v1 binding
+    // {v:1}; the marker is the setup's business, not the legacy exec_config's.
+    let binding: unknown = setup.binding;
+    if (binding && typeof binding === 'object' && !Array.isArray(binding)
+        && (binding as { v?: unknown }).v === 1) {
+      const { v: _v, ...rest } = binding as Record<string, unknown>;
+      binding = rest;
+    }
     for (const [field, value] of [
-      ['credential_binding', setup.binding],
+      ['credential_binding', binding],
       ['ssh_hosts', setup.ssh_hosts],
       ['chain', setup.chain],
     ] as const) {
