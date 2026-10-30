@@ -1,0 +1,4 @@
+#!/usr/bin/env node
+'use strict';
+
+require('./_handover.js').run('index', 'wundervault-mcp');

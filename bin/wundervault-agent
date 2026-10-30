@@ -1,0 +1,4 @@
+#!/usr/bin/env node
+'use strict';
+
+require('./_handover.js').run('agent', 'wundervault-agent');

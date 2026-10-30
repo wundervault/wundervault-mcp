@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for an owner-approved Wundervault update
+
+[Timer]
+OnBootSec=60
+OnUnitInactiveSec=60
+AccuracySec=5s
+Unit=wundervault-update.service
+
+[Install]
+WantedBy=timers.target

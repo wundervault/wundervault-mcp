@@ -309,6 +309,14 @@ if [ "$MODE" = uninstall ]; then
     exit 1
   fi
   rm -f "$PLIST_PATH"
+  # The install root, the updater's job and the request spool (Update now). Only what the
+  # layout's own manifest says it made; launchers it moved aside are put back.
+  if [ -f /opt/wundervault/state/manifest.json ]; then
+    /bin/sh "$HERE/layout-posix.sh" uninstall --platform darwin || {
+      echo "ERROR: removing /opt/wundervault failed; the broker is already stopped and its job removed." >&2
+      exit 1
+    }
+  fi
   # The account and its state are LEFT BEHIND on purpose. They hold the credentials this
   # machine's agents use; deleting them here would turn "stop the service" into
   # "irreversibly destroy the vault contents" for anyone who typed --uninstall to debug a
@@ -347,14 +355,26 @@ real_path() {
 # test/installer-pick.test.ts runs this function on its own; it sets EXEC and reads nothing
 # else but real_path above.
 pick_broker() {
+  NPM_BIN_DIR=""
   _self_pkg=$(CDPATH= cd -- "$1/.." 2>/dev/null && pwd -P) || _self_pkg=""
   _own=""
   if [ -n "$_self_pkg" ] && [ -f "$_self_pkg/dist/agent.js" ]; then
     # npm's global layout: <prefix>/lib/node_modules/@wundervault/mcp-server, launchers in <prefix>/bin.
     _bin=$(CDPATH= cd -- "$_self_pkg/../../../../bin" 2>/dev/null && pwd -P) || _bin=""
-    if [ -n "$_bin" ] && [ -x "$_bin/wundervault-agent" ] \
-       && [ "$(real_path "$_bin/wundervault-agent")" = "$(real_path "$_self_pkg/dist/agent.js")" ]; then
-      _own="$_bin/wundervault-agent"
+    if [ -n "$_bin" ] && [ -x "$_bin/wundervault-agent" ]; then
+      # npm's launcher can point at three things: dist/agent.js (before Update now), this
+      # package's bin/ stub (this version on), or — once this installer has run — the install
+      # root's wrapper, which replaced it. In the last case the copy to install is this
+      # package's own stub, not the wrapper (which would make /opt/wundervault "the package").
+      _target=$(real_path "$_bin/wundervault-agent")
+      if [ "$_target" = "$(real_path "$_self_pkg/dist/agent.js")" ] \
+         || { [ -f "$_self_pkg/bin/wundervault-agent" ] && [ "$_target" = "$(real_path "$_self_pkg/bin/wundervault-agent")" ]; }; then
+        _own="$_bin/wundervault-agent"
+        NPM_BIN_DIR="$_bin"
+      elif [ "$_target" = /opt/wundervault/bin/wundervault-agent ] && [ -x "$_self_pkg/bin/wundervault-agent" ]; then
+        _own="$_self_pkg/bin/wundervault-agent"
+        NPM_BIN_DIR="$_bin"
+      fi
     fi
   fi
   _first=$( PATH=$USER_PATH; command -v wundervault-agent 2>/dev/null || true )
@@ -802,6 +822,32 @@ else
   echo "           FileVault appears to be OFF. Turn it on: a stolen disk opens this store."
 fi
 
+
+# ── 2b. the install root (Update now) ────────────────────────────────────────
+# From this version on the broker runs from /opt/wundervault: a root-owned copy per version and a
+# `current` link, so the root updater can install a signed new version without this script, npm
+# or sudo (SPEC-update-now U1/U2). This copies the package checked above into it, points
+# `current` at it, installs the updater's job and the request spool, and swaps the npm launchers
+# for links to the install root's wrappers. It downloads nothing. The job below then names the
+# install root's paths, so everything after this point is unchanged.
+PKG_VERSION=$("$REAL_NODE" -p 'require(process.argv[1]).version' "$PKG_DIR/package.json")
+# The launchers agents start by bare name live in npm's bin folder (found by pick_broker), which
+# is not the folder of EXEC when EXEC is this package's own stub.
+LAUNCH_DIR=${NPM_BIN_DIR:-$(dirname -- "$EXEC")}
+LAYOUT_OUT=$(/bin/sh "$HERE/layout-posix.sh" install --platform darwin --account "$ACCOUNT" \
+  --node "$REAL_NODE" --pkg "$PKG_DIR" --version "$PKG_VERSION" \
+  --launchers "$LAUNCH_DIR/wundervault-mcp $LAUNCH_DIR/wundervault-agent") || {
+  echo "ERROR: setting up /opt/wundervault failed (above). Nothing about the running broker was changed." >&2
+  exit 1
+}
+printf '%s\n' "$LAYOUT_OUT"
+EXPECTED_LAYOUT="SERVICE_NODE=/opt/wundervault/current/node EXEC=/opt/wundervault/current/app/bin/wundervault-agent"
+[ "$(printf '%s\n' "$LAYOUT_OUT" | tail -n 1)" = "$EXPECTED_LAYOUT" ] || {
+  echo "ERROR: the install root did not report the expected paths. Refusing to continue." >&2
+  exit 1
+}
+NODE=/opt/wundervault/current/node
+EXEC=/opt/wundervault/current/app/bin/wundervault-agent
 
 # ── 3. the job ───────────────────────────────────────────────────────────────
 # The template is shipped alongside this script and read from disk rather than written

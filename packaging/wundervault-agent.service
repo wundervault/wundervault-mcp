@@ -57,6 +57,10 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ReadWritePaths=/var/lib/wundervault
+# Update now: the broker leaves its one-line request here for the root updater. Only this file —
+# its folder stays read-only, so the broker can't create, rename or replace anything in it. The '-'
+# lets a machine without the spool (an install older than Update now) still start.
+ReadWritePaths=-/var/lib/wundervault-update/request.json
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

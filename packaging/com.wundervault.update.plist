@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wundervault.update</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/wundervault/current/node</string>
+        <string>/opt/wundervault/current/app/dist/updater.js</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/var/log/wundervault-update.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/wundervault-update.log</string>
+</dict>
+</plist>

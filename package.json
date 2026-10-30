@@ -5,6 +5,7 @@
   "description": "AI agents use your API keys, SSH keys and wallets through a local broker, never holding them",
   "files": [
     "dist",
+    "bin",
     "README.md",
     "README-AGENTS.md",
     "CHANGELOG.md",
@@ -38,8 +39,8 @@
     "node": "^22.23.4 || ^24.22.1 || ^26.12.1 || >=27"
   },
   "bin": {
-    "wundervault-mcp": "dist/index.js",
-    "wundervault-agent": "dist/agent.js"
+    "wundervault-mcp": "bin/wundervault-mcp",
+    "wundervault-agent": "bin/wundervault-agent"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

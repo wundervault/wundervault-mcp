@@ -1,0 +1,15 @@
+# Root on purpose: this writes root-owned code. Everything it does is specified in U4.
+[Unit]
+Description=Wundervault signed release updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/wundervault/current/node /opt/wundervault/current/app/dist/updater.js
+TimeoutStartSec=15min
+Environment=
+UMask=0022
+NoNewPrivileges=yes
+PrivateTmp=yes

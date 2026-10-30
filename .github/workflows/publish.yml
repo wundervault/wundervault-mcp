@@ -42,6 +42,9 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      # Empty or test keys cannot ship: the updater needs an installed owner key.
+      - run: node scripts/check-release-keys.mjs
+      - run: node scripts/pack-app.mjs --out release-assets
 
       # --provenance is redundant on paper (trusted publishing attests by default) but
       # is reported to be needed in practice often enough that asking twice is cheaper
@@ -52,3 +55,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --target main --generate-notes
+
+      # The owner rebuilds and compares these bytes before approving a release record.
+      # CI publishes the archive, never the owner's release signature.
+      - name: Upload updater app assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" release-assets/wundervault-app-*.tar.gz release-assets/app-files.json

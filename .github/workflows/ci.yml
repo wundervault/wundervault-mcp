@@ -28,6 +28,13 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - name: Release keys and reproducible app archive
+        run: |
+          node scripts/check-release-keys.mjs --allow-empty
+          node scripts/pack-app.mjs --out pack-first
+          node scripts/pack-app.mjs --out pack-second
+          cmp pack-first/wundervault-app-*.tar.gz pack-second/wundervault-app-*.tar.gz
+          cmp pack-first/app-files.json pack-second/app-files.json
 
   # The repo mirrors the installer so a customer can diff it against the served copy.
   # installer/README.md tells them to refuse BOTH files if the two differ, so a stale
