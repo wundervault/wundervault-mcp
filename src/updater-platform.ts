@@ -391,7 +391,12 @@ export function defaultDeps(): UpdaterDeps {
       const entry = record.node[platform];
       if (!entry) throw new Error('platform');
       if (windows) {
-        fs.copyFileSync(path.join(temp, 'node.exe'), path.join(dir, 'node.exe'), fs.constants.COPYFILE_EXCL);
+        const exe = path.join(dir, 'node.exe');
+        fs.copyFileSync(path.join(temp, 'node.exe'), exe, fs.constants.COPYFILE_EXCL);
+        // On disk before active.cmd can name it: a power cut must not leave the descriptor pointing
+        // at an executable whose bytes were still in the cache (review round 3, A-F1).
+        const fd = fs.openSync(exe, 'r+');
+        try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
       } else {
         const member = 'member' in entry ? entry.member : undefined;
         if (!member) throw new Error('node member');

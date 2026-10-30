@@ -205,7 +205,9 @@ test('uninstall waits for the shared lock before removing anything', {
 
 test('POSIX stale-lock recovery uses a serialized inode-and-content comparison', () => {
   const source = fs.readFileSync(layout, 'utf8');
-  assert.match(source, /fs\.linkSync\(temp, breaker\)/);
+  // Round 3 (B-F1): the break-lock is a fresh file, so its age is its own, not the waiter's temp's.
+  assert.match(source, /fs\.linkSync\(fresh, breaker\)/);
+  assert.doesNotMatch(source, /fs\.linkSync\(temp, breaker\)/);
   assert.match(source, /same\(inspected\.st, current\.st\)/);
   assert.match(source, /inspected\.data\.equals\(current\.data\)/);
   assert.match(source, /same\(ours, stat\(breaker\)\)/);

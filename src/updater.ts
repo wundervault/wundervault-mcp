@@ -433,10 +433,12 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
       }
     }
     if (ok) appendHistory(stateDir, [from]);
-    journal('committed', from, from, order);
     atomicJson(path.join(stateDir, 'failed.json'), [order.version]);
-    prune(d, from);
+    // The terminal status (and its remembered id) BEFORE the journal is committed: a crash between
+    // the two then re-runs only the idempotent recovery, never the order (review round 3, A-F2).
     status(order, ok ? 'rolled back' : 'rollback failed', 'new version not healthy');
+    journal('committed', from, from, order);
+    prune(d, from);
   };
 
   try {
@@ -463,9 +465,12 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
           d.writeDescriptor(pending.from);
           syncDirectory(d.root);
         }
-        journal('committed', pending.from, pending.from, order);
         removeTree(path.join(versionsDir, `${order.version}.staging`));
+        // Renamed into place but never switched to: above the high-water mark, so never a version
+        // that ran — remove it rather than leave an untracked tree (review round 3, A-F3).
+        if (d.readDescriptor() !== order.version) removeTree(path.join(versionsDir, order.version));
         status(order, 'failed', 'interrupted');
+        journal('committed', pending.from, pending.from, order);
       }
     }
 

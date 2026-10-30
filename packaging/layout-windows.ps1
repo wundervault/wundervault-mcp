@@ -153,12 +153,25 @@ function Assert-Version {
 }
 
 $ResumeUpdater = $false
+# One layout run at a time on this machine, installs and uninstalls alike (review round 3, B blind
+# spot): a named system-wide mutex, released in the finally below. An abandoned one (a run that
+# died) is granted to us with AbandonedMutexException, which counts as acquired.
+$LayoutMutex = New-Object System.Threading.Mutex($false, 'Global\WundervaultLayout')
+$HoldsMutex = $false
 try {
+    try { $HoldsMutex = $LayoutMutex.WaitOne([TimeSpan]::FromSeconds(120)) }
+    catch [System.Threading.AbandonedMutexException] { $HoldsMutex = $true }
+    if (-not $HoldsMutex) { throw 'Another Wundervault install or uninstall is still running after 120 seconds.' }
     # Disabling prevents a new tick; let an in-flight update finish rather than killing its switch.
     $Task = Get-ScheduledTask -TaskName 'wundervault-update' -ErrorAction SilentlyContinue
     if ($null -ne $Task) {
-        $ResumeUpdater = $Action -eq 'install'
+        # Resumed whatever happens (install, or an uninstall that failed); a successful uninstall
+        # has removed the task, so there is nothing left to resume (review round 3, B-F3).
+        $ResumeUpdater = $true
         Disable-ScheduledTask -TaskName 'wundervault-update' | Out-Null
+        # The state read BEFORE disabling can be stale: a tick may have started in between, and
+        # disabling does not stop a running instance (review round 3, B-F2).
+        $Task = Get-ScheduledTask -TaskName 'wundervault-update' -ErrorAction SilentlyContinue
         $Wait = [System.Diagnostics.Stopwatch]::StartNew()
         while ($null -ne $Task -and $Task.State -eq 'Running') {
             if ($Wait.Elapsed.TotalSeconds -ge 120) {
@@ -320,7 +333,8 @@ if ($Action -eq 'uninstall') {
     if ($RemoveData) {
         Write-Output 'layout: -RemoveData is handled by the caller; broker data was not touched here'
     }
-    exit 0
+    # return, not exit: the finally below must release the mutex (and resume the updater if needed).
+    return
 }
 
 Assert-Version $Version
@@ -610,4 +624,6 @@ Write-Output ('BROKER_CMD=' + (Join-Path $Root 'bin\broker.cmd'))
             Enable-ScheduledTask -TaskName 'wundervault-update' | Out-Null
         }
     }
+    if ($HoldsMutex) { $LayoutMutex.ReleaseMutex() }
+    $LayoutMutex.Dispose()
 }

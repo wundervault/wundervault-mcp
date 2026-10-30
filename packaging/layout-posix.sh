@@ -148,7 +148,7 @@ if [ -e "$ROOT" ] || [ -L "$ROOT" ]; then
         done
         safe_dir "$ROOT/state"
         EXTRA=$(/usr/bin/find "$ROOT/state" -mindepth 1 -maxdepth 1 \
-            ! \( -type f \( -name lock -o -name lock.break -o -name 'lock.tmp.*' \) \) -print)
+            ! \( -type f \( -name lock -o -name lock.break -o -name 'lock.tmp.*' -o -name 'lock.break.tmp.*' \) \) -print)
         [ -z "$EXTRA" ] || die "won't adopt a folder it didn't make: $ROOT"
         EXTRA=$(/usr/bin/find "$ROOT" -mindepth 1 -maxdepth 1 \
             ! -name versions ! -name bin ! -name state -print)
@@ -447,11 +447,15 @@ if (match) {
   stale = now - inspected.st.mtimeMs > 20 * 60 * 1000;
 }
 if (!stale) process.exit(0);
-const ours = fs.lstatSync(temp);
+// The break-lock is a FRESH file, never the waiter's lock temp: that one may be minutes old, and a
+// hard link carries its mtime, so others would judge a live breaker abandoned (review round 3, B-F1).
+const fresh = name + '.break.tmp.' + process.pid + '.' + Date.now();
+fs.writeFileSync(fresh, String(process.pid) + ' ' + String(Date.now()), { flag: 'wx', mode: 0o600 });
+const ours = fs.lstatSync(fresh);
 let held = false;
 for (let attempt = 0; attempt < 2; attempt++) {
   try {
-    fs.linkSync(temp, breaker);
+    fs.linkSync(fresh, breaker);
     held = true;
     break;
   } catch (e) {
@@ -478,6 +482,7 @@ if (held) {
     if (same(ours, stat(breaker))) fs.unlinkSync(breaker);
   }
 }
+fs.unlinkSync(fresh);
 JS
         # Retry publication immediately after a break; otherwise wait without busy-spinning.
         if /bin/ln "$LOCK_TEMP" "$ROOT/state/lock" 2>/dev/null; then

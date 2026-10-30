@@ -497,6 +497,8 @@ describe('updater flow', () => {
     expect(f.status()).toMatchObject({ state: 'failed', detail: 'interrupted' });
     expect(json(path.join(f.state, 'journal.json'))).toMatchObject({ phase: 'committed', to: OLD });
     expect(f.calls.fetch).toEqual([]);
+    // Round 3 (A-F3): a version renamed into place but never switched to is not left behind.
+    expect(fs.existsSync(path.join(f.versions, NEW))).toBe(false);
   });
 
   it('resumes switched by restarting and committing a healthy broker', async () => {
