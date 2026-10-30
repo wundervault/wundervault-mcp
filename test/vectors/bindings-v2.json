@@ -1,0 +1,675 @@
+[
+  {
+    "name": "v1 bearer",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"header","name":"Authorization","template":"Bearer {secret}"},
+    "ok": true
+  },
+  {
+    "name": "v1 explicit version",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":1,"in":"header","name":"X-Api-Key","template":"{secret}"},
+    "ok": true
+  },
+  {
+    "name": "v1 query",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"query","name":"api_key.v1","template":"{secret}"},
+    "ok": true
+  },
+  {
+    "name": "v1 Telegram path",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"path","template":"/bot{secret}"},
+    "ok": true
+  },
+  {
+    "name": "v1 basic retains username",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"header","name":"authorization","template":"Basic {basic}","username":"account"},
+    "ok": true
+  },
+  {
+    "name": "v1 signed stamp",
+    "shape": "signed_set",
+    "delivery": "http",
+    "binding": {"in":"stamp"},
+    "ok": true
+  },
+  {
+    "name": "v1 null is not a binding object",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": null,
+    "ok": false,
+    "field": "binding"
+  },
+  {
+    "name": "v1 array is not a binding object",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": [],
+    "ok": false,
+    "field": "binding"
+  },
+  {
+    "name": "v1 unknown field",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"header","name":"x","template":"{secret}","extra":true},
+    "ok": false,
+    "field": "binding"
+  },
+  {
+    "name": "v1 unknown location",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"body","name":"x","template":"{secret}"},
+    "ok": false,
+    "field": "binding.in"
+  },
+  {
+    "name": "v1 header newline",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"header","name":"x-api-key\n","template":"{secret}"},
+    "ok": false,
+    "field": "binding.name"
+  },
+  {
+    "name": "v1 forbidden host",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"header","name":"HOST","template":"{secret}"},
+    "ok": false,
+    "field": "binding.name"
+  },
+  {
+    "name": "v1 query name rejects slash",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"query","name":"api/key","template":"{secret}"},
+    "ok": false,
+    "field": "binding.name"
+  },
+  {
+    "name": "v1 template needs a placeholder",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"header","name":"x","template":"constant"},
+    "ok": false,
+    "field": "binding.template"
+  },
+  {
+    "name": "v1 two placeholders",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"header","name":"x","template":"{secret}{secret}"},
+    "ok": false,
+    "field": "binding.template"
+  },
+  {
+    "name": "v1 basic is header only",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"query","name":"auth","template":"{basic}","username":"user"},
+    "ok": false,
+    "field": "binding.template"
+  },
+  {
+    "name": "v1 basic requires username",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"header","name":"authorization","template":"Basic {basic}"},
+    "ok": false,
+    "field": "binding.username"
+  },
+  {
+    "name": "v1 username rejects colon",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"header","name":"authorization","template":"Basic {basic}","username":"user:other"},
+    "ok": false,
+    "field": "binding.username"
+  },
+  {
+    "name": "v1 username requires basic",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"header","name":"x","template":"{secret}","username":"user"},
+    "ok": false,
+    "field": "binding.username"
+  },
+  {
+    "name": "v1 path rejects name",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"path","name":"key","template":"/{secret}"},
+    "ok": false,
+    "field": "binding.name"
+  },
+  {
+    "name": "v1 path requires slash",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"path","template":"bot{secret}"},
+    "ok": false,
+    "field": "binding.template"
+  },
+  {
+    "name": "v1 path rejects dot segment",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"path","template":"/../{secret}"},
+    "ok": false,
+    "field": "binding.template"
+  },
+  {
+    "name": "v1 path rejects percent encoding",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"path","template":"/%2e%2e/{secret}"},
+    "ok": false,
+    "field": "binding.template"
+  },
+  {
+    "name": "v1 path rejects query",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"path","template":"/{secret}?x=1"},
+    "ok": false,
+    "field": "binding.template"
+  },
+  {
+    "name": "v1 API key cannot stamp",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"in":"stamp"},
+    "ok": false,
+    "field": "binding.in"
+  },
+  {
+    "name": "v1 signed set requires stamp",
+    "shape": "signed_set",
+    "delivery": "http",
+    "binding": {"in":"header","name":"x","template":"{secret}"},
+    "ok": false,
+    "field": "binding.in"
+  },
+  {
+    "name": "v1 key ID requires named parts",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"in":"header","name":"x","template":"{secret}"},
+    "ok": false,
+    "field": "binding"
+  },
+  {
+    "name": "v1 stamp rejects name",
+    "shape": "signed_set",
+    "delivery": "http",
+    "binding": {"in":"stamp","name":"oauth1"},
+    "ok": false,
+    "field": "binding.name"
+  },
+  {
+    "name": "v2 API key header",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"X-Api-Key","template":"{part:key}"}]},
+    "ok": true
+  },
+  {
+    "name": "v2 key ID two headers",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"APCA-API-KEY-ID","template":"{part:id}"},{"in":"header","name":"APCA-API-SECRET-KEY","template":"{part:secret}"}]},
+    "ok": true
+  },
+  {
+    "name": "v2 Twilio style basic",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"Authorization","template":"Basic {basic:id:secret}"}]},
+    "ok": true
+  },
+  {
+    "name": "v2 key ID may place only one part",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"query","name":"key","template":"{part:secret}"}]},
+    "ok": true
+  },
+  {
+    "name": "v2 Telegram path",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"path","name":"","template":"/bot{part:key}"}]},
+    "ok": true
+  },
+  {
+    "name": "v2 Slack webhook path",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"path","name":"","template":"/services/{part:key}"}]},
+    "ok": true
+  },
+  {
+    "name": "v2 password basic",
+    "shape": "password",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"authorization","template":"Basic {basic:username:password}"}]},
+    "ok": true
+  },
+  {
+    "name": "v2 signed set stamp alone",
+    "shape": "signed_set",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"stamp","name":"","template":""}]},
+    "ok": true
+  },
+  {
+    "name": "unknown shape",
+    "shape": "unknown",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:key}"}]},
+    "ok": false,
+    "field": "shape"
+  },
+  {
+    "name": "shape delivery mismatch",
+    "shape": "api_key",
+    "delivery": "ssh",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:key}"}]},
+    "ok": false,
+    "field": "delivery"
+  },
+  {
+    "name": "unknown delivery",
+    "shape": "api_key",
+    "delivery": "smtp",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:key}"}]},
+    "ok": false,
+    "field": "delivery"
+  },
+  {
+    "name": "website login cannot have binding",
+    "shape": "website_login",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:password}"}]},
+    "ok": false,
+    "field": "binding"
+  },
+  {
+    "name": "SSH key cannot have binding",
+    "shape": "ssh_key",
+    "delivery": "ssh",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:private_key}"}]},
+    "ok": false,
+    "field": "binding"
+  },
+  {
+    "name": "wallet cannot have binding",
+    "shape": "wallet",
+    "delivery": "wallet",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:private_key}"}]},
+    "ok": false,
+    "field": "binding"
+  },
+  {
+    "name": "signing key cannot have binding",
+    "shape": "signing_key",
+    "delivery": "sign",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:private_key}"}]},
+    "ok": false,
+    "field": "binding"
+  },
+  {
+    "name": "unknown binding version",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":3,"placements":[{"in":"header","name":"x","template":"{part:key}"}]},
+    "ok": false,
+    "field": "binding.v"
+  },
+  {
+    "name": "v2 unknown outer field",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"extra":true,"placements":[{"in":"header","name":"x","template":"{part:key}"}]},
+    "ok": false,
+    "field": "binding"
+  },
+  {
+    "name": "v2 no placements",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[]},
+    "ok": false,
+    "field": "binding.placements"
+  },
+  {
+    "name": "v2 placements must be list",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":{}},
+    "ok": false,
+    "field": "binding.placements"
+  },
+  {
+    "name": "v2 fifth placement",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"a","template":"{part:id}"},{"in":"header","name":"b","template":"{part:secret}"},{"in":"header","name":"c","template":"{part:id}"},{"in":"header","name":"d","template":"{part:secret}"},{"in":"header","name":"e","template":"{part:id}"}]},
+    "ok": false,
+    "field": "binding.placements"
+  },
+  {
+    "name": "v2 placement must be object",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[null]},
+    "ok": false,
+    "field": "binding.placements.0"
+  },
+  {
+    "name": "v2 placement unknown field",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:key}","username":"u"}]},
+    "ok": false,
+    "field": "binding.placements.0"
+  },
+  {
+    "name": "v2 placement unknown location",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"body","name":"x","template":"{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.in"
+  },
+  {
+    "name": "v2 missing part",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 part placed twice",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:id}"},{"in":"query","name":"y","template":"{part:id}"}]},
+    "ok": false,
+    "field": "binding.placements.1.template"
+  },
+  {
+    "name": "v2 duplicate header case insensitive",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"X-Key","template":"{part:id}"},{"in":"header","name":"x-KEY","template":"{part:secret}"}]},
+    "ok": false,
+    "field": "binding.placements.1.name"
+  },
+  {
+    "name": "v2 duplicate query case insensitive",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"query","name":"Key","template":"{part:id}"},{"in":"query","name":"KEY","template":"{part:secret}"}]},
+    "ok": false,
+    "field": "binding.placements.1.name"
+  },
+  {
+    "name": "v2 same name in different locations is allowed",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"key","template":"{part:id}"},{"in":"query","name":"key","template":"{part:secret}"}]},
+    "ok": true
+  },
+  {
+    "name": "v2 forbidden cookie header",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"Cookie","template":"{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.name"
+  },
+  {
+    "name": "v2 header newline",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x-key\n","template":"{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.name"
+  },
+  {
+    "name": "v2 header invalid space",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x key","template":"{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.name"
+  },
+  {
+    "name": "v2 query invalid punctuation",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"query","name":"key!","template":"{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.name"
+  },
+  {
+    "name": "v2 missing header name",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","template":"{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.name"
+  },
+  {
+    "name": "v2 template newline",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:key}\n"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 template too long",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 empty template",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":""}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 rejects legacy secret placeholder",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{secret}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 rejects legacy basic in query",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"query","name":"auth","template":"{basic}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 named basic is header only",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"query","name":"auth","template":"{basic:id:secret}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 exactly one placeholder",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:id}:{part:secret}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 rejects extra braces",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{{part:key}}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 part ids must be lowercase",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:KEY}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 basic cannot place a part twice internally",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"authorization","template":"Basic {basic:id:id}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 password cannot use a single part",
+    "shape": "password",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:password}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 password cannot reverse basic parts",
+    "shape": "password",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"authorization","template":"Basic {basic:password:username}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 path requires slash",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"path","name":"","template":"bot{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 path rejects dot segment",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"path","name":"","template":"/./{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 path rejects double dot segment",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"path","name":"","template":"/a/../{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 path rejects encoded dot segment",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"path","name":"","template":"/%2E./{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 path rejects fragment",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"path","name":"","template":"/{part:key}#fragment"}]},
+    "ok": false,
+    "field": "binding.placements.0.template"
+  },
+  {
+    "name": "v2 path rejects name",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"path","name":"key","template":"/{part:key}"}]},
+    "ok": false,
+    "field": "binding.placements.0.name"
+  },
+  {
+    "name": "v2 at most one path",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"path","name":"","template":"/{part:id}"},{"in":"path","name":"","template":"/{part:secret}"}]},
+    "ok": false,
+    "field": "binding.placements.1.in"
+  },
+  {
+    "name": "v2 stamp rejects name",
+    "shape": "signed_set",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"stamp","name":"oauth1","template":""}]},
+    "ok": false,
+    "field": "binding.placements.0"
+  },
+  {
+    "name": "v2 stamp requires explicit empty fields",
+    "shape": "signed_set",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"stamp"}]},
+    "ok": false,
+    "field": "binding.placements.0"
+  },
+  {
+    "name": "v2 stamp rejects template",
+    "shape": "signed_set",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"stamp","name":"","template":"oauth1"}]},
+    "ok": false,
+    "field": "binding.placements.0"
+  },
+  {
+    "name": "v2 stamp must be alone",
+    "shape": "signed_set",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"stamp","name":"","template":""},{"in":"header","name":"x","template":"{part:token}"}]},
+    "ok": false,
+    "field": "binding.placements.0.in"
+  },
+  {
+    "name": "v2 stamp requires signed set",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"stamp","name":"","template":""}]},
+    "ok": false,
+    "field": "binding.placements.0.in"
+  },
+  {
+    "name": "v2 signed set refuses placements",
+    "shape": "signed_set",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"header","name":"x","template":"{part:token}"}]},
+    "ok": false,
+    "field": "binding.placements.0.in"
+  }
+]

@@ -55,8 +55,13 @@ the MCP worktree `~/wv-build/mcp-brand` at 7a63849.
     by the server for format and uniqueness (same pattern as U's order ids).
 11. **List without spending.** `GET /agent/vault/secrets` returns `setup_ciphertext`/`setup_nonce`/`rev`
     per entry, no value, no approval spent, no email.
-12. **Sizes are UTF-8 bytes.** Padding buckets 256 B · 1 KiB · 4 KiB · 16 KiB · 64 KiB · 128 KiB;
-    larger is refused before sealing (signature details may be 72 KiB, `agent.py` 498–500).
+12. **Sizes are UTF-8 bytes.** Padding buckets 256 B · 1 KiB · 4 KiB · 16 KiB · 64 KiB · 128 KiB ·
+    256 KiB · 512 KiB; larger is refused before sealing (signature details may be 72 KiB, `agent.py`
+    498–500; signed operations may be 256 KiB, `dashboard.py` 1543–1544, kept as a map of op id →
+    {definition, signature} with `definition.op` equal to its key, ≤ 50 ops).
+17. **Server logs name nothing.** Log lines that carry a key's name, op ids, header names, hosts
+    or origins (e.g. `dashboard.py` 1617 `ops=sorted(ops.keys())`) log ids and counts instead; a
+    test greps every `log.*(` call site in the routes L touches.
 13. **History.** Each owner-copy value version seals its own `value_format` + part ids; restoring a
     version is refused if the current setup places a part that version lacks (message says which).
 14. **Redaction:** the broker scrubs, longest first, every form of every part plus the composed basic

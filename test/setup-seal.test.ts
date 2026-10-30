@@ -51,7 +51,7 @@ function referenceSeal(
   key: Buffer, info: string, aad: string, value: unknown, nonce: Buffer,
 ): { ciphertext: string; plaintextLength: number } {
   const json = Buffer.from(JSON.stringify(value), 'utf8');
-  const sizes = [256, 1024, 4096, 16384, 65536, 131072];
+  const sizes = [256, 1024, 4096, 16384, 65536, 131072, 262144, 524288];
   const size = sizes.find(candidate => candidate >= json.length);
   if (size === undefined) throw new Error('Reference plaintext too large');
   const plaintext = Buffer.concat([json, Buffer.alloc(size - json.length, 32)]);
@@ -164,7 +164,7 @@ describe('setup envelopes', () => {
   });
 
   it('uses byte lengths, pads with spaces, and refuses values above the last bucket', () => {
-    for (const size of [256, 1024, 4096, 16384, 65536, 131072]) {
+    for (const size of [256, 1024, 4096, 16384, 65536, 131072, 262144, 524288]) {
       expect(pad('x'.repeat(size)).length).toBe(size);
     }
     expect(pad('x'.repeat(257)).length).toBe(1024);
@@ -172,8 +172,9 @@ describe('setup envelopes', () => {
     expect(pad('é'.repeat(129)).length).toBe(1024);
     expect(pad('😀'.repeat(64)).length).toBe(256);
     expect(pad('{}').subarray(2).every(byte => byte === 0x20)).toBe(true);
-    expect(() => pad('x'.repeat(131073))).toThrow();
-    expect(() => pad('é'.repeat(65537))).toThrow();
+    expect(pad('x'.repeat(131073)).length).toBe(262144);
+    expect(() => pad('x'.repeat(524289))).toThrow();
+    expect(() => pad('é'.repeat(262145))).toThrow();
   });
 
   it('makes different setups within one bucket the same ciphertext length', () => {
@@ -255,7 +256,7 @@ describe('setup envelopes', () => {
     expect(sealSetup(key, first.agent_id, first.entry_id, first.rev, first.setup, Buffer.alloc(11)))
       .toEqual({ ok: false, reason: 'bad seal' });
     expect(sealSetup(key, first.agent_id, first.entry_id, first.rev, {
-      ...first.setup, name: 'é'.repeat(65537),
+      ...first.setup, name: 'é'.repeat(262145),
     })).toEqual({ ok: false, reason: 'malformed' });
   });
 

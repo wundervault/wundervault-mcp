@@ -5,8 +5,8 @@ import {
 import { open, readFile, rename, unlink } from 'node:fs/promises';
 
 const zeroSalt = Buffer.alloc(32);
-const buckets = [256, 1024, 4096, 16384, 65536, 131072];
-const maxSealedBytes = 131072 + 16;
+const buckets = [256, 1024, 4096, 16384, 65536, 131072, 262144, 524288];
+const maxSealedBytes = 524288 + 16;
 const setupKeys = new Set([
   'v', 'rev', 'value_sha256', 'value_format', 'name', 'shape', 'service', 'delivery',
   'binding', 'ssh_hosts', 'private_origins', 'known_addresses', 'approval', 'operations', 'chain',
@@ -58,7 +58,7 @@ export function hkdfKey(ikm: Uint8Array, salt: Uint8Array, info: string): Buffer
 export function pad(json: string): Buffer {
   const bytes = Buffer.from(json, 'utf8');
   const bucket = buckets.find(size => size >= bytes.length);
-  if (bucket === undefined) throw new Error('Plaintext exceeds 131072 bytes');
+  if (bucket === undefined) throw new Error('Plaintext exceeds 524288 bytes');
   const padded = Buffer.alloc(bucket, 0x20);
   bytes.copy(padded);
   return padded;
