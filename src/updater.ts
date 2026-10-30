@@ -1,9 +1,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { generateKeyPairSync, sign, createHash } from 'node:crypto';
+import { generateKeyPairSync, sign, createHash, randomUUID } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import type { ReleaseKey } from './release-keys.js';
 import {
   DEFAULT_LIMITS,
@@ -128,16 +128,47 @@ function removeTree(file: string): void {
   }
 }
 
-function acquireLock(file: string, startedAt: number): (() => void) | null {
-  const temp = `${file}.tmp-${process.pid}`;
+function sameInode(a: fs.Stats, b: fs.Stats): boolean {
+  return a.dev === b.dev && a.ino === b.ino;
+}
+
+function inspectLock(file: string): { stat: fs.Stats; text: string } | null {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    return { stat: fs.fstatSync(fd), text: fs.readFileSync(fd, 'utf8') };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function unlinkOwned(file: string, owner: fs.Stats): void {
+  try {
+    if (sameInode(fs.lstatSync(file), owner)) fs.unlinkSync(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
+
+/** onStale permits deterministic interleaving of two stale-lock inspectors in tests. */
+export function acquireLock(
+  file: string,
+  startedAt: number,
+  onStale?: () => void,
+): (() => void) | null {
+  const temp = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  const breakFile = `${file}.break`;
   const contents = `${process.pid} ${startedAt}`;
   let fd: number | undefined;
   try {
-    fs.rmSync(temp, { force: true });
     fd = fs.openSync(temp, 'wx', 0o600);
     fs.fchmodSync(fd, 0o600);
     fs.writeFileSync(fd, contents);
     fs.fsyncSync(fd);
+    const owner = fs.fstatSync(fd);
     fs.closeSync(fd);
     fd = undefined;
 
@@ -145,49 +176,88 @@ function acquireLock(file: string, startedAt: number): (() => void) | null {
       try {
         // Publish only a complete lock; another process never sees an empty one.
         fs.linkSync(temp, file);
+        return () => unlinkOwned(file, owner);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        let stale = false;
-        try {
-          const stat = fs.statSync(file);
-          const text = fs.readFileSync(file, 'utf8');
-          const match = /^(\d+) (\d+)$/.exec(text);
-          const pid = match ? Number(match[1]) : NaN;
-          const at = match ? Number(match[2]) : NaN;
-          if (!Number.isSafeInteger(pid) || pid <= 0 ||
-              !Number.isSafeInteger(at) || at < 0) {
-            stale = startedAt - stat.mtimeMs > 20 * 60_000;
-          } else {
-            stale = startedAt - at > 20 * 60_000;
-            if (!stale) {
-              try {
-                process.kill(pid, 0);
-              } catch (probeError) {
-                stale = (probeError as NodeJS.ErrnoException).code === 'ESRCH';
-              }
-            }
-          }
-        } catch (readError) {
-          if ((readError as NodeJS.ErrnoException).code === 'ENOENT') continue;
-          throw readError;
-        }
-        if (!stale) return null;
-        fs.rmSync(file, { force: true });
-        continue;
       }
-      return () => {
-        // A run older than twenty minutes must not remove its successor's lock.
-        try {
-          if (fs.readFileSync(file, 'utf8') === contents) fs.unlinkSync(file);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+
+      const inspected = inspectLock(file);
+      if (inspected === null) continue;
+      const match = /^(\d+) (\d+)$/.exec(inspected.text);
+      const pid = match ? Number(match[1]) : NaN;
+      const at = match ? Number(match[2]) : NaN;
+      let stale: boolean;
+      if (!Number.isSafeInteger(pid) || pid <= 0 ||
+          !Number.isSafeInteger(at) || at < 0) {
+        stale = startedAt - inspected.stat.mtimeMs > 20 * 60_000;
+      } else {
+        stale = startedAt - at > 20 * 60_000;
+        if (!stale) {
+          try {
+            process.kill(pid, 0);
+          } catch (error) {
+            stale = (error as NodeJS.ErrnoException).code === 'ESRCH';
+          }
         }
-      };
+      }
+      if (!stale) return null;
+      onStale?.();
+
+      let breaking = false;
+      for (let retry = 0; retry < 2; retry++) {
+        try {
+          fs.linkSync(temp, breakFile);
+          breaking = true;
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+          if (retry !== 0) return null;
+          let other: fs.Stats;
+          try {
+            other = fs.lstatSync(breakFile);
+          } catch (readError) {
+            if ((readError as NodeJS.ErrnoException).code === 'ENOENT') continue;
+            throw readError;
+          }
+          if (startedAt - other.mtimeMs <= 60_000) return null;
+          // An abandoned breaker may be removed once before retrying publication.
+          unlinkOwned(breakFile, other);
+        }
+      }
+      if (!breaking) return null;
+      try {
+        const current = inspectLock(file);
+        if (current !== null && sameInode(current.stat, inspected.stat) &&
+            current.text === inspected.text) {
+          fs.unlinkSync(file);
+        }
+      } finally {
+        unlinkOwned(breakFile, owner);
+      }
     }
     return null;
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
     fs.rmSync(temp, { force: true });
+  }
+}
+
+function cleanLeftovers(root: string, versionsDir: string): void {
+  for (const name of fs.readdirSync(root)) {
+    if (!name.startsWith('tmp-')) continue;
+    const file = path.join(root, name);
+    const stat = fs.lstatSync(file);
+    if (stat.isDirectory() && !stat.isSymbolicLink() &&
+        (process.platform === 'win32' ||
+         (stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0))) {
+      removeTree(file);
+    }
+  }
+  for (const name of fs.readdirSync(versionsDir)) {
+    if (!name.endsWith('.staging')) continue;
+    const file = path.join(versionsDir, name);
+    const stat = fs.lstatSync(file);
+    if (stat.isDirectory() && !stat.isSymbolicLink()) removeTree(file);
   }
 }
 
@@ -208,7 +278,7 @@ function readJournal(file: string): Journal | null {
 function ordersIn(file: string): string[] {
   const value = readJson(file);
   if (value === null) return [];
-  if (!Array.isArray(value) || value.length > 200 ||
+  if (!Array.isArray(value) || value.length > 2000 ||
       !value.every(id => typeof id === 'string' && ORDER_ID.test(id))) {
     throw new Error('order history');
   }
@@ -220,8 +290,14 @@ function rememberOrder(file: string, id: string): void {
   const orders = ordersIn(file);
   if (!orders.includes(id)) {
     orders.push(id);
-    atomicJson(file, orders.slice(-200));
+    atomicJson(file, orders.slice(-2000));
   }
+}
+
+export function writeStatus(statusFile: string, ordersFile: string, value: Status): void {
+  // A crash before remembering leaves a visible terminal result for the next run to remember.
+  atomicJson(statusFile, value, 0o644);
+  if (TERMINAL.has(value.state)) rememberOrder(ordersFile, value.order_id);
 }
 
 function versionsIn(file: string): string[] {
@@ -325,9 +401,7 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
     const value: Status = {
       ...order, state, detail: detail.slice(0, 200), at: new Date(d.now()).toISOString(),
     };
-    // Persist deduplication before making a terminal status visible.
-    if (TERMINAL.has(state)) rememberOrder(ordersFile, order.order_id);
-    atomicJson(statusFile, value, 0o644);
+    writeStatus(statusFile, ordersFile, value);
   };
   const journal = (phase: Journal['phase'], from: string | null, to: string | null, order: Order): void => {
     atomicJson(journalFile, {
@@ -366,6 +440,7 @@ export async function runOnce(d: UpdaterDeps): Promise<'idle' | 'done' | 'busy'>
   };
 
   try {
+    cleanLeftovers(d.root, versionsDir);
     const journalNow = readJournal(journalFile);
     // Only an UNcommitted journal is work this run did; a committed one is history.
     const pending = journalNow && journalNow.phase !== 'committed' ? journalNow : null;

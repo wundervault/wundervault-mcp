@@ -207,12 +207,15 @@ function checkUrl(value: unknown, path: string): asserts value is string {
  * The only path shape an app archive entry may have: relative, '/'-separated, at most 16 deep,
  * each part 1–100 of letters, digits and @ _ . + - and not starting with a dot (no '.', '..' or
  * dotfiles). '_' may lead: our own bin/_handover.js and @noble/hashes/_blake.js do (found
- * 2026-10-30 packing the real repo).
+ * 2026-10-30 packing the real repo). safeAppPath also excludes Windows device names and
+ * components Windows would normalise by removing trailing dots or spaces.
  */
 export const APP_PATH = /^[A-Za-z0-9@_][A-Za-z0-9@._+-]{0,99}(\/[A-Za-z0-9@_][A-Za-z0-9@._+-]{0,99}){0,15}$/;
 
 export function safeAppPath(path: string): boolean {
-  return APP_PATH.test(path) && !path.split('/').some(part => part === '.' || part === '..');
+  return APP_PATH.test(path) && !path.split('/').some(part =>
+    part === '.' || part === '..' || /[. ]$/.test(part) ||
+    /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(part.split('.')[0]!));
 }
 
 export function parseRecord(

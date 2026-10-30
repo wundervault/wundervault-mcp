@@ -295,18 +295,20 @@ export async function extractApp(
     for (const name of required) if (!safePath(name)) fail('invalid required file');
 
     const files = new Set<string>();          // exact names written
-    const folded = new Map<string, 'file' | 'dir'>();   // case-folded name -> kind
+    const folded = new Map<string, { kind: 'file' | 'dir'; name: string }>();
     let fileCount = 0;
     const claim = (path: string, kind: 'file' | 'dir'): void => {
       const lower = path.toLowerCase();
       const before = folded.get(lower);
-      if (before === 'file' || (before === 'dir' && kind === 'file')) fail(`duplicate entry app/${path}`);
+      if (before && (before.kind === 'file' || kind === 'file' || before.name !== path)) {
+        fail(`duplicate entry app/${path}`);
+      }
       // A file may not sit under something that is already a file.
       const parts = lower.split('/');
       for (let i = 1; i < parts.length; i++) {
-        if (folded.get(parts.slice(0, i).join('/')) === 'file') fail(`entry under a file app/${path}`);
+        if (folded.get(parts.slice(0, i).join('/'))?.kind === 'file') fail(`entry under a file app/${path}`);
       }
-      folded.set(lower, kind);
+      folded.set(lower, { kind, name: path });
     };
     await withArchive(archive, limits, async bytes => {
       await entries(bytes, limits, async (header, data) => {
@@ -322,6 +324,7 @@ export async function extractApp(
           if (path === '') return;
           if (!safePath(path)) fail('invalid app path');
           claim(path, 'dir');
+          for (let i = path.indexOf('/'); i !== -1; i = path.indexOf('/', i + 1)) claim(path.slice(0, i), 'dir');
           parents(join(stagingDir, 'app'), path);
           return;
         }

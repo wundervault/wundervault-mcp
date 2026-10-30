@@ -12,7 +12,8 @@ const APP_PATH = /^[A-Za-z0-9@_][A-Za-z0-9@._+-]{0,99}(\/[A-Za-z0-9@_][A-Za-z0-9
 
 function checkPath(name) {
   if (!name || !APP_PATH.test(name) ||
-      name.split('/').some(part => !part || part === '.' || part === '..')) {
+      name.split('/').some(part => !part || part === '.' || part === '..' ||
+        /[. ]$/.test(part) || /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(part.split('.')[0]))) {
     throw new Error(`Invalid archive path: ${name}`);
   }
 }

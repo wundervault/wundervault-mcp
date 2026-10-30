@@ -117,7 +117,7 @@ test('verify-release verifies a signed Node archive and its expected member', ()
     const result = verify(dir);
     assert.equal(result.status, 0, result.output);
     assert.match(result.output, /^node linux-x64: verified$/m);
-    assert.match(result.output, /^OK 9\.8\.7$/m);
+    assert.match(result.output, /^OK 9\.8\.7\b/m);
   });
 });
 
@@ -148,7 +148,7 @@ test('verify-release allows a listed Node archive to be absent', () => {
     const result = verify(dir);
     assert.equal(result.status, 0, result.output);
     assert.match(result.output, /^node linux-x64: not present$/m);
-    assert.match(result.output, /^OK 9\.8\.7$/m);
+    assert.match(result.output, /^OK 9\.8\.7\b/m);
   }, { absent: true });
 });
 

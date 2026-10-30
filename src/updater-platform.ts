@@ -45,6 +45,57 @@ function atomicText(file: string, text: string): void {
   }
 }
 
+export function windowsNode(
+  dir: string,
+  stat: (file: string) => fs.Stats = file => fs.lstatSync(file),
+): string {
+  const bundled = path.join(dir, 'node.exe');
+  try {
+    const info = stat(bundled);
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error('no node for version');
+    return bundled;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  try {
+    const file = path.join(dir, 'node.path');
+    const info = stat(file);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 1024) {
+      throw new Error('no node for version');
+    }
+    const bytes = fs.readFileSync(file);
+    if (bytes.length === 0 || bytes.length > 1024 ||
+        bytes.some(byte => byte < 32 || byte > 126)) throw new Error('no node for version');
+    const node = bytes.toString('ascii');
+    if (!path.win32.isAbsolute(node) ||
+        !/^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)/.test(node) ||
+        !/\\node\.exe$/i.test(node) || /["%!^&|<>]/.test(node)) {
+      throw new Error('no node for version');
+    }
+    const target = stat(node);
+    if (!target.isFile() || target.isSymbolicLink()) throw new Error('no node for version');
+    return node;
+  } catch {
+    throw new Error('no node for version');
+  }
+}
+
+export function writeWindowsDescriptor(
+  root: string,
+  v: string,
+  stat: (file: string) => fs.Stats = file => fs.lstatSync(file),
+): void {
+  if (parseVersion(v) === null) throw new Error('descriptor');
+  const dir = path.join(root, 'versions', v);
+  const node = windowsNode(dir, stat);
+  if (/["\r\n%!^&|<>]/.test(node) || /["\r\n%!^&|<>]/.test(dir)) {
+    throw new Error('descriptor');
+  }
+  atomicText(path.join(root, 'bin', 'active.cmd'),
+    `set "WV_NODE=${node}"\r\nset "WV_APP=${path.join(dir, 'app')}"\r\n`);
+}
+
 function systemRoot(): string {
   const value = process.env.SystemRoot ?? 'C:\\Windows';
   if (!path.win32.isAbsolute(value) || /[\r\n"]/.test(value)) throw new Error('SystemRoot');
@@ -271,12 +322,7 @@ export function defaultDeps(): UpdaterDeps {
   const writeDescriptor = (v: string): void => {
     const dir = versionDir(v);
     if (windows) {
-      const bundled = path.join(dir, 'node.exe');
-      const node = fs.existsSync(bundled) ? bundled : readActive()?.node;
-      if (!node || /["\r\n%!^&|<>]/.test(node) || /["\r\n%!^&|<>]/.test(dir)) {
-        throw new Error('descriptor');
-      }
-      atomicText(activeFile, `set "WV_NODE=${node}"\r\nset "WV_APP=${path.join(dir, 'app')}"\r\n`);
+      writeWindowsDescriptor(root, v);
     } else {
       const temp = `${currentFile}.tmp-${process.pid}`;
       fs.rmSync(temp, { force: true });
@@ -414,11 +460,8 @@ export function defaultDeps(): UpdaterDeps {
       });
     },
     async selfTest(dir) {
-      const exe = windows ?
-        (fs.existsSync(path.join(dir, 'node.exe')) ? path.join(dir, 'node.exe') : readActive()?.node) :
-        path.join(dir, 'node');
-      if (!exe) return false;
       try {
+        const exe = windows ? windowsNode(dir) : path.join(dir, 'node');
         await runProgram(exe, [path.join(dir, 'app', 'dist', 'updater.js'), '--self-test'],
           root, env, windows, 30_000);
         return true;

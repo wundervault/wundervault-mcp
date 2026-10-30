@@ -152,6 +152,24 @@ function Assert-Version {
     }
 }
 
+$ResumeUpdater = $false
+try {
+    # Disabling prevents a new tick; let an in-flight update finish rather than killing its switch.
+    $Task = Get-ScheduledTask -TaskName 'wundervault-update' -ErrorAction SilentlyContinue
+    if ($null -ne $Task) {
+        $ResumeUpdater = $Action -eq 'install'
+        Disable-ScheduledTask -TaskName 'wundervault-update' | Out-Null
+        $Wait = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($null -ne $Task -and $Task.State -eq 'Running') {
+            if ($Wait.Elapsed.TotalSeconds -ge 120) {
+                throw 'The wundervault-update task is still Running after 120 seconds; layout was not changed.'
+            }
+            Start-Sleep -Milliseconds 250
+            $Task = Get-ScheduledTask -TaskName 'wundervault-update' -ErrorAction SilentlyContinue
+        }
+        $Wait.Stop()
+    }
+
 $script:Manifest = $null
 if (Test-Path -LiteralPath $Root) {
     Assert-RealPath $Root
@@ -279,7 +297,6 @@ if ($Action -eq 'uninstall') {
     if (@($script:Manifest.tasks) -contains 'wundervault-update') {
         $Task = Get-ScheduledTask -TaskName 'wundervault-update' -ErrorAction SilentlyContinue
         if ($null -ne $Task) {
-            Stop-ScheduledTask -TaskName 'wundervault-update'
             Unregister-ScheduledTask -TaskName 'wundervault-update' -Confirm:$false
         }
     }
@@ -436,6 +453,45 @@ if (-not $IsCurrent) {
     }
 }
 
+$BundledNode = Join-Path $V 'node.exe'
+$VersionNodePath = Join-Path $V 'node.path'
+if (Test-Path -LiteralPath $BundledNode) {
+    Assert-RealPath $BundledNode
+    if (-not (Test-Path -LiteralPath $BundledNode -PathType Leaf)) {
+        throw 'no node for version'
+    }
+    $ActiveNode = $BundledNode
+} else {
+    if (-not (Test-Path -LiteralPath $VersionNodePath)) {
+        # A first install uses the validated system Node. Preserve an existing current version's
+        # system Node when migrating a layout made before node.path was introduced.
+        Assert-CmdPath $ActiveNode
+        if ($ActiveNode -notmatch '\\node\.exe$' -or $ActiveNode.Length -gt 1024 -or
+            $Ascii.GetString($Ascii.GetBytes($ActiveNode)) -cne $ActiveNode) {
+            throw 'System Node path must be ASCII, at most 1 KiB, and end with \node.exe.'
+        }
+        Write-LayoutFile $VersionNodePath $ActiveNode
+    }
+    Assert-RealPath $VersionNodePath
+    $NodePathItem = Get-Item -LiteralPath $VersionNodePath -Force
+    if ($NodePathItem.PSIsContainer -or $NodePathItem.Length -gt 1024) {
+        throw 'no node for version'
+    }
+    $NodePathBytes = [System.IO.File]::ReadAllBytes($VersionNodePath)
+    if (@($NodePathBytes | Where-Object { $_ -gt 127 }).Count -ne 0) {
+        throw 'no node for version'
+    }
+    $ActiveNode = $Ascii.GetString($NodePathBytes)
+    Assert-CmdPath $ActiveNode
+    if ($ActiveNode -notmatch '\\node\.exe$' -or
+        -not (Test-Path -LiteralPath $ActiveNode -PathType Leaf)) {
+        throw 'no node for version'
+    }
+    Assert-RealPath $ActiveNode
+    Add-ManifestPath $VersionNodePath 'file'
+    Set-LayoutAcl $VersionNodePath $false $true $AdminsSid
+}
+
 Write-LayoutFile $Active (
     'set "WV_NODE=' + $ActiveNode + '"' + "`r`n" +
     'set "WV_APP=' + $App + '"' + "`r`n"
@@ -525,9 +581,10 @@ $Repeating = New-ScheduledTaskTrigger -Once -At ([datetime]::Today) `
 $Daily.Repetition = $Repeating.Repetition
 $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
-    -MultipleInstances IgnoreNew -StartWhenAvailable
+    -MultipleInstances IgnoreNew -StartWhenAvailable -Disable
 Register-ScheduledTask -TaskName 'wundervault-update' -Action $TaskAction `
     -Trigger @($Startup, $Daily) -Principal $TaskPrincipal -Settings $Settings -Force | Out-Null
+$ResumeUpdater = $true
 
 # The task object is another root-code boundary, not merely the files it runs.
 $Scheduler = New-Object -ComObject 'Schedule.Service'
@@ -546,3 +603,11 @@ foreach ($Ace in $TaskAcl.DiscretionaryAcl) {
 Save-Manifest
 Set-LayoutAcl $ManifestPath $false $false $AdminsSid
 Write-Output ('BROKER_CMD=' + (Join-Path $Root 'bin\broker.cmd'))
+} finally {
+    if ($ResumeUpdater) {
+        $Task = Get-ScheduledTask -TaskName 'wundervault-update' -ErrorAction SilentlyContinue
+        if ($null -ne $Task) {
+            Enable-ScheduledTask -TaskName 'wundervault-update' | Out-Null
+        }
+    }
+}

@@ -137,14 +137,21 @@ if [ -e "$ROOT" ] || [ -L "$ROOT" ]; then
     safe_dir "$ROOT"
     if [ ! -f "$MANIFEST" ] || [ -L "$MANIFEST" ]; then
         [ "$ACTION" = install ] || die "no managed manifest"
-        # Only the exact, empty skeleton of our first run may be adopted.
-        for dir in versions bin state; do
+        # Only the exact skeleton of our first run, plus its lock files, may be adopted.
+        # Each folder is looked at one level deep only (-mindepth/-maxdepth, GNU and BSD find):
+        # a -prune after failed -path tests let find descend into state/ and report the lock
+        # files there as strangers (review round 2 test).
+        for dir in versions bin; do
             safe_dir "$ROOT/$dir"
-            [ -z "$(/usr/bin/find "$ROOT/$dir" ! -path "$ROOT/$dir" -prune -print)" ] ||
+            [ -z "$(/usr/bin/find "$ROOT/$dir" -mindepth 1 -maxdepth 1 -print)" ] ||
                 die "won't adopt a folder it didn't make: $ROOT"
         done
-        EXTRA=$(/usr/bin/find "$ROOT" ! -path "$ROOT" \
-            ! -path "$ROOT/versions" ! -path "$ROOT/bin" ! -path "$ROOT/state" -prune -print)
+        safe_dir "$ROOT/state"
+        EXTRA=$(/usr/bin/find "$ROOT/state" -mindepth 1 -maxdepth 1 \
+            ! \( -type f \( -name lock -o -name lock.break -o -name 'lock.tmp.*' \) \) -print)
+        [ -z "$EXTRA" ] || die "won't adopt a folder it didn't make: $ROOT"
+        EXTRA=$(/usr/bin/find "$ROOT" -mindepth 1 -maxdepth 1 \
+            ! -name versions ! -name bin ! -name state -print)
         [ -z "$EXTRA" ] || die "won't adopt a folder it didn't make: $ROOT"
     fi
     safe_dir "$ROOT/state"
@@ -362,6 +369,9 @@ release_lock() {
         if [ "$LOCK_TEMP" -ef "$ROOT/state/lock" ]; then
             /bin/rm -f "$ROOT/state/lock"
         fi
+        if [ "$LOCK_TEMP" -ef "$ROOT/state/lock.break" ]; then
+            /bin/rm -f "$ROOT/state/lock.break"
+        fi
         /bin/rm -f "$LOCK_TEMP"
     fi
 }
@@ -380,37 +390,100 @@ take_lock() {
     while ! /bin/ln "$LOCK_TEMP" "$ROOT/state/lock" 2>/dev/null; do
         lock_now=$(/bin/date +%s)
         [ "$lock_now" -lt "$lock_deadline" ] || die "updater lock held for 120 seconds"
-        [ ! -L "$ROOT/state/lock" ] || die "updater lock is a symlink"
-        if [ ! -e "$ROOT/state/lock" ]; then
-            continue
+        # A stale-lock decision is only a snapshot. Serialize breakers, then compare both the
+        # inode and exact bytes again before unlinking; another installer may already hold it.
+        "$NODE" --input-type=commonjs - "$ROOT/state/lock" "$LOCK_TEMP" <<'JS'
+const fs = require('fs');
+const [name, temp] = process.argv.slice(2);
+const breaker = name + '.break';
+function stat(p) {
+  try { return fs.lstatSync(p); } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+}
+function same(a, b) {
+  return a && b && a.dev === b.dev && a.ino === b.ino;
+}
+function inspect() {
+  let fd;
+  try {
+    fd = fs.openSync(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error('updater lock is not a regular file');
+    const data = fs.readFileSync(fd);
+    if (!same(st, stat(name))) return null;
+    return { st, data };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+const inspected = inspect();
+if (!inspected) process.exit(0);
+const now = Date.now();
+const match = /^(\d+) (\d+)$/.exec(inspected.data.toString('utf8'));
+let stale = false;
+if (match) {
+  const pid = Number(match[1]);
+  const started = Number(match[2]);
+  if (Number.isSafeInteger(pid) && pid > 0 && pid <= 2147483647 &&
+      Number.isSafeInteger(started)) {
+    stale = now - started > 20 * 60 * 1000;
+    if (!stale) {
+      try { process.kill(pid, 0); } catch (e) {
+        if (e.code === 'ESRCH') stale = true;
+        else if (e.code !== 'EPERM') throw e;
+      }
+    }
+  } else {
+    stale = now - inspected.st.mtimeMs > 20 * 60 * 1000;
+  }
+} else {
+  stale = now - inspected.st.mtimeMs > 20 * 60 * 1000;
+}
+if (!stale) process.exit(0);
+const ours = fs.lstatSync(temp);
+let held = false;
+for (let attempt = 0; attempt < 2; attempt++) {
+  try {
+    fs.linkSync(temp, breaker);
+    held = true;
+    break;
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    const old = stat(breaker);
+    if (!old) continue;
+    if (!old.isFile()) throw new Error('unsafe updater break lock');
+    if (attempt !== 0 || Date.now() - old.mtimeMs <= 60 * 1000) break;
+    if (same(old, stat(breaker))) {
+      try { fs.unlinkSync(breaker); } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+      }
+    }
+  }
+}
+if (held) {
+  try {
+    const current = inspect();
+    if (current && same(inspected.st, current.st) &&
+        inspected.data.equals(current.data) && same(ours, stat(breaker))) {
+      fs.unlinkSync(name);
+    }
+  } finally {
+    if (same(ours, stat(breaker))) fs.unlinkSync(breaker);
+  }
+}
+JS
+        # Retry publication immediately after a break; otherwise wait without busy-spinning.
+        if /bin/ln "$LOCK_TEMP" "$ROOT/state/lock" 2>/dev/null; then
+            break
         fi
-        [ -f "$ROOT/state/lock" ] || die "updater lock is not a regular file"
-        if [ "$PLATFORM" = linux ]; then
-            lock_mtime=$(/usr/bin/stat -c %Y "$ROOT/state/lock" 2>/dev/null) || continue
-        else
-            lock_mtime=$(/usr/bin/stat -f %m "$ROOT/state/lock" 2>/dev/null) || continue
-        fi
-        lock_stale=no
-        if [ "$((lock_now - lock_mtime))" -gt 1200 ]; then
-            lock_stale=yes
-        else
-            lock_pid=
-            lock_started=
-            IFS=' ' read -r lock_pid lock_started < "$ROOT/state/lock" || :
-            case "$lock_pid" in
-                ''|0|*[!0-9]*) ;;
-                *)
-                    if ! /bin/kill -0 "$lock_pid" 2>/dev/null; then
-                        lock_stale=yes
-                    fi
-                    ;;
-            esac
-        fi
-        if [ "$lock_stale" = yes ]; then
-            /bin/rm -f "$ROOT/state/lock"
-        else
-            /bin/sleep 1
-        fi
+        /bin/sleep 1
     done
 }
 
@@ -458,6 +531,7 @@ plan_launchers() {
 }
 
 if [ "$ACTION" = uninstall ]; then
+    take_lock
     manifest check
     if [ "$PLATFORM" = linux ]; then
         "$SYSTEMCTL" disable --now wundervault-update.timer

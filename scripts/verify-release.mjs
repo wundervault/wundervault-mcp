@@ -13,6 +13,7 @@ main(async () => {
   const values = args({
     dir: { type: 'string' },
     version: { type: 'string' },
+    'require-node': { type: 'boolean' },
     ...testKeyOptions,
   });
   required(values, ['dir', 'version']);
@@ -31,6 +32,8 @@ main(async () => {
   if (await sha256File(archivePath) !== record.app.sha256) {
     throw new Error('App archive SHA-256 differs from the release record');
   }
+  let nodeVerified = 0;
+  let nodeMissing = 0;
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'wundervault-verify-'));
   try {
     const staging = path.join(temp, 'staging');
@@ -45,6 +48,7 @@ main(async () => {
         : basename;
       const file = path.join(values.dir, filename);
       if (!fs.existsSync(file)) {
+        nodeMissing++;
         console.log(`node ${platform}: not present`);
         continue;
       }
@@ -59,10 +63,15 @@ main(async () => {
           fs.rmSync(destination, { force: true });
         }
       }
+      nodeVerified++;
       console.log(`node ${platform}: verified`);
     }
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
-  console.log(`OK ${values.version}`);
+  if (values['require-node'] && nodeMissing > 0) {
+    console.error(`--require-node: ${nodeMissing} Node platform files not present`);
+    process.exitCode = 1;
+  }
+  console.log(`OK ${values.version}: app verified; node files: ${nodeVerified} verified, ${nodeMissing} not present (their hashes come from Node's signed SHASUMS256 when the record is built)`);
 });

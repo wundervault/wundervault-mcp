@@ -430,7 +430,11 @@ describe('GNU-format headers (the official Node archives use them)', () => {
   it.skipIf(!real || !existsSync(real))('extracts bin/node from a real Node release archive', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'wv-realnode-'));
     const dest = join(dir, 'node');
-    await extractNodeMember(real!, process.env.WV_REAL_NODE_MEMBER!, dest);
-    expect(statSync(dest).size).toBeGreaterThan(10_000_000);
+    try {
+      await extractNodeMember(real!, process.env.WV_REAL_NODE_MEMBER!, dest);
+      expect(statSync(dest).size).toBeGreaterThan(10_000_000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });   // a 120 MB binary per run otherwise stays in /tmp
+    }
   }, 120_000);
 });

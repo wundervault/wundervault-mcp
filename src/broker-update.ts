@@ -259,28 +259,32 @@ export async function pollOnce(d: BrokerUpdateDeps): Promise<void> {
             ? openOrder(envelope.ciphertext, envelope.nonce, key, d.fingerprint, d.now(), d.version)
             : { ok: false as const, reason: 'no key' };
           if (!opened.ok) {
-            await remember(d, state, [envelope.id]);
-            await post(d, envelope.id, 'refused', opened.reason);
+            if (await post(d, envelope.id, 'refused', opened.reason)) {
+              await remember(d, state, [envelope.id]);
+            }
             continue;
           }
           if (state.seen!.includes(opened.order.order_id)) {
-            await remember(d, state, [envelope.id]);
-            await post(d, envelope.id, 'refused', 'replay');
+            if (await post(d, envelope.id, 'refused', 'replay')) {
+              await remember(d, state, [envelope.id]);
+            }
             continue;
           }
           // The browser names the order and the server files it under that same name, so the
           // root updater's status file can be relayed by any later broker process — including the
           // new version that the update itself started, which remembers nothing of this one.
           if (opened.order.order_id !== envelope.id) {
-            await remember(d, state, [envelope.id]);
-            await post(d, envelope.id, 'refused', 'id mismatch');
+            if (await post(d, envelope.id, 'refused', 'id mismatch')) {
+              await remember(d, state, [envelope.id]);
+            }
             continue;
           }
           try {
             await writeRequest(d, opened.order);
           } catch {
-            await remember(d, state, [envelope.id]);
-            await post(d, envelope.id, 'failed', 'no spool');
+            if (await post(d, envelope.id, 'failed', 'no spool')) {
+              await remember(d, state, [envelope.id]);
+            }
             continue;
           }
           await remember(d, state, [envelope.id, opened.order.order_id]);
