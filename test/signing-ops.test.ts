@@ -12,6 +12,7 @@ import { ed25519 } from '@noble/curves/ed25519.js';
 import { pay, sign, approveStamp, type Deps } from '../src/signing-ops.js';
 import { SigningState, commitment } from '../src/wallet.js';
 import { canonicalJson } from '../src/opdef.js';
+import { validateRecipe, recipeSha256, describeRecipe, type Recipe } from '../src/stamp.js';
 import { recoverAddress, transferDigest, evmAddressOf, parseEvmPrivateKey } from '../src/evm.js';
 import { base58Encode, parseSolanaSecretKey, associatedTokenAddress } from '../src/solana.js';
 import { parsePaymentRequired, selectOffer } from '../src/x402.js';
@@ -557,5 +558,21 @@ describe('stamp approval', () => {
   it('a denial refuses the call', async () => {
     server.owner = 'deny';
     expect((await run('https://api.example.com:443'))?.code).toBe('NOT_APPROVED');
+  });
+  it('OAuth 1.0a: one approval covers the default and the explicit default (SPEC-oauth1, check 10)', async () => {
+    const checked = (raw: unknown) => { const r = validateRecipe(raw); if (!r.ok) throw new Error(r.reason); return r.recipe; };
+    const implicit = checked({ builtin: 'oauth1' });
+    const explicit = checked({ builtin: 'oauth1', signature_method: 'HMAC-SHA1' });
+    const ask = async (recipe: Recipe) => approveStamp(deps, {
+      entryId: 'st', s: await server.api().getSecret('st') as never, vaultKey: new Uint8Array(VAULT_KEY),
+      origin: 'https://api.x.com:443', recipe, recipeSha: recipeSha256(recipe), summary: describeRecipe(recipe), purpose: 'post',
+    });
+    expect(await ask(implicit)).toBeNull();
+    expect(server.requests.size).toBe(1);
+    server.entries.get('st')!.policy = policy([{ recipe_sha256: recipeSha256(implicit), origin: 'https://api.x.com:443' }]);
+    expect(await ask(explicit)).toBeNull();
+    expect(server.requests.size).toBe(1);
+    expect(await ask(checked({ builtin: 'oauth1', signature_method: 'HMAC-SHA256' }))).toBeNull();
+    expect(server.requests.size).toBe(2);
   });
 });

@@ -175,7 +175,8 @@ If something on Windows or macOS fails, tell us what it printed:
 - **The agent never gets a secret.** No tool returns a value. The broker attaches the secret to the
   request itself, the way you set for that secret (a header, a query parameter, a username and
   password, or part of the web address), and removes it from the answer. Secrets marked
-  "stamped" (AWS, exchanges) never travel: the broker signs each request with them.
+  "stamped" (AWS, X and other OAuth 1.0a services, exchanges) never travel: the broker signs each
+  request with them.
 - **A separate account.** Your agents run as you; the broker doesn't. They can't read its
   files or its memory.
 - **End-to-end encrypted vault.** Secrets are encrypted in your browser with AES-256-GCM. The

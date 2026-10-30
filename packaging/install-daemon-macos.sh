@@ -137,6 +137,9 @@ sudo_path_check() {
   for _d in /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
     [ -d "$_d" ] && root_only_chain "$_d" && SAFE_PATH="${SAFE_PATH:+$SAFE_PATH:}$_d"
   done
+  # The steps below put the line in /etc/sudoers.d, which only helps if sudo reads that folder.
+  SUDOERS_D=no
+  grep -E -q '^[[:space:]]*[#@]includedir[[:space:]]+((/private)?/etc/sudoers\.d/?|"(/private)?/etc/sudoers\.d/?")[[:space:]]*$' "${SUDOERS_FILE:-/etc/sudoers}" 2>/dev/null && SUDOERS_D=yes
   return 0
 }
 sudo_path_warning() {
@@ -147,11 +150,28 @@ WARNING: sudo on this computer looks commands up in a folder someone other than 
   $SUDO_PATH_BAD
 Your agents run as you, so any program they put there can stand in for a command you run with
 sudo — npm, node, or anything else — and run as root. This installer uses system tools only and
-is not affected, but your other sudo commands are. To fix it for good, run
-  sudo /usr/sbin/visudo -f /etc/sudoers.d/secure_path
-and add this one line:
+is not affected, but your other sudo commands are. To fix it for good, sudo needs this one line:
   Defaults secure_path="${SAFE_PATH}"
 EOM
+  # Not "edit it with visudo": visudo opens an editor as root, and which editor can come from your
+  # settings and your PATH — the very thing that is exposed. These steps run only tools named by
+  # full path, and check the file before sudo reads it: sudo skips a file in /etc/sudoers.d whose
+  # name has a dot in it, so nothing changes until the last step, and only if the check passed.
+  if [ "$SUDOERS_D" = yes ]; then
+    cat >&2 <<EOM
+Add it with these four commands, one at a time:
+  sudo /bin/mkdir -p /etc/sudoers.d
+  printf '%s\n' 'Defaults secure_path="${SAFE_PATH}"' | sudo /usr/bin/tee /etc/sudoers.d/secure_path.new >/dev/null
+  sudo /bin/chmod 0440 /etc/sudoers.d/secure_path.new
+  sudo /usr/sbin/visudo -cf /etc/sudoers.d/secure_path.new && sudo /bin/mv /etc/sudoers.d/secure_path.new /etc/sudoers.d/secure_path
+Then check:  sudo /usr/bin/printenv PATH   (it should print ${SAFE_PATH})
+EOM
+  else
+    cat >&2 <<EOM
+This computer's sudo does not read /etc/sudoers.d, so that line belongs in /etc/sudoers itself.
+Ask whoever looks after this computer, or see https://wundervault.com/help/trouble#help-trouble-sudo-path.
+EOM
+  fi
 }
 # <<< sudo path check
 # >>> package scan
@@ -599,13 +619,58 @@ else
   echo "account ${ACCOUNT}: created (uid ${ACCOUNT_UID})"
 fi
 
+# >>> place file
+# The installer writes as root into the state folder, which the broker's own account owns and can
+# rearrange (2.0.3 review, round 4). A link put where a key is about to go would have openssl, dd
+# and chown follow it as root: creating or clobbering whatever it points at, then handing that to
+# the account. So nothing is written there by name. Each file is made in a folder only root can
+# enter, given its owner and mode THERE, and renamed into place: a rename replaces a link rather
+# than following it, and -h stops mv moving the file into a folder a link points at.
+#
+# -h is the test that matters in refuse_symlink: -f follows the link and answers about the TARGET.
+refuse_symlink() {
+  if [ -h "$1" ]; then
+    echo "ERROR: $1 is a symbolic link." >&2
+    echo "       This installer writes that path as root. A link there would have root" >&2
+    echo "       create or overwrite whatever it points at. Remove it and re-run:" >&2
+    echo "         sudo rm -- '$1'" >&2
+    exit 1
+  fi
+}
+place_file() {
+  refuse_symlink "$2"
+  # A real folder only: a link is refuse_symlink's, and one planted after it is the rename's to replace.
+  if [ -d "$2" ] && [ ! -h "$2" ]; then echo "ERROR: $2 is a folder; a file belongs there. Remove it and re-run." >&2; exit 1; fi
+  mv -f -h "$1" "$2"
+}
+# <<< place file
+
 # ── 2. the directories ───────────────────────────────────────────────────────
+# The top folder is root's (2.1.0). It used to be the broker account's, which could then rename
+# `state` or `run` and put a link in its place before a reinstall, and the mkdir, chown and chmod
+# below would have followed it as root (2.0.3 review, round 4). The broker only passes through it.
+# Taken back FIRST, so nothing below runs while that account can still rearrange it; its own
+# parent is root's, so the folder itself cannot be swapped.
+refuse_symlink "$BASE_DIR"
+mkdir -p "$BASE_DIR"
+chown root:wheel "$BASE_DIR"
+# Ownership alone does not take it back: while the account owned it, it could give itself an access
+# list entry (create and delete children) that survives the chown and the chmod (installer review,
+# round 1). -N removes every entry; then check that none is left.
+chmod -N "$BASE_DIR"
+chmod 0755 "$BASE_DIR"
+if [ -n "$(ls -lde "$BASE_DIR" | sed -n '2,$p')" ]; then
+  echo "ERROR: ${BASE_DIR} still has an access control list after it was removed." >&2
+  echo "       Someone other than root may be able to change it. Nothing in it was touched." >&2
+  exit 1
+fi
+refuse_symlink "$STATE_DIR"
+refuse_symlink "$RUN_DIR"
 mkdir -p "$STATE_DIR" "$RUN_DIR"
-chown "${ACCOUNT}:${ACCOUNT}" "$BASE_DIR" "$STATE_DIR" "$RUN_DIR"
+chown "${ACCOUNT}:${ACCOUNT}" "$STATE_DIR" "$RUN_DIR"
 # Unconditional, because mkdir's mode is masked by umask and ignored outright when the
 # directory already exists. A state directory left at 0755 by an earlier run would leave
 # the boundary open while every other check here passed.
-chmod 0755 "$BASE_DIR"
 chmod 0700 "$STATE_DIR"
 chmod 0755 "$RUN_DIR"
 ACTUAL=$(stat -f '%Lp' "$STATE_DIR")
@@ -633,24 +698,19 @@ echo "run dir   ${RUN_DIR}: 0755 ${ACCOUNT} — agents reach their sockets throu
 #
 # Generated with openssl rather than by the broker at first start, so that the key exists
 # before anything can ask for it and so the mode is set by root while root is still here.
-# A path inside a directory the SERVICE ACCOUNT owns, about to be written BY ROOT.
-#
-# That account can replace either key file with a symlink before a reinstall. openssl or dd
-# would then follow it as root, create or clobber whatever it points at, and the chown that
-# follows would hand that target to the service account. A privileged installer must not
-# resolve a path through a directory an unprivileged account can rearrange under it — the
-# same rule that keeps `--destinations` from following a path in the agent's home.
-#
-# -h is the test that matters: -f follows the link and answers about the TARGET.
-refuse_symlink() {
-  if [ -h "$1" ]; then
-    echo "ERROR: $1 is a symbolic link." >&2
-    echo "       This installer writes that path as root. A link there would have root" >&2
-    echo "       create or overwrite whatever it points at. Remove it and re-run:" >&2
-    echo "         sudo rm -- '$1'" >&2
-    exit 1
-  fi
-}
+# Paths inside a directory the SERVICE ACCOUNT owns, about to be written BY ROOT: see place_file.
+# A link already there is refused with a clear message; one put there after this check is
+# replaced by the rename, never followed.
+MAKE_DIR=$(mktemp -d "${BASE_DIR}/.install.XXXXXX")
+trap 'rm -rf "$MAKE_DIR"' EXIT
+# A rename is one step only within one file system; across two, mv copies, and the reasoning in
+# place_file no longer holds (installer review, round 1, B1). A state folder mounted on its own is
+# not a layout this installer supports.
+if [ "$(stat -f '%d' "$MAKE_DIR")" != "$(stat -f '%d' "$STATE_DIR")" ]; then
+  echo "ERROR: ${STATE_DIR} is on a different file system from ${BASE_DIR}." >&2
+  echo "       This installer moves keys into it in one step, which needs the same file system." >&2
+  exit 1
+fi
 
 BROKER_KEY="${STATE_DIR}/broker-key.pem"
 STORE_KEY="${STATE_DIR}/store.key"
@@ -666,15 +726,16 @@ else
   # script here, and the guarded fallback below — the one that prints a warning and lets
   # the broker make its own key at first --pair — can never run.
   ( umask 077 && openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-      -out "$BROKER_KEY" 2>/dev/null ) || true
-  if [ -s "$BROKER_KEY" ]; then
-    chown "${ACCOUNT}:${ACCOUNT}" "$BROKER_KEY"
-    chmod 0600 "$BROKER_KEY"
-    BK_MODE=$(stat -f '%Lp' "$BROKER_KEY")
+      -out "$MAKE_DIR/broker-key.pem" 2>/dev/null ) || true
+  if [ -s "$MAKE_DIR/broker-key.pem" ]; then
+    chown "${ACCOUNT}:${ACCOUNT}" "$MAKE_DIR/broker-key.pem"
+    chmod 0600 "$MAKE_DIR/broker-key.pem"
+    BK_MODE=$(stat -f '%Lp' "$MAKE_DIR/broker-key.pem")
     [ "$BK_MODE" = "600" ] || { echo "ERROR: ${BROKER_KEY} is mode ${BK_MODE}, expected 600." >&2; exit 1; }
+    place_file "$MAKE_DIR/broker-key.pem" "$BROKER_KEY"
     echo "broker key: created, 0600 ${ACCOUNT}"
   else
-    rm -f "$BROKER_KEY"
+    rm -f "$MAKE_DIR/broker-key.pem"
     echo "WARNING: could not generate the broker key with openssl." >&2
     echo "         The broker will create one at first --pair instead." >&2
   fi
@@ -715,23 +776,23 @@ fi
 if [ "$STORE_KEY_OK" = "1" ]; then
   echo "store key: already present at ${STORE_KEY}"
 else
-  ( umask 077 && dd if=/dev/urandom of="$STORE_KEY" bs=32 count=1 2>/dev/null ) || true
+  ( umask 077 && dd if=/dev/urandom of="$MAKE_DIR/store.key" bs=32 count=1 2>/dev/null ) || true
   # Unlike the broker key there is no acceptable fallback here: continuing without this
   # file means the broker silently runs on the DERIVED key while the install reports a
   # random one. Fail loudly instead.
-  if [ ! -s "$STORE_KEY" ]; then
-    rm -f "$STORE_KEY"
+  if [ ! -s "$MAKE_DIR/store.key" ]; then
     echo "ERROR: could not write ${STORE_KEY}." >&2
     echo "       Without it the broker falls back to a key derived from this machine's" >&2
     echo "       identity and uid, which is weaker and must not be described otherwise." >&2
     exit 1
   fi
-  chown "${ACCOUNT}:${ACCOUNT}" "$STORE_KEY"
-  chmod 0600 "$STORE_KEY"
-  SK_SIZE=$(stat -f '%z' "$STORE_KEY")
+  chown "${ACCOUNT}:${ACCOUNT}" "$MAKE_DIR/store.key"
+  chmod 0600 "$MAKE_DIR/store.key"
+  SK_SIZE=$(stat -f '%z' "$MAKE_DIR/store.key")
   [ "$SK_SIZE" -ge 32 ] || { echo "ERROR: ${STORE_KEY} is only ${SK_SIZE} bytes." >&2; exit 1; }
-  SK_MODE=$(stat -f '%Lp' "$STORE_KEY")
+  SK_MODE=$(stat -f '%Lp' "$MAKE_DIR/store.key")
   [ "$SK_MODE" = "600" ] || { echo "ERROR: ${STORE_KEY} is mode ${SK_MODE}, expected 600." >&2; exit 1; }
+  place_file "$MAKE_DIR/store.key" "$STORE_KEY"
   echo "store key: created, 0600 ${ACCOUNT} — random, so it cannot be recomputed"
 fi
 echo "           It is NOT sealed to hardware: a copy of this disk plus root opens it."

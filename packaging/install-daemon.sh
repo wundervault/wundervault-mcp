@@ -137,6 +137,9 @@ sudo_path_check() {
   for _d in /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
     [ -d "$_d" ] && root_only_chain "$_d" && SAFE_PATH="${SAFE_PATH:+$SAFE_PATH:}$_d"
   done
+  # The steps below put the line in /etc/sudoers.d, which only helps if sudo reads that folder.
+  SUDOERS_D=no
+  grep -E -q '^[[:space:]]*[#@]includedir[[:space:]]+((/private)?/etc/sudoers\.d/?|"(/private)?/etc/sudoers\.d/?")[[:space:]]*$' "${SUDOERS_FILE:-/etc/sudoers}" 2>/dev/null && SUDOERS_D=yes
   return 0
 }
 sudo_path_warning() {
@@ -147,11 +150,28 @@ WARNING: sudo on this computer looks commands up in a folder someone other than 
   $SUDO_PATH_BAD
 Your agents run as you, so any program they put there can stand in for a command you run with
 sudo — npm, node, or anything else — and run as root. This installer uses system tools only and
-is not affected, but your other sudo commands are. To fix it for good, run
-  sudo /usr/sbin/visudo -f /etc/sudoers.d/secure_path
-and add this one line:
+is not affected, but your other sudo commands are. To fix it for good, sudo needs this one line:
   Defaults secure_path="${SAFE_PATH}"
 EOM
+  # Not "edit it with visudo": visudo opens an editor as root, and which editor can come from your
+  # settings and your PATH — the very thing that is exposed. These steps run only tools named by
+  # full path, and check the file before sudo reads it: sudo skips a file in /etc/sudoers.d whose
+  # name has a dot in it, so nothing changes until the last step, and only if the check passed.
+  if [ "$SUDOERS_D" = yes ]; then
+    cat >&2 <<EOM
+Add it with these four commands, one at a time:
+  sudo /bin/mkdir -p /etc/sudoers.d
+  printf '%s\n' 'Defaults secure_path="${SAFE_PATH}"' | sudo /usr/bin/tee /etc/sudoers.d/secure_path.new >/dev/null
+  sudo /bin/chmod 0440 /etc/sudoers.d/secure_path.new
+  sudo /usr/sbin/visudo -cf /etc/sudoers.d/secure_path.new && sudo /bin/mv /etc/sudoers.d/secure_path.new /etc/sudoers.d/secure_path
+Then check:  sudo /usr/bin/printenv PATH   (it should print ${SAFE_PATH})
+EOM
+  else
+    cat >&2 <<EOM
+This computer's sudo does not read /etc/sudoers.d, so that line belongs in /etc/sudoers itself.
+Ask whoever looks after this computer, or see https://wundervault.com/help/trouble#help-trouble-sudo-path.
+EOM
+  fi
 }
 # <<< sudo path check
 # >>> package scan
@@ -247,6 +267,34 @@ sudo_path_warning
 if [ "$MODE" = uninstall ]; then
   echo "Stopping and removing the secret broker (${UNIT_NAME})…"
   systemctl disable --now "$UNIT_NAME" 2>/dev/null || true
+  # Its exit code was trusted before, and the unit removed even when the stop had failed: a broker
+  # still serving credentials from a unit nobody could see or replace (2.0.3 review, round 3). Ask
+  # systemd what is true instead, and give a broker still closing its connections up to 15
+  # seconds, as the macOS uninstall does. Only "inactive" and "failed" mean nothing is left
+  # running; an answer systemd cannot give proves nothing, so it refuses too.
+  unit_state() { systemctl show -p ActiveState --value "$UNIT_NAME" 2>/dev/null || echo "?"; }
+  waited=0
+  state=$(unit_state)
+  while case "$state" in active|activating|deactivating|reloading|refreshing) true ;; *) false ;; esac \
+        && [ "$waited" -lt 15 ]; do
+    sleep 1
+    waited=$((waited + 1))
+    state=$(unit_state)
+  done
+  case "$state" in
+    inactive|failed) ;;
+    active|activating|deactivating|reloading|refreshing)
+      echo "ERROR: the broker is still ${state} ${waited} seconds after it was told to stop." >&2
+      echo "       Refusing to remove ${UNIT_PATH} — deleting it now would leave the broker" >&2
+      echo "       running from a unit you can no longer see or replace." >&2
+      echo "       Try:  sudo systemctl stop ${UNIT_NAME}   and run this again." >&2
+      exit 1 ;;
+    *)
+      echo "ERROR: systemd did not say whether the broker stopped (it answered: ${state:-nothing})." >&2
+      echo "       Refusing to remove ${UNIT_PATH}." >&2
+      echo "       Try:  sudo systemctl stop ${UNIT_NAME}   and run this again." >&2
+      exit 1 ;;
+  esac
   rm -f "$UNIT_PATH"
   systemctl daemon-reload
   # The account and its state are LEFT BEHIND on purpose. They hold the credentials this
@@ -511,7 +559,39 @@ else
   echo "account ${ACCOUNT}: created"
 fi
 
+# >>> place file
+# The installer writes as root into the state folder, which the broker's own account owns and can
+# rearrange (2.0.3 review, round 4). A link put where a key is about to go would have openssl,
+# systemd-creds and chown follow it as root: creating or clobbering whatever it points at, then
+# handing that to the account. So nothing is written there by name. Each file is made in a folder
+# only root can enter, given its owner and mode THERE, and renamed into place: a rename replaces a
+# link rather than following it, and -T stops mv moving the file into a folder of that name.
+#
+# -h is the test that matters in refuse_symlink: -f follows the link and answers about the TARGET.
+refuse_symlink() {
+  if [ -h "$1" ]; then
+    echo "ERROR: $1 is a symbolic link." >&2
+    echo "       This installer writes that path as root. A link there would have root" >&2
+    echo "       create or overwrite whatever it points at. Remove it and re-run:" >&2
+    echo "         sudo rm -- '$1'" >&2
+    exit 1
+  fi
+}
+refuse_folder() {
+  if [ -d "$1" ] && [ ! -h "$1" ]; then echo "ERROR: $1 is a folder; a file belongs there. Remove it and re-run." >&2; exit 1; fi
+}
+place_file() {
+  refuse_symlink "$2"
+  # A real folder only: a link is refuse_symlink's, and one planted after it is the rename's to replace.
+  refuse_folder "$2"
+  mv -f -T "$1" "$2"
+}
+# <<< place file
+
 # ── 2. the directory ─────────────────────────────────────────────────────────
+# Its parent (/var/lib) is root's, so the broker's account cannot swap the folder itself; a link
+# left there by anyone else is refused rather than followed by the chown below.
+refuse_symlink "$STATE_DIR"
 mkdir -p "$STATE_DIR"
 chown "${ACCOUNT}:$(id -gn "$ACCOUNT")" "$STATE_DIR"
 # Unconditional, because mkdir's mode is masked by umask and ignored outright when the
@@ -548,8 +628,33 @@ echo "state dir ${STATE_DIR}: 0700 ${ACCOUNT}"
 #
 # Generated with openssl rather than by the broker at first start, so that the key exists
 # before anything can ask for it and so the mode is set by root while root is still here.
+# Files for the state folder are made here first: see place_file. On the same file system as
+# /var/lib/wundervault, so the rename is one step.
+MAKE_DIR=$(mktemp -d /var/lib/.wundervault-install.XXXXXX)
+trap 'rm -rf "$MAKE_DIR"' EXIT
+# A rename is one step only within one file system; across two, mv copies, and the reasoning in
+# place_file no longer holds (installer review, round 1, B1). A state folder mounted on its own is
+# not a layout this installer supports.
+# The mount too: a bind mount shares the device number, and rename still fails across it (round 2, B1).
+# stat cannot see one (its %m walks up by device number); findmnt reads the mount table and can
+# (round 3, F1, checked against a real bind mount). util-linux ships it wherever systemd runs.
+same_mount() {
+  [ "$(stat -c '%d' "$1")" = "$(stat -c '%d' "$2")" ] || return 1
+  command -v findmnt >/dev/null 2>&1 || return 0
+  [ "$(findmnt -n -o TARGET --target "$1")" = "$(findmnt -n -o TARGET --target "$2")" ]
+}
+if ! same_mount "$MAKE_DIR" "$STATE_DIR"; then
+  echo "ERROR: ${STATE_DIR} is on a different file system from /var/lib." >&2
+  echo "       This installer moves keys into it in one step, which needs the same file system." >&2
+  exit 1
+fi
+
 BROKER_KEY="${STATE_DIR}/broker-key.pem"
-if [ -f "$BROKER_KEY" ]; then
+refuse_symlink "$BROKER_KEY"
+refuse_folder "$BROKER_KEY"
+# A regular file with something in it: an empty one (an interrupted run, a damaged restore) is not a
+# key and is replaced; a folder is refused above, not taken for one (installer review, round 2, F1).
+if [ -f "$BROKER_KEY" ] && [ -s "$BROKER_KEY" ]; then
   echo "broker key: already present at ${BROKER_KEY}"
 elif command -v openssl >/dev/null 2>&1; then
   # umask before the write, not chmod after: openssl creates the file itself, and a
@@ -559,15 +664,16 @@ elif command -v openssl >/dev/null 2>&1; then
   # make its own key at first --pair — can never run. Found while writing the macOS
   # installer, which had inherited the same shape.
   ( umask 077 && openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-      -out "$BROKER_KEY" 2>/dev/null ) || true
-  if [ -s "$BROKER_KEY" ]; then
-    chown "${ACCOUNT}:$(id -gn "$ACCOUNT")" "$BROKER_KEY"
-    chmod 0600 "$BROKER_KEY"
-    BK_MODE=$(stat -c '%a' "$BROKER_KEY" 2>/dev/null || stat -f '%Lp' "$BROKER_KEY")
+      -out "$MAKE_DIR/broker-key.pem" 2>/dev/null ) || true
+  if [ -s "$MAKE_DIR/broker-key.pem" ]; then
+    chown "${ACCOUNT}:$(id -gn "$ACCOUNT")" "$MAKE_DIR/broker-key.pem"
+    chmod 0600 "$MAKE_DIR/broker-key.pem"
+    BK_MODE=$(stat -c '%a' "$MAKE_DIR/broker-key.pem")
     [ "$BK_MODE" = "600" ] || { echo "ERROR: ${BROKER_KEY} is mode ${BK_MODE}, expected 600." >&2; exit 1; }
+    place_file "$MAKE_DIR/broker-key.pem" "$BROKER_KEY"
     echo "broker key: created, 0600 ${ACCOUNT}"
   else
-    rm -f "$BROKER_KEY"
+    rm -f "$MAKE_DIR/broker-key.pem"
     echo "WARNING: could not generate the broker key with openssl." >&2
     echo "         The broker will create one at first --pair instead." >&2
   fi
@@ -577,14 +683,17 @@ fi
 
 
 SEALED_KEY="${STATE_DIR}/store.key.cred"
-if [ -f "$SEALED_KEY" ]; then
+refuse_symlink "$SEALED_KEY"
+refuse_folder "$SEALED_KEY"
+if [ -f "$SEALED_KEY" ] && [ -s "$SEALED_KEY" ]; then
   echo "store key: already sealed at ${SEALED_KEY}"
 elif command -v systemd-creds >/dev/null 2>&1; then
   TPM_STATE=$(systemd-creds has-tpm2 2>/dev/null | head -1 || echo no)
   if head -c 32 /dev/urandom \
-      | systemd-creds encrypt --name=wv-store-key - "$SEALED_KEY" 2>/dev/null; then
-    chown "${ACCOUNT}:$(id -gn "$ACCOUNT")" "$SEALED_KEY"
-    chmod 0600 "$SEALED_KEY"
+      | systemd-creds encrypt --name=wv-store-key - "$MAKE_DIR/store.key.cred" 2>/dev/null; then
+    chown "${ACCOUNT}:$(id -gn "$ACCOUNT")" "$MAKE_DIR/store.key.cred"
+    chmod 0600 "$MAKE_DIR/store.key.cred"
+    place_file "$MAKE_DIR/store.key.cred" "$SEALED_KEY"
     # Record WHICH kind of sealing happened, because the two make different promises and
     # the broker must not claim the stronger one. A drop-in rather than the unit template, so
     # a re-run updates it and a package upgrade does not overwrite it.
@@ -629,7 +738,10 @@ grep -q "^ExecStart=${SERVICE_NODE} ${EXEC}\$" "$UNIT_PATH" || {
 # No sealed key on this machine? Then the unit must not ask systemd for one: a missing
 # credential source is fatal (243/CREDENTIALS), and a broker that will not start is worse
 # than one running on the derived key and saying so.
-if [ ! -f "$SEALED_KEY" ]; then
+# Only a sealed key with something in it is handed to the service: an empty one left by an interrupted
+# run, when sealing failed this time too, would stop the service at start instead of the fallback the
+# warning above describes (installer review, round 2, F2).
+if [ ! -s "$SEALED_KEY" ]; then
   sed -i '/^LoadCredentialEncrypted=wv-store-key:/d' "$UNIT_PATH"
   echo "unit: no sealed key, so the credential line was removed"
 fi
@@ -657,7 +769,7 @@ sleep 1
 # broker directly rather than grepping its log: a fixed journal window can scroll past the
 # line entirely if the service is chatty at startup, and then a machine reports a clean
 # install while running on the weaker key.
-if [ -f "$SEALED_KEY" ] && systemctl is-active --quiet "$UNIT_NAME"; then
+if [ -s "$SEALED_KEY" ] && systemctl is-active --quiet "$UNIT_NAME"; then
   sleep 1
   KEY_MODE=$(printf '{"action":"ping"}\n' \
     | timeout 5 socat - UNIX-CONNECT:/run/wundervault/mgmt/agent.sock 2>/dev/null \

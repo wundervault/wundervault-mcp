@@ -10,9 +10,13 @@
  *
  * The owner approves each (recipe, address) pair once; that lives in the policy (wallet.ts).
  *
- * See SPEC-1.0-signing.md §F.
+ * Two schemes are named built-ins instead, because no recipe can express them: AWS SigV4 (a
+ * signing-key chain) and OAuth 1.0a (SHA-1, a fresh nonce and timestamp in every request, and
+ * four stored values). The same rule holds for both: the secrets are MAC keys and nothing else.
+ *
+ * See SPEC-1.0-signing.md §F and SPEC-oauth1-2026-10-29.md.
  */
-import { createHash, createHmac } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { canonicalJson } from './opdef.js';
 
 export type MacAlg = 'hmac-sha256' | 'hmac-sha384' | 'hmac-sha512';
@@ -46,7 +50,15 @@ export interface AwsRecipe {
   content_sha256_header?: boolean;
 }
 
-export type Recipe = HmacRecipe | AwsRecipe;
+/** OAuth 1.0a (RFC 5849), signed fresh for every request (SPEC-oauth1). */
+export interface OAuth1Recipe {
+  builtin: 'oauth1';
+  /** Always present once checked, so the default and the explicit default hash the same. */
+  signature_method: 'HMAC-SHA1' | 'HMAC-SHA256';
+  realm?: string;
+}
+
+export type Recipe = HmacRecipe | AwsRecipe | OAuth1Recipe;
 
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}$/;
 const QUERY_NAME = /^[A-Za-z0-9_.\-[\]]{1,64}$/;
@@ -71,8 +83,23 @@ export function validateRecipe(raw: unknown): RecipeCheck {
   const bad = (reason: string): RecipeCheck => ({ ok: false, reason });
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return bad('stamp must be an object');
   const r = raw as Record<string, unknown>;
+  if (r.builtin === 'oauth1') {
+    const extra = Object.keys(r).filter((k) => !['builtin', 'signature_method', 'realm'].includes(k));
+    if (extra.length) return bad(`unknown fields ${extra.join(', ')}`);
+    // Only an ABSENT field takes the default: null is a value, and not one of the two (round 1, F1).
+    const method = r.signature_method === undefined ? 'HMAC-SHA1' : r.signature_method;
+    // PLAINTEXT sends the secret itself; RSA-SHA1 is not offered.
+    if (method !== 'HMAC-SHA1' && method !== 'HMAC-SHA256') return bad('signature_method must be HMAC-SHA1 or HMAC-SHA256');
+    if (r.realm !== undefined && (typeof r.realm !== 'string' || !/^[A-Za-z0-9_.-]{1,64}$/.test(r.realm))) {
+      return bad('realm must be letters, digits, _ . - (64 at most)');
+    }
+    return { ok: true, recipe: {
+      builtin: 'oauth1', signature_method: method,
+      ...(r.realm !== undefined ? { realm: r.realm as string } : {}),
+    } };
+  }
   if (r.builtin !== undefined) {
-    if (r.builtin !== 'aws-sigv4') return bad(`unknown builtin ${String(r.builtin).slice(0, 32)} (known: aws-sigv4)`);
+    if (r.builtin !== 'aws-sigv4') return bad(`unknown builtin ${String(r.builtin).slice(0, 32)} (known: aws-sigv4, oauth1)`);
     const extra = Object.keys(r).filter((k) => !['builtin', 'region', 'service', 'content_sha256_header'].includes(k));
     if (extra.length) return bad(`unknown fields ${extra.join(', ')}`);
     if (typeof r.region !== 'string' || !/^[a-z0-9-]{2,32}$/.test(r.region)) return bad('region must be an AWS region name');
@@ -181,6 +208,10 @@ export function recipeSha256(recipe: Recipe): string {
 
 /** The recipe in words, for the approval card. Built from the checked recipe only. */
 export function describeRecipe(recipe: Recipe): string {
+  if ('builtin' in recipe && recipe.builtin === 'oauth1') {
+    return `OAuth 1.0a (${recipe.signature_method}), signed fresh for every request, in the Authorization header`
+      + (recipe.realm ? `, realm ${recipe.realm}` : '');
+  }
   if ('builtin' in recipe) return `AWS Signature Version 4 (region ${recipe.region}, service ${recipe.service})`;
   const part = (p: Part): string => {
     if ('text' in p) return JSON.stringify(p.text);
@@ -208,6 +239,8 @@ export interface RequestImage {
   body: string | undefined;
   /** Headers as sent, lowercased names. */
   headers: Record<string, string>;
+  /** The port the request goes to; 443 when absent. OAuth 1.0a signs it when it is not 443. */
+  port?: number;
 }
 
 export interface StampResult {
@@ -216,6 +249,79 @@ export interface StampResult {
   query: string[];
   /** The stamp itself, to scrub from the reply. */
   stamp: string;
+  /** Further secrets to scrub from the reply, beyond the one the request was given (OAuth 1.0a). */
+  scrub?: string[];
+}
+
+/** OAuth 1.0a's four stored values. */
+export interface OAuth1Value {
+  consumer_key: string;
+  consumer_secret: string;
+  token: string;
+  token_secret: string;
+}
+
+/**
+ * A stamped entry's value, parsed for the recipe that will use it. `secret` is what the
+ * request scrubs; `oauth1` is set for the OAuth 1.0a built-in only.
+ */
+export interface StampedValue {
+  id?: string;
+  secret: string;
+  oauth1?: OAuth1Value;
+}
+
+/** Each role, and the names it may be stored under: X's, the RFC's, and X's "API Key Secret". */
+const OAUTH1_ROLES: ReadonlyArray<[keyof OAuth1Value, readonly string[]]> = [
+  ['consumer_key', ['api_key', 'consumer_key']],
+  ['consumer_secret', ['api_secret', 'api_key_secret', 'consumer_secret']],
+  ['token', ['access_token', 'token']],
+  ['token_secret', ['access_token_secret', 'token_secret']],
+];
+const OAUTH1_SHAPE = 'OAuth 1.0a needs the entry stored as {"api_key": "…", "api_secret": "…", "access_token": "…", '
+  + '"access_token_secret": "…"} (X\'s names; consumer_key, consumer_secret, token and token_secret also work)';
+
+/**
+ * The four values, or a refusal that names the field names and never a value. Nothing is
+ * repaired: an extra field, a missing role, two names for one role, a name given twice, or a
+ * value with a space, a quote or a backslash is refused (SPEC-oauth1 §2).
+ */
+function parseOAuth1Value(value: string): OAuth1Value {
+  const v = value.trim();
+  // No escapes anywhere: the values may not hold a quote or a backslash, and the names never need
+  // one. With none, every member name is spelled literally, so the count below sees them all —
+  // "api_\u0073ecret" would otherwise be a second api_secret it missed (round 2, F1).
+  if (v.includes('\\')) throw new Error(`${OAUTH1_SHAPE}; it contains a backslash, which none of these values has`);
+  // JSON.parse keeps the LAST of two members with one name, so {"api_secret":"a",…,"api_secret":"b"}
+  // would sign with b and say nothing (round 1, B3). Values cannot hold a quote, so a name
+  // followed by a colon is a member wherever it appears.
+  for (const [, names] of OAUTH1_ROLES) {
+    for (const n of names) {
+      if ((v.match(new RegExp(`"${n}"\\s*:`, 'g')) ?? []).length > 1) throw new Error(`${OAUTH1_SHAPE}; ${n} is given twice`);
+    }
+  }
+  let o: unknown;
+  try { o = v.startsWith('{') ? JSON.parse(v) : undefined; } catch { o = undefined; }
+  const r = (o && typeof o === 'object' && !Array.isArray(o)) ? o as Record<string, unknown> : null;
+  if (!r) throw new Error(`${OAUTH1_SHAPE}, and it is stored as something else`);
+  const known = new Set(OAUTH1_ROLES.flatMap(([, names]) => names));
+  const unknown = Object.keys(r).filter((k) => !known.has(k));
+  // Counted, never named: a stray field name could itself be a secret pasted in the wrong place.
+  if (unknown.length) throw new Error(`${OAUTH1_SHAPE}; it has ${unknown.length} field${unknown.length === 1 ? '' : 's'} that do${unknown.length === 1 ? 'es' : ''} not belong`);
+  const out: Partial<OAuth1Value> = {};
+  for (const [role, names] of OAUTH1_ROLES) {
+    const present = names.filter((n) => n in r);
+    if (present.length === 0) throw new Error(`${OAUTH1_SHAPE}; ${names[0]} is missing`);
+    if (present.length > 1) throw new Error(`${OAUTH1_SHAPE}; ${present.join(' and ')} are the same value stored twice`);
+    const val = r[present[0]];
+    // No quote or backslash either: a reply that is not JSON could carry a secret in its escaped
+    // spelling, which no scrub of the plain one would catch (round 1, B4). No service issues them.
+    if (typeof val !== 'string' || !/^[\x21\x23-\x5b\x5d-\x7e]{1,512}$/.test(val)) {
+      throw new Error(`${OAUTH1_SHAPE}; ${present[0]} must be text with no spaces, quotes or backslashes`);
+    }
+    out[role] = val;
+  }
+  return out as OAuth1Value;
 }
 
 /**
@@ -226,7 +332,23 @@ export interface StampResult {
  * would send a stamp the service rejects, or worse, one it accepts for a key nobody meant
  * (round 1, F1).
  */
-export function parseStampedValue(value: string): { id?: string; secret: string } {
+/**
+ * Does this value look like OAuth 1.0a's keys — a consumer secret and a token secret, by any of
+ * their names? Then it is not a bearer token: sent whole it is refused by every service, and it
+ * sends both secrets (round 1, B1 — the X entry that 1.0's migration made a bearer key did exactly
+ * that). Recognised, not validated: a bundle with one bad value is still a bundle, and must not
+ * fall back to being sent whole because it would not sign (round 2, F2).
+ */
+export function looksLikeOAuth1Value(value: string): boolean {
+  const has = (names: readonly string[]) => names.some((n) => value.includes(`"${n}"`));
+  return has(OAUTH1_ROLES[1][1]) && has(OAUTH1_ROLES[3][1]);
+}
+
+export function parseStampedValue(value: string, recipe?: Recipe): StampedValue {
+  if (recipe && 'builtin' in recipe && recipe.builtin === 'oauth1') {
+    const o = parseOAuth1Value(value);
+    return { secret: o.consumer_secret, oauth1: o };
+  }
   const v = value.trim();
   if (!v.startsWith('{')) return { secret: value };
   let o: unknown;
@@ -389,10 +511,105 @@ function awsSign(recipe: AwsRecipe, img: RequestImage, keyId: string, secret: st
 }
 
 /**
+ * Form-style pairs (`+` is a space, `%XX` a UTF-8 byte), as OAuth 1.0a reads a query or a
+ * form body. A malformed escape is refused: the broker and the service would disagree about
+ * what was signed (SPEC-oauth1 §6).
+ */
+function formPairs(s: string, where: string): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  for (const seg of s.split('&')) {
+    if (!seg) continue;
+    const i = seg.indexOf('=');
+    const raw = i < 0 ? [seg, ''] : [seg.slice(0, i), seg.slice(i + 1)];
+    const [k, v] = raw.map((x) => {
+      try { return decodeURIComponent(x.replace(/\+/g, ' ')); } catch {
+        throw new Error(`the ${where} has a malformed % escape, so it cannot be signed`);
+      }
+    });
+    if (/^oauth_/i.test(k)) throw new Error(`the ${where} carries ${k.slice(0, 40)}; OAuth parameters go in the Authorization header, which the broker writes`);
+    out.push([k, v]);
+  }
+  return out;
+}
+
+export interface OAuth1Input {
+  method: string;
+  scheme: 'https' | 'http';
+  host: string;
+  port: number;
+  /** Wire path, without the query. */
+  path: string;
+  /** Wire query, without the `?`. */
+  query: string;
+  /** The body, when it is application/x-www-form-urlencoded; otherwise undefined. */
+  form?: string;
+  /** The oauth_* parameters, without oauth_signature. */
+  oauth: Record<string, string>;
+  consumerSecret: string;
+  tokenSecret: string;
+  alg: 'HMAC-SHA1' | 'HMAC-SHA256';
+}
+
+/** RFC 5849 §3.4: the signature base string and the signature over it. */
+export function oauth1Sign(input: OAuth1Input): { base: string; signature: string } {
+  const defaultPort = input.scheme === 'https' ? 443 : 80;
+  const uri = `${input.scheme}://${input.host.toLowerCase()}${input.port === defaultPort ? '' : `:${input.port}`}${input.path || '/'}`;
+  const pairs: Array<[string, string]> = [
+    ...Object.entries(input.oauth),
+    ...formPairs(input.query, 'query'),
+    ...(input.form !== undefined ? formPairs(input.form, 'form body') : []),
+  ].map(([k, v]) => [uriEncode(k), uriEncode(v)]);
+  pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+  const params = pairs.map(([k, v]) => `${k}=${v}`).join('&');
+  const base = [input.method.toUpperCase(), uriEncode(uri), uriEncode(params)].join('&');
+  // The two secrets' only appearance: the HMAC key.
+  const key = `${uriEncode(input.consumerSecret)}&${uriEncode(input.tokenSecret)}`;
+  const signature = createHmac(input.alg === 'HMAC-SHA1' ? 'sha1' : 'sha256', key).update(base).digest('base64');
+  return { base, signature };
+}
+
+function oauth1Stamp(recipe: OAuth1Recipe, img: RequestImage, v: OAuth1Value, now: Date, nonce: () => string): StampResult {
+  const ct = (img.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+  const oauth: Record<string, string> = {
+    oauth_consumer_key: v.consumer_key,
+    oauth_nonce: nonce(),
+    oauth_signature_method: recipe.signature_method,
+    oauth_timestamp: String(Math.floor(now.getTime() / 1000)),
+    oauth_token: v.token,
+    oauth_version: '1.0',
+  };
+  const { signature } = oauth1Sign({
+    method: img.method, scheme: 'https', host: img.host, port: img.port ?? 443, path: img.path, query: img.query,
+    form: ct === 'application/x-www-form-urlencoded' && img.body !== undefined ? img.body : undefined,
+    oauth, consumerSecret: v.consumer_secret, tokenSecret: v.token_secret, alg: recipe.signature_method,
+  });
+  const fields = { ...oauth, oauth_signature: signature };
+  const header = 'OAuth ' + [
+    ...(recipe.realm ? [`realm="${recipe.realm}"`] : []),
+    ...Object.keys(fields).sort().map((k) => `${k}="${uriEncode(fields[k as keyof typeof fields])}"`),
+  ].join(', ');
+  return {
+    headers: { authorization: header },
+    query: [],
+    stamp: signature,
+    scrub: [v.consumer_secret, v.token_secret, `${uriEncode(v.consumer_secret)}&${uriEncode(v.token_secret)}`],
+  };
+}
+
+/** 32 hex characters from the CSPRNG, new for every request. */
+function freshNonce(): string {
+  return randomBytes(16).toString('hex');
+}
+
+/**
  * Compute the stamp for one request. The ONLY function here that receives the secret, and
  * it uses it as a MAC key and nothing else.
  */
-export function computeStamp(recipe: Recipe, img: RequestImage, value: { id?: string; secret: string }, now = new Date()): StampResult {
+export function computeStamp(recipe: Recipe, img: RequestImage, value: StampedValue, now = new Date(), nonce: () => string = freshNonce): StampResult {
+  if ('builtin' in recipe && recipe.builtin === 'oauth1') {
+    if (!value.oauth1) throw new Error(OAUTH1_SHAPE);
+    return oauth1Stamp(recipe, img, value.oauth1, now, nonce);
+  }
   if ('builtin' in recipe) {
     if (!value.id) throw new Error('AWS signing needs the access key id: store the entry as {"id": "AKIA…", "secret": "…"}');
     return awsSign(recipe, img, value.id, value.secret, now);

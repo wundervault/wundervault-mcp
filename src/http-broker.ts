@@ -320,7 +320,7 @@ export async function performOperation(
     const q = path.indexOf('?');
     const img: RequestImage = {
       method: def.route.method, host, path: q < 0 ? path : path.slice(0, q), query: q < 0 ? '' : path.slice(q + 1),
-      body, headers: Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v])),
+      body, headers: Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v])), port,
     };
     let st: StampResult;
     try { st = stamper(img); } catch (e) {
@@ -335,6 +335,8 @@ export async function performOperation(
     // (a query placement travels encoded; base64's + / = change) (round 1, F3).
     const enc = encodeURIComponent(st.stamp);
     forms.push(st.stamp, enc, enc.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()));
+    // A built-in that holds more than one secret (OAuth 1.0a) names the rest, in every spelling.
+    for (const extra of st.scrub ?? []) forms.push(...secretForms(def.credential_binding, extra));
   } else if (def.credential_binding.in === 'path') {
     // Checked again here, beside the only line that puts the key in the address: the
     // broker checks before it records or asks for approval, and this must not depend on it.

@@ -4,6 +4,45 @@ Changes to `@wundervault/mcp-server`: the MCP server, the broker (`wundervault-a
 installers. The full history, with the website's changes beside it, is at
 <https://wundervault.com/changelog>.
 
+## [2.1.0] — 2026-10-29
+
+### Security
+
+- **Reinstalling the broker keeps root's writes inside root's own folders.** The installers create
+  the broker's keys in a folder only root can enter and move them into place in one step, so a link
+  left where a key belongs is refused or replaced, never followed. On a Mac, `/var/lib/wundervault`
+  now belongs to root (the broker only passes through it), so its `state` and `run` folders cannot be
+  swapped before an install runs, and an access list left on it is removed. On Linux, an empty key file,
+  or a folder where a key belongs, is no longer taken for a key. A state folder mounted on its own is
+  refused, because keys could not be moved into it in one step.
+- **The fix for an exposed sudo no longer opens an editor as root.** When sudo on your computer looks
+  commands up in a folder your account can change, the installers now print four commands that add
+  the safe `secure_path` line, each naming its tool by full path, and check the file before sudo
+  reads it. The old advice, `visudo -f`, starts an editor as root, and which editor can come from the
+  very settings that are exposed.
+
+### Fixed
+
+- **Linux `--uninstall` waits for the broker to stop**, for up to 15 seconds, and removes the service
+  only once systemd says it has. If it is still running, or systemd does not answer, nothing is
+  removed, and you are told what to run. The Mac's uninstall has worked this way since 2.0.2.
+- **The pairing hint is quicker on a slow disk.** Working out which `node` and broker to print checks
+  each folder once, within five seconds in all.
+
+### Added
+
+- **Signed requests for X and other OAuth 1.0a services.** A secret marked "stamped" can now hold
+  the four values X gives you (API key and secret, access token and secret), stored together as
+  `{"api_key": "…", "api_secret": "…", "access_token": "…", "access_token_secret": "…"}`. Agents ask
+  for `request.stamp: {"builtin": "oauth1"}` and the broker signs every request itself, with a
+  fresh one-time code and the current time, so you approve it once per address and each later post
+  goes through. The same option works for Tumblr and Flickr, and, with HMAC-SHA256 and a realm, for
+  NetSuite. None of the four values reaches the agent, and the two secret ones are removed from
+  anything the service sends back.
+- **Those four values are never sent as one token.** A secret holding them that is still set to
+  "Bearer token" — which is how 1.0's upgrade left an X key saved before it — is now refused with a
+  note to switch it to "Signed requests", instead of being sent whole to the service.
+
 ## [2.0.3] — 2026-10-28
 
 ### Security

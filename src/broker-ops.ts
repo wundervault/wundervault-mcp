@@ -61,7 +61,7 @@ import type { VaultEntry } from './types.js';
 import { bindingFromExecConfig, looksLikePrivateKey, validateAgentHeaders, pathBindingProblem } from './delivery.js';
 import { renderDetail } from './render.js';
 import { SigningState } from './wallet.js';
-import { validateRecipe, recipeSha256, describeRecipe, computeStamp, parseStampedValue, type Recipe } from './stamp.js';
+import { validateRecipe, recipeSha256, describeRecipe, computeStamp, parseStampedValue, looksLikeOAuth1Value, type Recipe, type StampedValue } from './stamp.js';
 import { pay as payOp, sign as signOp, approveStamp, type Deps, type PayResult } from './signing-ops.js';
 import type { ActivityRecord } from './activity-log.js';
 import type { AnchorClient } from './activity-anchor.js';
@@ -345,6 +345,12 @@ export class BrokerOps {
           + 'Nothing was sent. If it is an SSH key, the owner can set it to SSH (with the servers '
           + 'it may sign in to) in the dashboard, and then use vault_ssh_exec.', 'WRONG_KIND');
       }
+      if (!stampRecipe && looksLikeOAuth1Value(secret)) {
+        return err('Refused: this entry holds OAuth 1.0a keys (X and others: an API key and secret, an access '
+          + 'token and secret), which are never sent as they are: the service would refuse them, and both '
+          + 'secrets would go with them. Nothing was sent. The owner can set this entry to "Signed requests" '
+          + 'in the dashboard; then call again with request.stamp {"builtin": "oauth1"}.', 'WRONG_KIND');
+      }
 
       let def;
       let label: string;
@@ -453,11 +459,11 @@ export class BrokerOps {
         noticeForAgent = notice.toolNote;
       }
 
-      // A stamped entry may hold {"id", "secret"}; only the secret is a MAC key, and only
-      // the secret is scrubbed (the id is sent in the clear by design).
-      let stamped: { id?: string; secret: string } | null = null;
+      // A stamped entry may hold {"id", "secret"}, or OAuth 1.0a's four values; only the
+      // secrets are MAC keys, and only they are scrubbed (ids are sent in the clear by design).
+      let stamped: StampedValue | null = null;
       if (stampRecipe) {
-        try { stamped = parseStampedValue(secret); } catch (e) {
+        try { stamped = parseStampedValue(secret, stampRecipe); } catch (e) {
           return err(`Refused: ${(e as Error).message}. Nothing was sent. The owner can fix it in the dashboard.`, 'WRONG_KIND');
         }
       }

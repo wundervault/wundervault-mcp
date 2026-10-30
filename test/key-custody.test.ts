@@ -417,6 +417,46 @@ describe('a brokered call keeps the credential', () => {
     }
   }, 20_000);
 
+  it('never sends OAuth 1.0a keys as one bearer token (SPEC-oauth1, round 1 B1)', async () => {
+    // The X entry 1.0's migration made a bearer key: the broker sent its whole JSON as
+    // "Authorization: Bearer {…}", which X refused and which carried both secrets.
+    let sent = 0;
+    vi.doMock('../src/http-broker.js', async (importOriginal) => {
+      const real = await importOriginal<typeof import('../src/http-broker.js')>();
+      return { ...real, performOperation: async () => { sent += 1; return { ok: true, status: 200, body: {} }; } };
+    });
+    const { AgentDaemon: Mocked } = await import('../src/agent.js');
+    const d: any = new Mocked();
+    d.registerProfile({
+      agent_name: 'D', api_key: 'wv_agent_D|secret-api-key', enc_key: ENC_KEY_B64,
+      vault_url: baseUrl, socket_token: TOKEN,
+    });
+    d.start();
+    const four = JSON.stringify({ api_key: 'ck-PUB', api_secret: 'cs-HIDDEN-1', access_token: '9-tok', access_token_secret: 'ts-HIDDEN-2' });
+    // round 2, F2: one that would not sign (a trailing space) is still never sent whole
+    const broken = JSON.stringify({ api_key: 'ck-PUB', api_secret: 'cs-HIDDEN-1 ', access_token: '9-tok', access_token_secret: 'ts-HIDDEN-2' });
+    SECRETS.ox1 = { mode: 'BROKER_HTTP', value: four };
+    try {
+      for (const [value, binding] of [[four, undefined], [four, { in: 'header', name: 'authorization', template: 'Bearer {secret}' }],
+        [four, { in: 'query', name: 'k', template: '{secret}' }], [broken, undefined]] as const) {
+        SECRETS.ox1.value = value;
+        SECRETS.ox1.cfg = binding ? { delivery: 'http', credential_binding: binding } : undefined;
+        const r = await speak(path.join(dir, 'run', 'D.sock'), {
+          token: TOKEN, op: 'call', entry_id: 'ox1', purpose: 'post',
+          request: { origin: { scheme: 'https', host: 'api.x.com', port: 443 }, method: 'POST', path: '/2/tweets', body: { text: 'hi' } },
+        });
+        expect(r.json.code).toBe('WRONG_KIND');
+        expect(r.raw).toMatch(/Signed requests/);
+        for (const v of ['cs-HIDDEN-1', 'ts-HIDDEN-2']) expect(r.raw).not.toContain(v);
+      }
+      expect(sent).toBe(0);
+    } finally {
+      delete SECRETS.ox1;
+      try { d.shutdown(); } catch { /* already down */ }
+      vi.doUnmock('../src/http-broker.js');
+    }
+  }, 20_000);
+
   it('carries no plaintext on the refusal paths either', async () => {
     // The paths where a naive implementation leaks: the broker is holding the decrypted
     // credential when each of these fails, and the temptation is to include context.

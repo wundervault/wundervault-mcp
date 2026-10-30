@@ -21,6 +21,30 @@ export function aclMayAllowChange(q: string, platform: NodeJS.Platform = process
 }
 
 /**
+ * aclMayAllowChange for one message, with memory and a deadline (2.0.3 review round 5, B2). The
+ * paths a hint checks share most of their folders (/, /usr, /usr/local), so each is asked once;
+ * and every `ls` gets only what is left of `budgetMs`, so a hung mount delays the message by the
+ * budget at most — not five seconds per folder per candidate. Past the deadline a folder not yet
+ * asked counts as "may", as for any `ls` that cannot answer: a command is only offered to sudo when
+ * it is proven. Elapsed time is monotonic, so a clock correction cannot stretch it (review round 2, B3).
+ */
+export function aclChecker(budgetMs = 5000, now: () => number = () => performance.now(),
+                           ask: (q: string, timeoutMs: number) => boolean = (q, timeoutMs) => aclMayAllowChange(q, process.platform,
+                             (args) => execFileSync('/bin/ls', args, { encoding: 'utf8', timeout: timeoutMs }))): (q: string) => boolean {
+  const seen = new Map<string, boolean>();
+  const deadline = now() + budgetMs;
+  return (q) => {
+    const known = seen.get(q);
+    if (known !== undefined) return known;
+    const left = deadline - now();
+    // Whole milliseconds: execFileSync refuses a fractional timeout, and that refusal reads as "may".
+    const r = left < 1 ? true : ask(q, Math.floor(Math.min(5000, left)));
+    seen.set(q, r);
+    return r;
+  };
+}
+
+/**
  * True when `p` can be changed only by root: every folder from `/` down, every symbolic link on the
  * way (followed where it leads; the folder it sits in is what counts), and the file itself are
  * owned by root, writable by no one else, and carry no access control list that lets anyone else
@@ -57,6 +81,12 @@ export function rootOnly(p: string,
   } catch { return false; }
 }
 
+/** rootOnly for every path one message checks, sharing one aclChecker (its memory and its deadline). */
+export function rootOnlyForOneMessage(budgetMs = 5000): (p: string) => boolean {
+  const acl = aclChecker(budgetMs);
+  return (p) => rootOnly(p, undefined, undefined, acl);
+}
+
 /** Where a node only root can change is usually found, after the one running now. */
 const NODE_CANDIDATES = ['/usr/local/bin/node', '/usr/bin/node', '/opt/wundervault/bin/node'];
 
@@ -78,7 +108,7 @@ const NODE_CANDIDATES = ['/usr/local/bin/node', '/usr/bin/node', '/opt/wundervau
 export function agentCommand(argv1: string | undefined = process.argv[1],
                              exists: (p: string) => boolean = existsSync,
                              runningNode: string = process.execPath,
-                             isRootOnly: (p: string) => boolean = rootOnly): string | null {
+                             isRootOnly: (p: string) => boolean = rootOnlyForOneMessage()): string | null {
   const quote = (p: string) => (/^[A-Za-z0-9_./@+-]+$/.test(p) ? p : `'${p.replace(/'/g, `'\\''`)}'`);
   if (!argv1 || !path.isAbsolute(argv1)) return null;
   let launcher = argv1;

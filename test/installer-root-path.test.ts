@@ -10,7 +10,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { agentCommand, rootOnly, sudoHint, aclMayAllowChange } from '../src/launcher.js';
+import { agentCommand, rootOnly, sudoHint, aclMayAllowChange, aclChecker, rootOnlyForOneMessage } from '../src/launcher.js';
 
 const ROOT = path.resolve(__dirname, '..');
 const SCRIPTS = {
@@ -316,11 +316,13 @@ describe('package_scan', () => {
 describe('the sudo PATH warning', () => {
   for (const which of ['linux', 'macos'] as const) {
     /** Run sudo_path_check + sudo_path_warning with USER_PATH and SUDO_UID as given. */
-    const check = (userPath: string, sudoUid = '501') => {
+    const check = (userPath: string, sudoUid = '501', sudoers = '') => {
       const text = fs.readFileSync(SCRIPTS[which].file, 'utf8');
       const fns = between(text, '# >>> root-only chain', '# <<< root-only chain') + '\n' + between(text, '# >>> sudo path check', '# <<< sudo path check');
       const f = path.join(tmp, 'sudocheck.sh');
-      fs.writeFileSync(f, `${fns}\nUSER_PATH='${userPath}'\nSUDO_UID='${sudoUid}'\nsudo_path_check\nsudo_path_warning\necho "BAD=$SUDO_PATH_BAD"\n`);
+      const sf = path.join(tmp, 'sudoers');
+      fs.writeFileSync(sf, sudoers);
+      fs.writeFileSync(f, `${fns}\nSUDOERS_FILE='${sf}'\nUSER_PATH='${userPath}'\nSUDO_UID='${sudoUid}'\nsudo_path_check\nsudo_path_warning\necho "BAD=$SUDO_PATH_BAD"\n`);
       return spawnSync('/bin/sh', ['-eu', f], { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
     };
     it(`${which}: warns, naming the folder and the exact secure_path line, when sudo's PATH has a folder a user owns`, () => {
@@ -330,6 +332,37 @@ describe('the sudo PATH warning', () => {
       expect(r.stderr).toMatch(/WARNING: sudo on this computer looks commands up in a folder someone other than root can change/);
       expect(r.stderr).toMatch(/Defaults secure_path="[^"]*\/usr\/bin[^"]*"/);
       expect(r.stderr).not.toContain(`secure_path="${brew}`);
+    });
+    it(`${which}: prints steps that never open an editor as root, and they work`, () => {
+      const brew = path.join(tmp, 'hb'); fs.mkdirSync(brew);
+      const r = check(`${brew}:/usr/bin:/bin`, '501', 'root ALL=(ALL) ALL\n#includedir /etc/sudoers.d\n');
+      expect(r.stderr).not.toMatch(/visudo -f|visudo\s*$/m);
+      const steps = r.stderr.split('\n').filter((l) => /^  (sudo |printf )/.test(l)).map((l) => l.trim());
+      expect(steps).toHaveLength(4);
+      expect(steps[3]).toMatch(/^sudo \/usr\/sbin\/visudo -cf \/etc\/sudoers\.d\/secure_path\.new && sudo \/bin\/mv /);
+      // Every tool is named by its full path.
+      for (const l of steps) for (const m of l.matchAll(/(?:^|\s)sudo (\S+)/g)) expect(m[1].startsWith('/')).toBe(true);
+      // Run them as this user, into a folder standing in for /etc/sudoers.d.
+      const d = path.join(tmp, 'sudoers.d');
+      const script = steps.map((l) => l.replace(/\/etc\/sudoers\.d/g, d).replace(/(^|[\s|&]) ?sudo /g, '$1')).join('\n');
+      const hasVisudo = fs.existsSync('/usr/sbin/visudo');
+      const ran = spawnSync('/bin/sh', ['-c', hasVisudo ? script : script.replace(/\/usr\/sbin\/visudo -cf \S+ && /, '')], { encoding: 'utf8' });
+      expect(ran.status, ran.stderr).toBe(0);
+      expect(fs.readFileSync(path.join(d, 'secure_path'), 'utf8')).toMatch(/^Defaults secure_path="[^"]*\/usr\/bin[^"]*"\n$/);
+      expect(fs.statSync(path.join(d, 'secure_path')).mode & 0o777).toBe(0o440);
+      expect(fs.existsSync(path.join(d, 'secure_path.new'))).toBe(false);
+    });
+    it(`${which}: knows a sudo that reads /etc/sudoers.d by either spelling, and says so when it does not`, () => {
+      const brew = path.join(tmp, 'hb2'); fs.mkdirSync(brew);
+      expect(check(`${brew}:/usr/bin`, '501', '@includedir /private/etc/sudoers.d\n').stderr).toMatch(/these four commands/);
+      // installer review r1, F3: a quoted path, and a trailing slash, are the same folder
+      expect(check(`${brew}:/usr/bin`, '501', '@includedir "/etc/sudoers.d"\n').stderr).toMatch(/these four commands/);
+      expect(check(`${brew}:/usr/bin`, '501', '#includedir /etc/sudoers.d/\n').stderr).toMatch(/these four commands/);
+      expect(check(`${brew}:/usr/bin`, '501', '#includedir "/etc/sudoers.d\n').stderr).not.toMatch(/these four commands/);
+      expect(check(`${brew}:/usr/bin`, '501', '#includedir /etc/sudoers.d.old\n').stderr).not.toMatch(/these four commands/);
+      const none = check(`${brew}:/usr/bin`, '501', 'root ALL=(ALL) ALL\n#includedir /etc/other.d\n').stderr;
+      expect(none).not.toMatch(/these four commands/);
+      expect(none).toMatch(/does not read \/etc\/sudoers\.d/);
     });
     it(`${which}: says nothing when sudo's PATH is root-only, or when not run through sudo`, () => {
       expect(check('/usr/bin:/bin').stderr).toBe('');
@@ -448,5 +481,131 @@ describe('messages name a node and a broker that only root can change', () => {
     const none = sudoHint('--pair', null);
     expect(none).toMatch(/full paths of node and of the broker your installer set up/);
     expect(none).not.toMatch(/sudo wundervault-agent/);
+  });
+});
+
+describe('the ACL check behind a sudo hint is asked once per folder, within a time limit (2.0.3 review r5, B2)', () => {
+  it('a folder shared by several candidates is asked once', () => {
+    const asked: string[] = [];
+    const acl = aclChecker(5000, () => 0, (q) => { asked.push(q); return false; });
+    for (const q of ['/', '/usr', '/usr/local', '/', '/usr', '/usr/bin']) acl(q);
+    expect(asked).toEqual(['/', '/usr', '/usr/local', '/usr/bin']);
+  });
+  it('each ls gets only what is left of the budget, and past it every answer is "may"', () => {
+    let t = 0;
+    const timeouts: number[] = [];
+    const acl = aclChecker(5000, () => t, (_q, timeoutMs) => { timeouts.push(timeoutMs); t += timeoutMs; return false; });
+    expect(acl('/a')).toBe(false);     // a hung ls: uses the whole 5 s
+    expect(acl('/b')).toBe(true);      // nothing left: "may", and ls is not run
+    expect(acl('/c')).toBe(true);
+    expect(timeouts).toEqual([5000]);
+    let u = 0;
+    const slow = aclChecker(5000, () => u, (_q, timeoutMs) => { timeouts.push(timeoutMs); u += 3000; return false; });
+    slow('/x'); slow('/y'); slow('/z');
+    expect(timeouts.slice(1)).toEqual([5000, 2000]); // the second gets what is left; the third is not asked
+  });
+  it('a real lookup still works through the shared checker', () => {
+    expect(rootOnlyForOneMessage()('/usr/bin/env')).toBe(true);
+    expect(rootOnlyForOneMessage()('relative/x')).toBe(false);
+  });
+});
+
+describe('keys reach the broker-owned state folder by rename, never by writing through a name (2.0.3 review r4, B2)', () => {
+  const placeFile = (which: 'linux' | 'macos') =>
+    between(fs.readFileSync(SCRIPTS[which].file, 'utf8'), '# >>> place file', '# <<< place file');
+  const which = process.platform === 'darwin' ? 'macos' : 'linux';
+  /** Run place_file from the installer for this platform; `noCheck` stands in for a link planted AFTER the check. */
+  const place = (src: string, dest: string, noCheck = false) => {
+    const f = path.join(tmp, 'place.sh');
+    fs.writeFileSync(f, `${placeFile(which)}\n${noCheck ? 'refuse_symlink() { :; }\n' : ''}place_file '${src}' '${dest}'\n`);
+    return spawnSync('/bin/sh', ['-eu', f], { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
+  };
+  let src = '';
+  let state = '';
+  let outside = '';
+  beforeEach(() => {
+    state = path.join(tmp, 'state'); fs.mkdirSync(state);
+    outside = path.join(tmp, 'outside'); fs.mkdirSync(outside);
+    src = path.join(tmp, 'made'); fs.writeFileSync(src, 'KEY');
+  });
+  it('a plain destination gets the file', () => {
+    expect(place(src, path.join(state, 'k')).status).toBe(0);
+    expect(fs.readFileSync(path.join(state, 'k'), 'utf8')).toBe('KEY');
+  });
+  it('a link already there is refused, and what it points at is untouched', () => {
+    fs.symlinkSync(path.join(outside, 'victim'), path.join(state, 'k'));
+    const r = place(src, path.join(state, 'k'));
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/is a symbolic link/);
+    expect(fs.existsSync(path.join(outside, 'victim'))).toBe(false);
+  });
+  it('a folder with something in it is refused too', () => {
+    fs.mkdirSync(path.join(state, 'k')); fs.writeFileSync(path.join(state, 'k', 'x'), 'x');
+    expect(place(src, path.join(state, 'k')).status).toBe(1);
+  });
+  it('a folder there is refused', () => {
+    fs.mkdirSync(path.join(state, 'k'));
+    expect(place(src, path.join(state, 'k')).status).toBe(1);
+  });
+  it('a link planted after the check is REPLACED by the rename, never followed', () => {
+    fs.symlinkSync(path.join(outside, 'victim'), path.join(state, 'k'));       // dangling: would be created
+    expect(place(src, path.join(state, 'k'), true).status).toBe(0);
+    expect(fs.lstatSync(path.join(state, 'k')).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(path.join(state, 'k'), 'utf8')).toBe('KEY');
+    expect(fs.existsSync(path.join(outside, 'victim'))).toBe(false);
+    fs.writeFileSync(src, 'KEY2');
+    fs.symlinkSync(outside, path.join(state, 'd'));                            // to a folder: would move inside it
+    expect(place(src, path.join(state, 'd'), true).status).toBe(0);
+    expect(fs.lstatSync(path.join(state, 'd')).isSymbolicLink()).toBe(false);
+    expect(fs.readdirSync(outside)).toEqual([]);
+  });
+  for (const w of ['linux', 'macos'] as const) {
+    it(`${w}: every key is made in the root-only folder and placed with place_file`, () => {
+      const text = fs.readFileSync(SCRIPTS[w].file, 'utf8');
+      expect(text).not.toMatch(/-out "\$BROKER_KEY"|of="\$STORE_KEY"|- "\$SEALED_KEY"/);
+      expect(text).toMatch(/place_file "\$MAKE_DIR\/broker-key\.pem" "\$BROKER_KEY"/);
+      expect(text).toMatch(w === 'linux' ? /place_file "\$MAKE_DIR\/store\.key\.cred" "\$SEALED_KEY"/
+        : /place_file "\$MAKE_DIR\/store\.key" "\$STORE_KEY"/);
+      // chown of a key happens only in MAKE_DIR, before it is placed
+      expect(text).not.toMatch(/chown "\$\{ACCOUNT\}:[^"]*" "\$(BROKER_KEY|STORE_KEY|SEALED_KEY)"/);
+    });
+  }
+  for (const w of ['linux', 'macos'] as const) {
+    it(`${w}: refuses a state folder on another file system before any key is made (installer review r1, B1)`, () => {
+      const text = fs.readFileSync(SCRIPTS[w].file, 'utf8');
+      const fsCheck = text.indexOf(w === 'linux' ? 'if ! same_mount "$MAKE_DIR" "$STATE_DIR"; then' : `stat -f '%d' "$MAKE_DIR"`);
+      expect(fsCheck).toBeGreaterThan(text.indexOf('MAKE_DIR=$(mktemp -d'));
+      expect(fsCheck).toBeLessThan(text.indexOf('openssl genpkey'));
+    });
+  }
+  it('linux: only a non-empty regular file is reused as a key; a folder is refused (installer review r1 B4, r2 F1)', () => {
+    const text = fs.readFileSync(SCRIPTS.linux.file, 'utf8');
+    for (const k of ['BROKER_KEY', 'SEALED_KEY']) {
+      const reuse = text.indexOf(`if [ -f "$${k}" ] && [ -s "$${k}" ]; then`);
+      expect(reuse, k).toBeGreaterThan(0);
+      const folder = text.indexOf(`refuse_folder "$${k}"`);
+      expect(folder, k).toBeGreaterThan(0);
+      expect(folder).toBeLessThan(reuse);
+    }
+  });
+  it('linux: the service is given the sealed key only when it has something in it (installer review r2, F2)', () => {
+    const text = fs.readFileSync(SCRIPTS.linux.file, 'utf8');
+    expect(text).toContain(`if [ ! -s "$SEALED_KEY" ]; then\n  sed -i '/^LoadCredentialEncrypted=wv-store-key:/d' "$UNIT_PATH"`);
+    expect(text).not.toMatch(/if \[ ! -f "\$SEALED_KEY" \]|if \[ -f "\$SEALED_KEY" \] && systemctl/);
+  });
+  it('linux: the same-file-system check compares the mount point too (installer review r2, B1)', () => {
+    const text = fs.readFileSync(SCRIPTS.linux.file, 'utf8');
+    expect(text).toContain('if ! same_mount "$MAKE_DIR" "$STATE_DIR"; then');
+    expect(text).toContain(`findmnt -n -o TARGET --target "$1"`);   // round 3, F1: stat's %m cannot see a bind mount
+  });
+  it('macos: the top folder is taken back by root before anything in it is touched', () => {
+    const text = fs.readFileSync(SCRIPTS.macos.file, 'utf8');
+    const at = (s: string) => { const i = text.indexOf(s); expect(i, s).toBeGreaterThan(0); return i; };
+    expect(at('chown root:wheel "$BASE_DIR"')).toBeLessThan(at('chmod -N "$BASE_DIR"'));
+    // installer review r1, F1: an access list the account gave itself survives a chown; it goes first
+    expect(at('chmod -N "$BASE_DIR"')).toBeLessThan(at('ls -lde "$BASE_DIR"'));
+    expect(at('ls -lde "$BASE_DIR"')).toBeLessThan(at('refuse_symlink "$STATE_DIR"'));
+    expect(at('refuse_symlink "$STATE_DIR"')).toBeLessThan(at('mkdir -p "$STATE_DIR" "$RUN_DIR"'));
+    expect(text).not.toMatch(/chown "\$\{ACCOUNT\}:\$\{ACCOUNT\}" "\$BASE_DIR"/);
   });
 });
