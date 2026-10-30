@@ -1,6 +1,7 @@
 import { createDecipheriv, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 export type OrderState = 'received' | 'refused' | 'working' | 'installed' |
   'rolled back' | 'rollback failed' | 'failed';
@@ -229,7 +230,10 @@ async function relay(d: BrokerUpdateDeps, state: PollState): Promise<void> {
   const status = value as Record<string, unknown>;
   if (typeof status.order_id !== 'string' || typeof status.state !== 'string' ||
       !relayStates.has(status.state) || typeof status.detail !== 'string') return;
-  const id = state.handedOver.get(status.order_id);
+  // After a restart (an update restarts the broker on purpose) the in-memory map is empty; an
+  // order this broker accepted is still in the persisted seen list, under the server's own id.
+  const id = state.handedOver.get(status.order_id) ??
+    (state.seen?.includes(status.order_id) ? status.order_id : undefined);
   if (id === undefined) return;
   const detail = status.detail.slice(0, 200);
   const pair = JSON.stringify([status.state, detail]);
@@ -264,6 +268,14 @@ export async function pollOnce(d: BrokerUpdateDeps): Promise<void> {
             await post(d, envelope.id, 'refused', 'replay');
             continue;
           }
+          // The browser names the order and the server files it under that same name, so the
+          // root updater's status file can be relayed by any later broker process — including the
+          // new version that the update itself started, which remembers nothing of this one.
+          if (opened.order.order_id !== envelope.id) {
+            await remember(d, state, [envelope.id]);
+            await post(d, envelope.id, 'refused', 'id mismatch');
+            continue;
+          }
           try {
             await writeRequest(d, opened.order);
           } catch {
@@ -287,6 +299,13 @@ export async function pollOnce(d: BrokerUpdateDeps): Promise<void> {
   } finally {
     state.running = false;
   }
+}
+
+/** Where the root updater's spool lives (SPEC-update-now U1). Fixed: never read from the environment. */
+export function updateSpoolDir(platform: NodeJS.Platform = process.platform): string | null {
+  if (platform === 'linux' || platform === 'darwin') return '/var/lib/wundervault-update';
+  if (platform === 'win32') return join(process.env.ProgramData ?? 'C:\\ProgramData', 'wundervault-update');
+  return null;
 }
 
 export function startPolling(

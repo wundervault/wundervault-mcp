@@ -17,7 +17,7 @@ function plaintext(overrides: Record<string, unknown> = {}): Record<string, unkn
     type: 'update',
     broker: 'broker-a',
     version: '2.2.0',
-    order_id: 'sealed-id',
+    order_id: 'server-id',
     issued_at: new Date(now).toISOString(),
     expires_at: new Date(now + 10 * 60_000).toISOString(),
     ...overrides,
@@ -42,7 +42,7 @@ describe('openOrder', () => {
 
   it('opens the WebCrypto ciphertext and tag layout', () => {
     expect(open(plaintext())).toEqual({
-      ok: true, order: { version: '2.2.0', order_id: 'sealed-id' },
+      ok: true, order: { version: '2.2.0', order_id: 'server-id' },
     });
   });
 
@@ -127,9 +127,9 @@ describe('broker update polling', () => {
     await pollOnce(d);
     expect(getOrders).toHaveBeenCalledWith('2.1.0');
     expect(await readFile(d.requestPath, 'utf8'))
-      .toBe('{"version":"2.2.0","order_id":"sealed-id"}');
+      .toBe('{"version":"2.2.0","order_id":"server-id"}');
     expect(postState).toHaveBeenCalledWith('server-id', 'received', '');
-    expect(JSON.parse(await readFile(d.seenPath, 'utf8'))).toEqual(['server-id', 'sealed-id']);
+    expect(JSON.parse(await readFile(d.seenPath, 'utf8'))).toEqual(['server-id']);
   });
 
   it('refuses an order sealed for another broker without touching the spool', async () => {
@@ -146,6 +146,22 @@ describe('broker update polling', () => {
     expect(postState).toHaveBeenCalledTimes(1);
     expect(postState).toHaveBeenCalledWith('server-id', 'refused', 'no key');
     expect(JSON.parse(await readFile(d.seenPath, 'utf8'))).toEqual(['server-id']);
+  });
+
+  it('refuses an order whose sealed id is not the id the server filed it under', async () => {
+    orders = [{ id: 'swapped-id', agent_id: 'agent-a', ...seal() }];   // sealed order_id is 'server-id'
+    await pollOnce(d);
+    expect(postState).toHaveBeenCalledWith('swapped-id', 'refused', 'id mismatch');
+    expect(await readFile(d.requestPath, 'utf8')).toBe('old contents');
+  });
+
+  it('relays the updater status from a NEW broker process (an update restarts it)', async () => {
+    await pollOnce(d);                      // the old broker accepts the order
+    const restarted: BrokerUpdateDeps = { ...d, client: { getOrders: vi.fn().mockResolvedValue({ orders: [] }), postState } };
+    await writeFile(d.statusPath, JSON.stringify({ order_id: 'server-id', state: 'installed', detail: '' }));
+    postState.mockClear();
+    await pollOnce(restarted);              // nothing in memory: only the persisted seen list
+    expect(postState).toHaveBeenCalledWith('server-id', 'installed', '');
   });
 
   it('rejects a replay under a new server id, including after restart', async () => {
@@ -190,7 +206,7 @@ describe('broker update polling', () => {
   it('relays status once per change with the server id and bounded detail', async () => {
     await pollOnce(d);
     postState.mockClear();
-    const status = { order_id: 'sealed-id', state: 'working', detail: 'downloading' };
+    const status = { order_id: 'server-id', state: 'working', detail: 'downloading' };
     await writeFile(d.statusPath, JSON.stringify(status));
     await pollOnce(d);
     await pollOnce(d);
@@ -210,9 +226,9 @@ describe('broker update polling', () => {
       '{',
       ' '.repeat(4097),
       JSON.stringify({ order_id: 'unknown', state: 'working', detail: '' }),
-      JSON.stringify({ order_id: 'sealed-id', state: 'received', detail: '' }),
-      JSON.stringify({ order_id: 'sealed-id', state: 'arbitrary', detail: '' }),
-      JSON.stringify({ order_id: 'sealed-id', state: 'working', detail: 123 }),
+      JSON.stringify({ order_id: 'server-id', state: 'received', detail: '' }),
+      JSON.stringify({ order_id: 'server-id', state: 'arbitrary', detail: '' }),
+      JSON.stringify({ order_id: 'server-id', state: 'working', detail: 123 }),
     ];
     for (const status of statuses) {
       await writeFile(d.statusPath, status);
@@ -224,7 +240,7 @@ describe('broker update polling', () => {
   it('swallows network errors and still relays status after a failed poll', async () => {
     await pollOnce(d);
     await writeFile(d.statusPath, JSON.stringify({
-      order_id: 'sealed-id', state: 'installed', detail: '',
+      order_id: 'server-id', state: 'installed', detail: '',
     }));
     getOrders.mockRejectedValue(new Error('offline'));
     postState.mockRejectedValueOnce(new Error('offline'));

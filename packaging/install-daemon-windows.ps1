@@ -104,6 +104,14 @@ if ($Uninstall) {
     Native schtasks @('/end', '/tn', $TaskName) -AllowFail | Out-Null
     Native schtasks @('/delete', '/tn', $TaskName, '/f') -AllowFail | Out-Null
     Say "task removed"
+    # The install root, the updater's task and the request spool (Update now): only what the
+    # layout's own manifest says it made.
+    if (Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'Wundervault\state\manifest.json')) {
+        & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoProfile -ExecutionPolicy Bypass `
+            -File (Join-Path $PSScriptRoot 'layout-windows.ps1') -Action uninstall
+        if ($LASTEXITCODE -ne 0) { Fail "removing $env:ProgramFiles\Wundervault failed (above); the broker task is already removed." }
+        Say "install root removed"
+    }
     Say "The account and $Base are LEFT IN PLACE on purpose: they hold your credentials."
     Say "Remove them deliberately when you have finished with them:"
     Say "  Remove-LocalUser $Account ; Remove-Item -Recurse -Force '$Base'"
@@ -433,12 +441,33 @@ if ($bit -match 'Protection\s+On') {
     Say "  something this installer can claim on your behalf."
 }
 
+# -- 5b. the install root (Update now) ------------------------------------------
+# From this version on the broker runs from $env:ProgramFiles\Wundervault: a copy per version
+# and bin\active.cmd naming the one that runs, so the SYSTEM updater task can install a signed
+# new version without this script, npm or an Administrator prompt (SPEC-update-now U1/U2). It
+# downloads nothing. The broker task below then runs bin\broker.cmd, which reads active.cmd.
+Step "Install root"
+$PkgRoot = Split-Path -Parent (Split-Path -Parent $AgentPath)
+$PkgVersion = (Get-Content -Raw -LiteralPath (Join-Path $PkgRoot 'package.json') | ConvertFrom-Json).version
+$LayoutOut = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoProfile -ExecutionPolicy Bypass `
+    -File (Join-Path $PSScriptRoot 'layout-windows.ps1') -Action install -Account $Account `
+    -NodePath $NodePath -PackageRoot $PkgRoot -Version $PkgVersion
+if ($LASTEXITCODE -ne 0) { Fail "setting up $env:ProgramFiles\Wundervault failed (above). Nothing about the running broker was changed." }
+$LayoutOut | ForEach-Object { Say $_ }
+$BrokerCmd = Join-Path $env:ProgramFiles 'Wundervault\bin\broker.cmd'
+if ((@($LayoutOut) | Select-Object -Last 1) -cne ('BROKER_CMD=' + $BrokerCmd)) {
+    Fail "the install root did not report the expected broker command. Refusing to continue."
+}
+
 # -- 6. the task ---------------------------------------------------------------
 Step "Scheduled task"
 Native schtasks @('/end', '/tn', $TaskName) -AllowFail | Out-Null
 Native schtasks @('/delete', '/tn', $TaskName, '/f') -AllowFail | Out-Null
 
-$action  = New-ScheduledTaskAction -Execute $NodePath -Argument "`"$AgentPath`""
+# Through cmd.exe and bin\broker.cmd, which names the version active.cmd points at -- so an
+# update switches the broker by replacing one file, never by editing this task.
+$action  = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\cmd.exe') `
+    -Argument ('/d /s /c ""{0}""' -f $BrokerCmd)
 $trigger = New-ScheduledTaskTrigger -AtStartup
 # NOT a New-ScheduledTaskPrincipal. Register-ScheduledTask's parameter sets put -Password
 # with -User, and passing it alongside -Principal fails with "Parameter set cannot be

@@ -124,6 +124,19 @@ export class BrokerOps {
   }
 
   /** This agent's route to the server's copy of the log's chain. */
+  /** Update now: this agent's route for the owner's update orders, and the key that opens them. */
+  orderRoute(): {
+    get(brokerVersion: string): ReturnType<AgentVaultAPI['getBrokerOrders']>;
+    post(id: string, state: string, detail: string): Promise<void>;
+    key(): Promise<Uint8Array>;
+  } {
+    return {
+      get: (v) => this.api.getBrokerOrders(v),
+      post: (id, state, detail) => this.api.postBrokerOrderState(id, state, detail),
+      key: () => this.api.ensureVaultKey(),
+    };
+  }
+
   anchorClient(): AnchorClient {
     const api = this.api;
     return {

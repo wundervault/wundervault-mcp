@@ -50,6 +50,8 @@ import {
   type Endpoint, type HelloSigner,
 } from './endpoint.js';
 import { loadOrCreateIdentity, logSignerFromIdentity, brokerPublicKeyObject } from './broker-key.js';
+import { startPolling, updateSpoolDir } from './broker-update.js';
+import type { OrderClient } from './broker-update.js';
 import { load as loadNetworkShape } from './network-store.js';
 import { BrokerOps, type ActivitySink } from './broker-ops.js';
 import { ActivityLog } from './activity-log.js';
@@ -715,6 +717,55 @@ class AgentDaemon {
     record: (r) => { if (this.activity.append(r)) this.anchorer.notify(); },
   };
   private dailyTimer: NodeJS.Timeout | null = null;
+
+  private updatePoller: { stop(): void } | null = null;
+
+  /**
+   * Update now (SPEC-update-now U5): fetch the owner's sealed update orders for this broker, and
+   * hand a checked one to the root updater. Only where the updater's spool exists — a machine
+   * installed before Update now has none, and nothing here may create it (root does that).
+   * Each account's orders are fetched with that account's own agent, so the agent named on an
+   * order is one whose key this broker holds.
+   */
+  private startUpdateOrders(): void {
+    const spool = updateSpoolDir();
+    if (!spool || !fs.existsSync(path.join(spool, 'request.json'))) return;
+    let fingerprint: string;
+    try { fingerprint = loadOrCreateIdentity().fingerprint; } catch { return; }
+    type Route = ReturnType<BrokerOps['orderRoute']>;
+    const routes = (): Route[] => this.profiles
+      .filter((p) => !!p.socket_token)
+      .map((p) => { try { return this.opsFor(p).orderRoute(); } catch { return null; } })
+      .filter((r): r is Route => r !== null);
+    const byAgent = new Map<string, Route>();
+    const client: OrderClient = {
+      getOrders: async (version) => {
+        const orders: Awaited<ReturnType<OrderClient['getOrders']>>['orders'] = [];
+        for (const route of routes()) {
+          try {
+            for (const o of (await route.get(version)).orders ?? []) { byAgent.set(o.agent_id, route); orders.push(o); }
+          } catch { /* that account's turn comes again in five minutes */ }
+        }
+        return { orders };
+      },
+      // A status may belong to an order a previous broker process accepted (an update restarts
+      // the broker), so any of this broker's routes may carry it; the server checks the account.
+      postState: async (id, state, detail) => {
+        for (const route of routes()) {
+          try { await route.post(id, state, detail); return; } catch { /* try the next account */ }
+        }
+      },
+    };
+    this.updatePoller = startPolling({
+      fingerprint, version: VERSION, client,
+      vaultKeyFor: async (agentId) => { const r = byAgent.get(agentId); return r ? r.key() : null; },
+      seenPath: path.join(systemRoot(), 'update-seen.json'),
+      requestPath: path.join(spool, 'request.json'),
+      statusPath: path.join(spool, 'status.json'),
+      now: () => Date.now(),
+      log: (m) => console.error(`[wundervault-agent] ${m}`),
+    });
+  }
 
   /** Every servable agent's route to the server, so each account's chain has one. */
   private anchorClients() {
@@ -1469,6 +1520,9 @@ class AgentDaemon {
             // asks for them explicitly below.
             socket.write(JSON.stringify({
               ok: true, version: VERSION, store_unreadable: this.storeUnreadable,
+              // Update now: the root updater's health check. A new version that can't read the
+              // store must be rolled back, not left 'running' (SPEC-update-now U4 step 11).
+              store_ok: !this.storeUnreadable,
               key_mode: this.keyMode,
               // Whether there is ACTUALLY a boundary here, from the daemon's own mouth.
               // The startup warning says this too, but a warning is a line in a log that
@@ -1595,6 +1649,7 @@ class AgentDaemon {
     (firstCheck as unknown as { unref?: () => void }).unref?.();
     this.dailyTimer = setInterval(() => { void dailyCare(); }, 24 * 60 * 60 * 1000);
     (this.dailyTimer as unknown as { unref?: () => void }).unref?.();
+    this.startUpdateOrders();
     // Said out loud, every start. A machine quietly running in the weaker mode while the
     // documentation describes the stronger one is the failure this line exists to prevent.
     if (this.keyMode === 'sealed-tpm') {
@@ -1654,6 +1709,7 @@ class AgentDaemon {
   }
 
   shutdown(): void {
+    this.updatePoller?.stop();
     this.anchorer.stop();
     if (this.dailyTimer) { clearInterval(this.dailyTimer); this.dailyTimer = null; }
     // The discovery file goes with the server. A port file that outlives its daemon names

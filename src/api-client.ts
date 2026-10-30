@@ -228,6 +228,18 @@ export class AgentVaultAPI {
     return this.postJson<AnchorState>('/agent/activity-anchor', body);
   }
 
+  /**
+   * Update now (SPEC-update-now U5/U7): the orders the owner sealed for THIS broker with THIS
+   * agent's vault key. Reporting the broker's version here is how the vault knows it is behind.
+   */
+  async getBrokerOrders(brokerVersion: string): Promise<{ orders: { id: string; agent_id: string; ciphertext: string; nonce: string }[] }> {
+    return this.fetchJson('/agent/broker/orders', { broker_version: brokerVersion });
+  }
+
+  async postBrokerOrderState(id: string, state: string, detail: string): Promise<void> {
+    await this.postJson(`/agent/broker/orders/${encodeURIComponent(id)}/state`, { state, detail });
+  }
+
   /** Tell the owner, through the server, that this machine's log no longer matches. */
   async reportActivityMismatch(body: {
     problem: 'changed' | 'missing' | 'damaged'; server_seq: number; local_last_seq: number | null;
