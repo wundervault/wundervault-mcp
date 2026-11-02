@@ -68,6 +68,19 @@ the MCP worktree `~/wv-build/mcp-brand` at 7a63849.
     entry id (a response for another id is refused). ssh / wallet / sign values are always `raw`.
     A stamped `signed_set` with `parts-1` is handed to the stamp code as today's JSON object
     (`JSON.stringify(oauth1FromParts(parts))`).
+21. **OWNER 2026-11-01: one box, no "Something else".** `Add a key` is a single box. Typing filters the
+    catalogue; a match fills the form (shape, labelled boxes, sending, addresses, approval) and Enter takes
+    the top match. No match → the **Add** button takes what was typed as the key's NAME and goes straight
+    to the shape picker (C1) and today's "How is it sent" form. Replaces the "Something else" entry in C5
+    and the step table; the unknown-service journey loses a step. C-5 step counts change to match.
+22. **OWNER 2026-11-01: a "Setting up a secret" guide page, for people AND agents** — in this release
+    (docs, ships with it). Covers: the shapes and what each is for; the catalogue and that it is only a
+    shortcut; adding an unknown service field by field (where the key goes, header name, template,
+    addresses); the signing methods we support and what a service needs before it fits; worked examples
+    (single key, key + ID e.g. Alpaca, X's signed set, SSH, wallet); common mistakes. One URL, plain HTML
+    plus a text copy agents fetch (linked from the For agents page / llms.txt), so an owner can ask an
+    agent "how do I set up my ___ key?" and the agent answers from it. Generated from the same catalogue
+    file where it lists services, so it can't drift. Paired-doc rule ([[the live page is not the markdown]]).
 20. **Owner writes (Claude, build).** Revisions are kept by the server, not trusted from callers:
     a SQLAlchemy before-update hook bumps `rev` by 1 whenever any L1 plaintext column or blob of a
     `persistent_secrets` / `agent_vault_entries` row changes, and new column `sealed_rev` records the
