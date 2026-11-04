@@ -431,7 +431,9 @@ export async function performOperation(
       port,
       path,
       method: def.route.method,
-      headers: { ...headers, host },
+      // RFC 9110 7.2: a non-default port is part of Host. Signed requests (OAuth 1.0a, SigV4)
+      // sign the address with its port, so a service on :8443 must receive the same.
+      headers: { ...headers, host: port === 443 ? host : `${host}:${port}` },
       // Pin the address we vetted. Without this the agent performs its own lookup at
       // connect time, and the record could differ from the one that passed the check.
       //

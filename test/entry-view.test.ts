@@ -299,6 +299,8 @@ describe('entry views', () => {
       id: resp.id,
       agent_id: resp.agent_id,
       rev: resp.rev,
+      policy_ciphertext: resp.policy_ciphertext,
+      policy_nonce: resp.policy_nonce,
       name: policy.name,
       secret_name: policy.name,
       entry_mode: 'BROKER_HTTP',
@@ -354,8 +356,8 @@ describe('entry views', () => {
     expect(JSON.parse(result.entry.exec_config as string)).toEqual(config);
     expect(result.entry).not.toHaveProperty('operations');
     expect(result.entry).not.toHaveProperty('allowed_private_origins');
-    expect(result.entry).not.toHaveProperty('policy_ciphertext');
-    expect(result.entry).not.toHaveProperty('policy_nonce');
+    // The owner-sealed rules pass through as they came (opened and version-checked later).
+    expect(result.entry.policy_ciphertext).toBe('server-policy');
     expect(result.entry).not.toHaveProperty('setup_ciphertext');
     expect(result.entry).not.toHaveProperty('extra');
   });

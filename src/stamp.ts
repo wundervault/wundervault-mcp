@@ -477,7 +477,9 @@ function awsSign(recipe: AwsRecipe, img: RequestImage, keyId: string, secret: st
   const added: Record<string, string> = { 'x-amz-date': amzDate };
   const wantContentHeader = recipe.content_sha256_header ?? recipe.service === 's3';
   if (wantContentHeader) added['x-amz-content-sha256'] = payloadHash;
-  const all: Record<string, string> = { ...img.headers, host: img.host, ...added };
+  // The Host the broker sends: a non-default port is part of it (http-broker.ts).
+  const hostHeader = img.port !== undefined && img.port !== 443 ? `${img.host}:${img.port}` : img.host;
+  const all: Record<string, string> = { ...img.headers, host: hostHeader, ...added };
   const signed = Object.keys(all).map((k) => k.toLowerCase()).filter((k) => !AWS_UNSIGNED.has(k)).sort();
   const canonicalHeaders = signed.map((k) => `${k}:${String(all[k]).trim().replace(/\s+/g, ' ')}\n`).join('');
   const segments = img.path.split('/').map((seg) => {

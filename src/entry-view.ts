@@ -30,6 +30,12 @@ const modes = {
 const responseFields = [
   'encrypted_content', 'content_nonce', 'access_tier', 'alert_email', 'directive',
   'directive_signature', 'id', 'agent_id', 'rev', 'vault_locked',
+  // The owner's sealed rules (wallet limits and payees, approved stamp recipes). Sealed by the
+  // owner's browser with this agent's vault key and bound to the entry id, and refused when
+  // older than a version this machine has seen (SigningState.acceptPolicy), so the server can
+  // withhold them but not forge or roll them back. Dropping them made every payment and every
+  // stamped call ask the owner again once a setup was sealed (found by broker-stamp-parts).
+  'policy_ciphertext', 'policy_nonce',
 ] as const;
 
 function refused(reason: string): EntryResult<never> {
