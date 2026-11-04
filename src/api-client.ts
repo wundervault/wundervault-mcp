@@ -171,6 +171,10 @@ export class AgentVaultAPI {
     within_rules?: boolean;
     /** The approved request this call is spending. Single use, burned on the server. */
     approval_id?: string;
+    /** Spec #19: on a locked account the detail travels sealed (wv-t2op-1), under this broker-made id. */
+    request_id?: string;
+    detail_ciphertext?: string;
+    detail_nonce?: string;
   }): Promise<{ allowed: boolean; tier: string; request_id?: string; message?: string;
                 emailed?: boolean }> {
     // Serialised once. The bytes that are hashed for the signature must be the bytes

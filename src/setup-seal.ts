@@ -7,6 +7,7 @@ import { open, readFile, rename, unlink } from 'node:fs/promises';
 const zeroSalt = Buffer.alloc(32);
 const buckets = [256, 1024, 4096, 16384, 65536, 131072, 262144, 524288];
 const maxSealedBytes = 524288 + 16;
+const maxT2OpJsonBytes = 64 * 1024;
 const setupKeys = new Set([
   'v', 'rev', 'value_sha256', 'value_format', 'name', 'shape', 'service', 'delivery',
   'binding', 'ssh_hosts', 'private_origins', 'known_addresses', 'approval', 'operations', 'chain',
@@ -29,6 +30,12 @@ export interface T2Detail {
   reason: string;
 }
 
+export interface T2OpDetail {
+  name: string;
+  kind: 'payment' | 'signature' | 'recipe';
+  detail: Record<string, unknown>;
+}
+
 export interface T2MatchFields {
   kind: string;
   origin: string;
@@ -49,6 +56,10 @@ export type OpenSetupResult =
 
 export type OpenT2DetailResult =
   | { ok: true; detail: T2Detail & { v: 1 } }
+  | Failure;
+
+export type OpenT2OpDetailResult =
+  | { ok: true; detail: T2OpDetail & { v: 1 } }
   | Failure;
 
 export function hkdfKey(ikm: Uint8Array, salt: Uint8Array, info: string): Buffer {
@@ -99,6 +110,15 @@ function validDetail(value: unknown): value is T2Detail & { v: 1 } {
     ['kind', 'origin', 'method', 'path'].every(key => !(value[key] as string).includes('\n'));
 }
 
+function validOpDetail(value: unknown): value is T2OpDetail & { v: 1 } {
+  const keys = ['v', 'name', 'kind', 'detail'];
+  return isObject(value) && Object.keys(value).length === keys.length &&
+    keys.every(key => Object.hasOwn(value, key)) && value.v === 1 &&
+    typeof value.name === 'string' && value.name.length <= 256 &&
+    (value.kind === 'payment' || value.kind === 'signature' || value.kind === 'recipe') &&
+    isObject(value.detail);
+}
+
 function decodeBase64(value: string): Buffer {
   if (typeof value !== 'string' || value.length > Math.ceil(maxSealedBytes / 3) * 4 ||
       !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
@@ -136,6 +156,7 @@ function seal(
 
 function openBlob(
   vaultKey: Uint8Array, info: string, aad: string, ciphertextB64: string, nonceB64: string,
+  maxJsonBytes?: number,
 ): { ok: true; value: unknown } | Failure {
   let plaintext: Buffer;
   try {
@@ -161,7 +182,11 @@ function openBlob(
     if (!buckets.includes(plaintext.length) || !Buffer.from(text, 'utf8').equals(plaintext)) {
       return { ok: false, reason: 'malformed' };
     }
-    return { ok: true, value: JSON.parse(text.trim()) as unknown };
+    const json = text.trim();
+    if (maxJsonBytes !== undefined && Buffer.byteLength(json, 'utf8') > maxJsonBytes) {
+      return { ok: false, reason: 'malformed' };
+    }
+    return { ok: true, value: JSON.parse(json) as unknown };
   } catch {
     return { ok: false, reason: 'malformed' };
   }
@@ -243,6 +268,42 @@ export function openT2Detail(
   );
   if (!opened.ok) return opened;
   if (!validDetail(opened.value)) return { ok: false, reason: 'malformed' };
+  return { ok: true, detail: opened.value };
+}
+
+export function sealT2OpDetail(
+  vaultKey: Uint8Array, agentId: string, requestId: string, detail: T2OpDetail, nonce?: Buffer,
+): SealResult {
+  let json: string;
+  try {
+    if (!validId(agentId) || !validRequestId(requestId) || !isObject(detail) ||
+        Object.keys(detail).length !== 3 || Object.hasOwn(detail, 'v')) {
+      return { ok: false, reason: 'malformed' };
+    }
+    json = JSON.stringify({ v: 1, ...detail });
+    if (Buffer.byteLength(json, 'utf8') > maxT2OpJsonBytes ||
+        !validOpDetail(JSON.parse(json) as unknown)) {
+      return { ok: false, reason: 'malformed' };
+    }
+  } catch {
+    return { ok: false, reason: 'malformed' };
+  }
+  return seal(vaultKey, 'wv-t2op-1', `wv-t2op-1|${agentId}|${requestId}`, json, nonce);
+}
+
+export function openT2OpDetail(
+  vaultKey: Uint8Array, agentId: string, requestId: string,
+  ciphertextB64: string, nonceB64: string,
+): OpenT2OpDetailResult {
+  if (!validId(agentId) || !validRequestId(requestId)) {
+    return { ok: false, reason: 'malformed' };
+  }
+  const opened = openBlob(
+    vaultKey, 'wv-t2op-1', `wv-t2op-1|${agentId}|${requestId}`,
+    ciphertextB64, nonceB64, maxT2OpJsonBytes,
+  );
+  if (!opened.ok) return opened;
+  if (!validOpDetail(opened.value)) return { ok: false, reason: 'malformed' };
   return { ok: true, detail: opened.value };
 }
 

@@ -1,0 +1,22 @@
+{
+ "vault_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+ "agent_id": "agent-vector-1",
+ "request_id": "0123456789abcdef0123456789abcdef",
+ "nonce_b64": "oaKjpKWmp6ipqqus",
+ "plaintext": {
+  "v": 1,
+  "name": "Base wallet",
+  "kind": "payment",
+  "detail": {
+   "entry_id": "e1",
+   "payee": "0x1111111111111111111111111111111111111111",
+   "amount": "2500000",
+   "network": "base",
+   "reason": "payee",
+   "spent_24h": "0",
+   "daily_cap": "10000000",
+   "purpose": "Buy the report"
+  }
+ },
+ "ciphertext_b64": "HXxoeN5rO5GUoobJaqbvI1bZtblhsBB6w8yiSGc+kCnKvQDL3fUHiDDCN0bLJb11o0PoFR1ukSuAUWx841t4tY8IDJcKH+OsGBPJi0zkzAOsZBBectZPTGVex9JWpWXiNy1j5Y1mOm3BE6RvL9QoOkOGZZCgMudsQ3CDE8tDG0ropiwFLNhcEPWMr6EwoSHIQUmgUA9xmtfOHm70N8/XQ+GbkTkl6W79EgxIpf2eV5FiMr4HEa9j/KfVkZqqulDVJ/XFl9grct6klKK8Pm3r03+k92QxDPMXJyKwvti6e21hsnz1XRPx4xOf87qxvTr0iLm4TZqP8CXUTksgroSc+cyT29CoBHOKU8ItoBg2fyM="
+}

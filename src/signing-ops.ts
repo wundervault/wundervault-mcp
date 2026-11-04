@@ -27,6 +27,7 @@ import {
   readPolicy, commitment, openOwnerToken, SigningState, LedgerUnreadable, type ApprovalKind, type Policy,
 } from './wallet.js';
 import { parseSigningKey, signBytes, decodeData } from './signing.js';
+import { newRequestId, sealT2OpDetail } from './setup-seal.js';
 import type { SecretResponse } from './types.js';
 
 export interface OpError { error: string; code?: string }
@@ -60,6 +61,7 @@ export interface Deps {
 async function ownerApproval(d: Deps, a: {
   entryId: string; kind: ApprovalKind; commit: string; detail: Record<string, unknown>;
   purpose: string; vaultKey: Uint8Array;
+  sealed?: { agentId: string; name: string };
   /**
    * What makes two asks "the same ask" for reuse. Defaults to the commitment; a payment adds
    * the resource, so a second purchase from the same payee for the same amount is asked
@@ -75,7 +77,32 @@ async function ownerApproval(d: Deps, a: {
   } else {
     // The agent's reason travels INSIDE the detail, which the server erases on decision —
     // never in the request's purpose field, which outlived it (round 1, server F1).
-    const v = await d.api.checkOperation({ entry_id: a.entryId, kind: a.kind, detail: a.detail, purpose: '' });
+    let body: Parameters<AgentVaultAPI['checkOperation']>[0];
+    let generatedId: string | undefined;
+    if (a.sealed) {
+      let sealed;
+      try {
+        generatedId = newRequestId();
+        sealed = sealT2OpDetail(a.vaultKey, a.sealed.agentId, generatedId, {
+          name: a.sealed.name, kind: a.kind, detail: a.detail,
+        });
+      } catch {
+        return err('Refused: this approval request could not be sealed. Nothing was signed.', 'BAD_REQUEST');
+      }
+      if (!sealed.ok) {
+        return err('Refused: this approval request could not be sealed. Nothing was signed.', 'BAD_REQUEST');
+      }
+      body = {
+        entry_id: a.entryId, kind: a.kind, request_id: generatedId,
+        detail_ciphertext: sealed.ciphertext, detail_nonce: sealed.nonce, purpose: '',
+      };
+    } else {
+      body = { entry_id: a.entryId, kind: a.kind, detail: a.detail, purpose: '' };
+    }
+    const v = await d.api.checkOperation(body);
+    if (generatedId !== undefined && v.request_id !== generatedId) {
+      return err('Refused: the server returned a different approval request id. Nothing was signed.', 'BAD_SERVER');
+    }
     if (v.allowed) {
       // The server may never allow one of these without an approval. A server that does is
       // not one this broker will follow.
@@ -181,6 +208,7 @@ export async function pay(d: Deps, args: {
     if (!('outside' in first)) return first;
     const approval = await ownerApproval(d, {
       entryId: args.entryId, kind: 'payment', commit, vaultKey, purpose: args.purpose,
+      sealed: s.vault_locked === true ? { agentId: s.agent_id!, name: s.name! } : undefined,
       pendingKey: commitment({ ...fields, resource_url: pr.resourceUrl }),
       detail: {
         ...fields, reason: first.outside, spent_24h: first.spent.toString(), daily_cap: (rules?.dailyCap ?? 0n).toString(),
@@ -289,6 +317,7 @@ export async function sign(d: Deps, args: {
   return guarded(async () => {
     const approval = await ownerApproval(d, {
       entryId: args.entryId, kind: 'signature', commit: commitment(fields), vaultKey, purpose: args.purpose,
+      sealed: s.vault_locked === true ? { agentId: s.agent_id!, name: s.name! } : undefined,
       detail: { ...fields, ...(text !== undefined ? { text } : {}), purpose: args.purpose.slice(0, 200) },
     });
     if ('error' in approval) return approval;
@@ -327,6 +356,7 @@ export async function approveStamp(d: Deps, args: {
     const fields = { entry_id: args.entryId, origin: args.origin, recipe_sha256: args.recipeSha };
     const approval = await ownerApproval(d, {
       entryId: args.entryId, kind: 'recipe', commit: commitment(fields), vaultKey: args.vaultKey, purpose: args.purpose,
+      sealed: args.s.vault_locked === true ? { agentId: args.s.agent_id!, name: args.s.name! } : undefined,
       detail: { ...fields, recipe: args.recipe, summary: args.summary, purpose: args.purpose.slice(0, 200) },
     });
     if ('error' in approval) return approval;
