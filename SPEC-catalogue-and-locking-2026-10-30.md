@@ -442,5 +442,5 @@ Each check names how it is proved. "DB scan" = dump every table of a test accoun
 
 ## Out of scope (named so nobody builds them by accident)
 
-Google/Microsoft OAuth accounts, databases, AWS SigV4, website-login filling and the other coming
+Google/Microsoft OAuth accounts, databases, a catalogue entry for AWS (SigV4 itself is built since 1.0 and works with a single key or ID + secret — 2026-11-03), website-login filling and the other coming
 features, installers (.pkg/.msi), changing an account back to unlocked.
