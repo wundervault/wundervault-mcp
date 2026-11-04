@@ -115,7 +115,8 @@ function validOpDetail(value: unknown): value is T2OpDetail & { v: 1 } {
   const keys = ['v', 'name', 'kind', 'detail'];
   return isObject(value) && Object.keys(value).length === keys.length &&
     keys.every(key => Object.hasOwn(value, key)) && value.v === 1 &&
-    typeof value.name === 'string' && value.name.length <= 256 &&
+    // Characters, as the vault page counts a name (review cl5 browser F3), not UTF-16 units.
+    typeof value.name === 'string' && Array.from(value.name).length <= 256 &&
     (value.kind === 'payment' || value.kind === 'signature' || value.kind === 'recipe') &&
     isObject(value.detail);
 }
@@ -451,6 +452,29 @@ export class SetupPins {
     return this.enqueue(async () => {
       if (this.unreadable || !this.state) throw new Error('refuse: pins unreadable');
       if (!accountId || !entryId || !validRev(rev)) throw new Error('Invalid pin');
+      // Merge with the file as it is NOW: another broker process may have pinned higher since
+      // this one loaded it, and a whole-file rewrite from a stale copy would undo that (review
+      // cl5 r2 broker F2). Highest revision wins; locked is never un-set.
+      let onDisk: PinState | null = null;
+      try {
+        onDisk = parsePins(await this.fs.readFile(this.path, 'utf8'));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') {
+          this.unreadable = true;
+          throw new Error('refuse: pins unreadable');
+        }
+      }
+      if (onDisk) {
+        const merged: PinState = {
+          accounts: new Map(this.state.accounts),
+          entries: new Map(this.state.entries),
+        };
+        for (const [id, a] of onDisk.accounts) {
+          merged.accounts.set(id, { locked: a.locked || (merged.accounts.get(id)?.locked ?? false) });
+        }
+        for (const [id, r] of onDisk.entries) merged.entries.set(id, Math.max(r, merged.entries.get(id) ?? r));
+        this.state = merged;
+      }
       const current = this.state.entries.get(entryId);
       // A newer revision was pinned while this one was being opened: never hand back the older
       // setup (review cl5 F3).

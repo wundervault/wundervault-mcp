@@ -550,8 +550,9 @@ export class BrokerOps {
           // still says why, in its own words.
           const why = outcome ? approvalNotGivenMessage(outcome, `"${s.name}"`)
             : `${verdict.message ?? 'This call needs owner approval.'} Nothing was sent.`;
+          // Scrubbed like rec.address: a path may carry a part (review cl5 r2 broker F1).
           return err(`${why}\n\nThe owner sees exactly: ${def.route.method} `
-            + `${originString(def.origin)}${def.route.path}`);
+            + scrubShown(`${originString(def.origin)}${def.route.path}`));
         }
         const second = await this.api.checkOperation((lockedCheck ?? {
           entry_id: entryId, purpose: purpose.slice(0, 200), origin: originStr,
@@ -561,7 +562,7 @@ export class BrokerOps {
           rec.approval = 'not_approved';
           return err(`${second.message ?? 'This call needs owner approval.'}\n\n`
             + `Nothing was sent. The owner sees exactly: ${def.route.method} `
-            + `${originString(def.origin)}${def.route.path}`);
+            + scrubShown(`${originString(def.origin)}${def.route.path}`));
         }
         verdict.tier = second.tier;
         rec.approval = 'approved';

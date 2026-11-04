@@ -464,3 +464,22 @@ describe('setup pins', () => {
     expect(failedWrite.decide('account', 'entry', true, 1)).toBe('refuse: pins unreadable');
   });
 });
+
+describe('setup pins across processes (review cl5 r2 broker F2)', () => {
+  it('a second process with a stale copy cannot lower a pin or drop locked', async () => {
+    const { mkdtemp } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const p = await import('node:path');
+    const file = p.join(await mkdtemp(p.join(os.tmpdir(), 'wv-pins2-')), 'pins.json');
+    const a = new SetupPins(file);
+    const b = new SetupPins(file);
+    await a.load(); await b.load();              // both load the empty state
+    await a.record('acct', 'e', 6, true);        // process A pins rev 6 and locked
+    await b.record('acct', 'other', 1, true);    // process B, stale, writes another entry
+    const fresh = new SetupPins(file);
+    await fresh.load();
+    expect(fresh.decide('acct', 'e', true, 5, true)).toBe('refuse: older revision');
+    expect(fresh.decide('acct', 'e', true, 6, false)).toBe('refuse: unlocked after locked');
+    await expect(b.record('acct', 'e', 5, true)).rejects.toThrow('older revision');
+  });
+});
