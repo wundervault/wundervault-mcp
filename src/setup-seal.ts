@@ -7,7 +7,8 @@ import { open, readFile, rename, unlink } from 'node:fs/promises';
 const zeroSalt = Buffer.alloc(32);
 const buckets = [256, 1024, 4096, 16384, 65536, 131072, 262144, 524288];
 const maxSealedBytes = 524288 + 16;
-const maxT2OpJsonBytes = 64 * 1024;
+// The server accepts a signature detail up to 72 KiB (agent.py MAX_SIGNATURE_DETAIL_BYTES).
+const maxT2OpJsonBytes = 80 * 1024;
 const setupKeys = new Set([
   'v', 'rev', 'value_sha256', 'value_format', 'name', 'shape', 'service', 'delivery',
   'binding', 'ssh_hosts', 'private_origins', 'known_addresses', 'approval', 'operations', 'chain',
@@ -339,10 +340,12 @@ export type PinDecision =
   | 'ok'
   | 'refuse: plaintext after sealed'
   | 'refuse: older revision'
+  | 'refuse: unlocked after locked'
   | 'refuse: pins unreadable';
 
 interface PinState {
-  accounts: Map<string, true>;
+  /** Per account: it has opened a sealed setup; `locked` = it has seen the account locked. */
+  accounts: Map<string, { locked: boolean }>;
   entries: Map<string, number>;
 }
 
@@ -352,14 +355,15 @@ function parsePins(text: string): PinState {
       !isObject(value.accounts) || !isObject(value.entries)) {
     throw new Error('Invalid pins');
   }
-  const accounts = new Map<string, true>();
+  const accounts = new Map<string, { locked: boolean }>();
   const entries = new Map<string, number>();
   for (const [id, account] of Object.entries(value.accounts)) {
-    if (!id || !isObject(account) || Object.keys(account).length !== 1 ||
-        !Object.hasOwn(account, 'sealed_seen') || account.sealed_seen !== true) {
+    if (!id || !isObject(account) || account.sealed_seen !== true ||
+        Object.keys(account).some(key => key !== 'sealed_seen' && key !== 'locked_seen') ||
+        (Object.hasOwn(account, 'locked_seen') && account.locked_seen !== true)) {
       throw new Error('Invalid pins');
     }
-    accounts.set(id, true);
+    accounts.set(id, { locked: account.locked_seen === true });
   }
   for (const [id, rev] of Object.entries(value.entries)) {
     if (!id || !validRev(rev)) throw new Error('Invalid pins');
@@ -401,8 +405,16 @@ export class SetupPins {
     });
   }
 
-  decide(accountId: string, entryId: string, hasCiphertext: boolean, rev: number | undefined): PinDecision {
+  decide(
+    accountId: string, entryId: string, hasCiphertext: boolean, rev: number | undefined,
+    locked?: unknown,
+  ): PinDecision {
     if (!this.loaded || this.unreadable || !this.state) return 'refuse: pins unreadable';
+    // Locking is one-way (spec L4.6). The flag is not sealed, so a server that once said
+    // "locked" and now says otherwise is asking for plaintext approval traffic (review cl5 F2).
+    if (this.state.accounts.get(accountId)?.locked && locked !== true) {
+      return 'refuse: unlocked after locked';
+    }
     if (!hasCiphertext && this.state.accounts.has(accountId)) {
       return 'refuse: plaintext after sealed';
     }
@@ -414,24 +426,31 @@ export class SetupPins {
     return 'ok';
   }
 
-  async record(accountId: string, entryId: string, rev: number): Promise<void> {
+  async record(accountId: string, entryId: string, rev: number, locked = false): Promise<void> {
     await this.load();
     return this.enqueue(async () => {
       if (this.unreadable || !this.state) throw new Error('refuse: pins unreadable');
       if (!accountId || !entryId || !validRev(rev)) throw new Error('Invalid pin');
-      // Listing pins every entry on every call; write only when a pin actually moves.
       const current = this.state.entries.get(entryId);
-      if (this.state.accounts.has(accountId) && current !== undefined && current >= rev) return;
+      // A newer revision was pinned while this one was being opened: never hand back the older
+      // setup (review cl5 F3).
+      if (current !== undefined && current > rev) throw new Error('refuse: older revision');
+      const account = this.state.accounts.get(accountId);
+      const wasLocked = account?.locked === true;
+      if (wasLocked && !locked) throw new Error('refuse: unlocked after locked');
+      // Listing pins every entry on every call; write only when a pin actually moves.
+      if (account && current === rev && (wasLocked || !locked)) return;
       const next: PinState = {
         accounts: new Map(this.state.accounts),
         entries: new Map(this.state.entries),
       };
-      next.accounts.set(accountId, true);
+      next.accounts.set(accountId, { locked: wasLocked || locked });
       next.entries.set(entryId, Math.max(rev, next.entries.get(entryId) ?? rev));
       const json = JSON.stringify({
         v: 1,
         accounts: Object.fromEntries(
-          [...next.accounts.keys()].map(id => [id, { sealed_seen: true }]),
+          [...next.accounts.entries()].map(([id, a]) =>
+            [id, a.locked ? { sealed_seen: true, locked_seen: true } : { sealed_seen: true }]),
         ),
         entries: Object.fromEntries(next.entries),
       });

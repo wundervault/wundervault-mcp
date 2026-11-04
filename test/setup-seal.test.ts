@@ -366,7 +366,8 @@ describe('setup pins', () => {
     expect(pins.decide('account', 'entry', true, 6)).toBe('refuse: older revision');
     expect(pins.decide('account', 'entry', true, 7)).toBe('ok');
     expect(pins.decide('account', 'entry', true, 8)).toBe('ok');
-    await pins.record('account', 'entry', 3);
+    // A setup older than the pin is never handed back (review cl5 F3).
+    await expect(pins.record('account', 'entry', 3)).rejects.toThrow('refuse: older revision');
     expect(pins.decide('account', 'entry', true, 6)).toBe('refuse: older revision');
     await pins.record('account', 'entry', 8);
     expect(JSON.parse(await readFile(path, 'utf8'))).toEqual({
@@ -383,11 +384,13 @@ describe('setup pins', () => {
   it('serializes concurrent records without losing or lowering pins', async () => {
     const path = await pinPath();
     const pins = new SetupPins(path);
-    await Promise.all([
+    const results = await Promise.allSettled([
       pins.record('account', 'entry', 10),
       pins.record('account', 'entry', 2),
       pins.record('account', 'other', 4),
     ]);
+    // The older revision, recorded after the newer one, is refused rather than accepted.
+    expect(results.map(r => r.status)).toEqual(['fulfilled', 'rejected', 'fulfilled']);
     const reloaded = new SetupPins(path);
     await reloaded.load();
     expect(reloaded.decide('account', 'entry', true, 9)).toBe('refuse: older revision');

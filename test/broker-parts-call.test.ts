@@ -271,6 +271,8 @@ beforeAll(async () => {
 }, 20_000);
 
 beforeEach(() => {
+  // Each test is a fresh machine: a locked account seen in one test must not pin the next.
+  fs.rmSync(path.join(dir, 'setup-pins.json'), { force: true });
   entries = new Map();
   wire = [];
   checks = [];

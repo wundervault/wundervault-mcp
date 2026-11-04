@@ -94,6 +94,50 @@ function shapeMatchesDelivery(shape: Shape, delivery: Delivery): boolean {
     || (shape === 'website_login' && delivery === 'http');
 }
 
+/**
+ * The vault page's save-time rules, checked again where the setup is USED (parent spec item 1:
+ * a setup that fails them refuses use, never "unrestricted"). Returns why, or null.
+ * `forUse` = the broker is about to send/sign with it (a stored-only key may still be listed).
+ */
+export function setupProblem(setup: {
+  shape?: unknown; delivery?: unknown; value_format?: unknown; binding?: unknown;
+  ssh_hosts?: unknown; chain?: unknown;
+}, forUse: boolean): string | null {
+  const { shape, delivery } = setup;
+  if (!isShape(shape)) return 'unknown shape';
+  if (delivery !== 'http' && delivery !== 'ssh' && delivery !== 'wallet' && delivery !== 'sign') {
+    return 'unknown delivery';
+  }
+  if (!shapeMatchesDelivery(shape, delivery)) return 'shape does not allow this delivery';
+  const format = setup.value_format ?? 'raw';
+  if (format !== 'raw' && format !== 'parts-1') return 'unknown value format';
+  if (format === 'raw' && shape !== RAW_SHAPES[delivery]) return 'raw values require a single-part shape';
+  if (format === 'parts-1' && delivery !== 'http') return 'SSH, wallet and signing values must use the raw format';
+  if (delivery === 'http') {
+    const storedOnly = shape === 'website_login' || (shape === 'password' && setup.binding == null);
+    if (storedOnly) {
+      if (setup.binding != null) return 'this shape has no web credential binding';
+      return forUse ? 'this key is stored only and is not sent by the broker' : null;
+    }
+    if (setup.binding == null && shape !== 'api_key') return 'this shape needs a binding';
+    if (setup.binding != null) {
+      const checked = validateBindingV2(setup.binding, shape, 'http');
+      if (!checked.ok) return `${checked.field}: ${checked.message}`;
+    }
+  } else if (setup.binding != null) {
+    return 'this shape has no web credential binding';
+  }
+  if (delivery === 'ssh' && (!Array.isArray(setup.ssh_hosts) || setup.ssh_hosts.length === 0
+      || setup.ssh_hosts.some((h) => typeof h !== 'string' || !h))) {
+    return 'an SSH key needs at least one server';
+  }
+  if (delivery === 'wallet' && setup.chain !== 'evm' && setup.chain !== 'solana') {
+    return 'a wallet is on evm or solana';
+  }
+  if (delivery !== 'wallet' && setup.chain != null) return 'a chain only applies to wallets';
+  return null;
+}
+
 function allowedParts(shape: Shape): Set<string> {
   return new Set([
     ...Object.keys(SHAPES[shape].parts),

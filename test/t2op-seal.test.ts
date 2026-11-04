@@ -118,13 +118,13 @@ describe('wv-t2op-1', () => {
     }
   });
 
-  it('accepts exactly 64 KiB before padding and rejects one more byte on seal and open', () => {
+  it('accepts exactly 80 KiB before padding and rejects one more byte on seal and open', () => {
     const detail: T2OpDetail = { name: 'Wallet', kind: 'signature', detail: { text: '' } };
     const overhead = Buffer.byteLength(JSON.stringify({ v: 1, ...detail }), 'utf8');
-    detail.detail.text = 'x'.repeat(64 * 1024 - overhead);
+    detail.detail.text = 'x'.repeat(80 * 1024 - overhead);
     const sealed = sealT2OpDetail(VAULT_KEY, AGENT_ID, REQUEST_ID, detail, NONCE);
     if (!sealed.ok) throw new Error(sealed.reason);
-    expect(Buffer.from(sealed.ciphertext, 'base64')).toHaveLength(65536 + 16);
+    expect(Buffer.from(sealed.ciphertext, 'base64')).toHaveLength(131072 + 16);
     expect(openT2OpDetail(VAULT_KEY, AGENT_ID, REQUEST_ID, sealed.ciphertext, sealed.nonce))
       .toEqual({ ok: true, detail: { v: 1, ...detail } });
     detail.detail.text += 'x';
@@ -134,16 +134,16 @@ describe('wv-t2op-1', () => {
 
   it('measures the JSON size in UTF-8 bytes, including escaping and envelope overhead', () => {
     const detail: T2OpDetail = {
-      name: 'Wallet', kind: 'signature', detail: { text: 'é'.repeat(32 * 1024) },
+      name: 'Wallet', kind: 'signature', detail: { text: 'é'.repeat(40 * 1024 + 1) },
     };
     expect(sealT2OpDetail(VAULT_KEY, AGENT_ID, REQUEST_ID, detail, NONCE)).toEqual(MALFORMED);
     expect(openReference({ v: 1, ...detail })).toEqual(MALFORMED);
-    detail.detail.text = '"'.repeat(32 * 1024);
+    detail.detail.text = '"'.repeat(40 * 1024 + 1);
     expect(sealT2OpDetail(VAULT_KEY, AGENT_ID, REQUEST_ID, detail, NONCE)).toEqual(MALFORMED);
   });
 
   it('rejects oversized authenticated JSON even when its parsed serialization would fit', () => {
-    const json = JSON.stringify(vectorPlaintext).replace('"amount":', '"amount":' + ' '.repeat(65536));
+    const json = JSON.stringify(vectorPlaintext).replace('"amount":', '"amount":' + ' '.repeat(80 * 1024));
     const sealed = referenceSeal(json);
     expect(openT2OpDetail(VAULT_KEY, AGENT_ID, REQUEST_ID, sealed.ciphertext, sealed.nonce))
       .toEqual(MALFORMED);
@@ -431,15 +431,9 @@ describe('locked operation approvals', () => {
     expect(server.decrypts).toBe(0);
   });
 
-  it('refuses an oversized locked signature envelope without asking', async () => {
-    server.kind = 'signature';
-    const result = await sign(deps, {
-      entryId: 'key', purpose: PURPOSE, data: 'x'.repeat(65530),
-    });
-    expect(result).toMatchObject({ code: 'BAD_REQUEST' });
-    expect(server.checkOperation).not.toHaveBeenCalled();
-    expect(server.decrypts).toBe(0);
-  });
+  // (The envelope limit, 80 KiB to cover the server's 72 KiB signature detail, is tested on
+  // sealT2OpDetail above; a sign() call can't build an envelope past it: large data travels as
+  // a digest.)
 
   it.each(KINDS)('rejects a different server request id for %s before waiting or decrypting', async (kind) => {
     server.replyId = 'different';

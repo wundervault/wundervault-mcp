@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { checkValueCommitment, openSetup } from './setup-seal.js';
+import { setupProblem } from './parts.js';
 import type { SetupPins } from './setup-seal.js';
 import type { SecretResponse, SecretsResponse, VaultEntry } from './types.js';
 
@@ -79,7 +80,7 @@ export async function resolveEntry<T extends EntryResponse>(
   const hasSetup = resp.setup_ciphertext !== undefined && resp.setup_ciphertext !== null;
   try {
     await ctx.pins.load();
-    const decision = ctx.pins.decide(ctx.account, entryId, hasSetup, resp.rev);
+    const decision = ctx.pins.decide(ctx.account, entryId, hasSetup, resp.rev, resp.vault_locked);
     if (decision !== 'ok') return refused(decision);
   } catch {
     return refused('pins unreadable');
@@ -100,9 +101,10 @@ export async function resolveEntry<T extends EntryResponse>(
     if (!opened.ok) return refused(opened.reason);
     const setup = opened.setup;
 
-    if (setup.delivery !== 'http' && setup.value_format === 'parts-1') {
-      return refused('SSH, wallet and signing values must use the raw format');
-    }
+    // The same rules the vault page saves by (review cl5 broker F1): a sealed setup that breaks
+    // them is refused here, so nothing downstream ever sees an impossible combination.
+    const problem = setupProblem(setup, ctx.withValue);
+    if (problem) return refused(problem);
     if (ctx.withValue && !checkValueCommitment(setup, resp.encrypted_content ?? '')) {
       return refused("the key and its setup don't match");
     }
@@ -140,7 +142,7 @@ export async function resolveEntry<T extends EntryResponse>(
     view.setup = setup;
 
     // Persist before returning anything usable. Errors must not expose an unpinned view.
-    await ctx.pins.record(ctx.account, entryId, setup.rev);
+    await ctx.pins.record(ctx.account, entryId, setup.rev, resp.vault_locked === true);
     if (!ctx.withValue) {
       // A list entry keeps the exact shape the server listed before L — an older agent app
       // reads `operations` as an array of ids (server.ts list rendering) — and carries no setup.

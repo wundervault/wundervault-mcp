@@ -130,6 +130,17 @@ describe('entry views', () => {
     return result;
   }
 
+  it.each([
+    ['a stored-only website login marked for sending', { shape: 'website_login', delivery: 'http', value_format: 'raw', binding: { in: 'header', name: 'authorization', template: 'Bearer {secret}', v: 1 } }],
+    ['a raw value on a two-part shape', { shape: 'key_id', delivery: 'http', value_format: 'raw' }],
+    ['a parts value for an SSH key', { shape: 'ssh_key', delivery: 'ssh', value_format: 'parts-1', binding: null, ssh_hosts: ['h'] }],
+    ['an SSH key with no servers', { shape: 'ssh_key', delivery: 'ssh', binding: null, ssh_hosts: [] }],
+    ['a wallet on an unknown chain', { shape: 'wallet', delivery: 'wallet', binding: null, chain: 'dogecoin' }],
+    ['an API key on the SSH delivery', { shape: 'api_key', delivery: 'ssh', binding: null, ssh_hosts: ['h'] }],
+  ])('refuses %s even though its seal is genuine (review cl5 F1)', async (_label, overrides) => {
+    await expectRefusal(sealed(setup(overrides as Partial<Setup>)));
+  });
+
   it('keys account pins by the UTF-8 API key hash', () => {
     expect(pinAccountFor('abc')).toBe(
       'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
@@ -310,7 +321,7 @@ describe('entry views', () => {
       setup: policy,
     });
     expect(record).toHaveBeenCalledTimes(1);
-    expect(record).toHaveBeenCalledWith(account, entryId, 3);
+    expect(record).toHaveBeenCalledWith(account, entryId, 3, false);
   });
 
   it.each([
@@ -337,10 +348,10 @@ describe('entry views', () => {
     {
       label: 'wallet',
       policy: setup({
-        shape: 'wallet', delivery: 'wallet', binding: null, chain: 'ethereum',
+        shape: 'wallet', delivery: 'wallet', binding: null, chain: 'evm',
       }),
       mode: 'BROKER_WALLET',
-      config: { delivery: 'wallet', chain: 'ethereum' },
+      config: { delivery: 'wallet', chain: 'evm' },
     },
     {
       label: 'sign',
@@ -466,7 +477,7 @@ describe('entry views', () => {
     expect(result.message).toContain('Nothing was sent.');
     expect(result.message).not.toContain('private path');
     expect(record).toHaveBeenCalledTimes(1);
-    expect(record).toHaveBeenCalledWith(account, entryId, 3);
+    expect(record).toHaveBeenCalledWith(account, entryId, 3, false);
   });
 
   it('resolves the first API fetch and exposes refusal codes on errors', async () => {
@@ -535,5 +546,26 @@ describe('entry views', () => {
     expect(await api.getSecret(entryId)).toEqual(resp);
     expect(await api.listSecrets()).toEqual(list);
     expect(key).not.toHaveBeenCalled();
+  });
+});
+
+describe('locked pin (review cl5 F2)', () => {
+  it('refuses an entry once the account was seen locked and the server now says otherwise', async () => {
+    const { SetupPins } = await import('../src/setup-seal.js');
+    const { mkdtemp } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const nodePath = await import('node:path');
+    const dir = await mkdtemp(nodePath.join(os.tmpdir(), 'wv-lockpin-'));
+    const pins = new SetupPins(nodePath.join(dir, 'pins.json'));
+    await pins.load();
+    await pins.record('acct', 'e1', 2, true);
+    expect(pins.decide('acct', 'e1', true, 2, true)).toBe('ok');
+    expect(pins.decide('acct', 'e1', true, 2, false)).toBe('refuse: unlocked after locked');
+    expect(pins.decide('acct', 'e1', true, 2, undefined)).toBe('refuse: unlocked after locked');
+    await expect(pins.record('acct', 'e1', 3, false)).rejects.toThrow('unlocked after locked');
+    const reloaded = new SetupPins(nodePath.join(dir, 'pins.json'));
+    await reloaded.load();
+    expect(reloaded.decide('acct', 'e2', true, 1, false)).toBe('refuse: unlocked after locked');
+    expect(reloaded.decide('other', 'e2', true, 1, false)).toBe('ok');
   });
 });
