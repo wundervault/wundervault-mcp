@@ -2,6 +2,7 @@
  * Drive stamped credentials through the real broker: a local vault serves encrypted
  * entries and policies, and a trusted HTTPS service records what reached the wire.
  */
+import { SetupPins } from '../src/setup-seal.js';
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -445,6 +446,7 @@ beforeEach(() => {
   // Each test is a fresh machine: the downgrade pins of one test's sealed setups must not
   // refuse the next test's legacy entry (that refusal is the guard working, tested elsewhere).
   fs.rmSync(path.join(dir, 'setup-pins.json'), { force: true });
+  SetupPins.resetSharedForTests();
   entries = new Map();
   wire = [];
   checks = [];

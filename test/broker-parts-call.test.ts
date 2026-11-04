@@ -2,6 +2,7 @@
  * Drive the real broker request path: a local vault serves sealed entries, and a
  * trusted local HTTPS service echoes the credentials that actually reached the wire.
  */
+import { SetupPins } from '../src/setup-seal.js';
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -273,6 +274,7 @@ beforeAll(async () => {
 beforeEach(() => {
   // Each test is a fresh machine: a locked account seen in one test must not pin the next.
   fs.rmSync(path.join(dir, 'setup-pins.json'), { force: true });
+  SetupPins.resetSharedForTests();
   entries = new Map();
   wire = [];
   checks = [];

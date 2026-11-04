@@ -373,6 +373,26 @@ function parsePins(text: string): PinState {
 }
 
 export class SetupPins {
+  private static readonly byPath = new Map<string, SetupPins>();
+
+  /**
+   * One instance per pins file in this process. Each instance caches the file and rewrites it
+   * whole, so two instances on one path could undo each other's pins (review cl5 broker B1).
+   */
+  static shared(path: string): SetupPins {
+    let pins = SetupPins.byPath.get(path);
+    if (!pins) {
+      pins = new SetupPins(path);
+      SetupPins.byPath.set(path, pins);
+    }
+    return pins;
+  }
+
+  /** Tests only: forget the shared instances (a test that deletes the pins file is a new machine). */
+  static resetSharedForTests(): void {
+    SetupPins.byPath.clear();
+  }
+
   private state: PinState | null = null;
   private loaded = false;
   private unreadable = false;

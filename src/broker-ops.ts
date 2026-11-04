@@ -164,7 +164,7 @@ export class BrokerOps {
     private readonly depsOverride: Partial<Deps> = {},
     opts: { pinsPath?: string } = {},
   ) {
-    const pins = new SetupPins(opts.pinsPath ?? path.join(systemRoot(), 'setup-pins.json'));
+    const pins = SetupPins.shared(opts.pinsPath ?? path.join(systemRoot(), 'setup-pins.json'));
     this.api = new AgentVaultAPI(apiKey, loadEncryptionKey(encKeyB64), vaultUrl, signer, pins);
     this.state = state;
   }
