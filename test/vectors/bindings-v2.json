@@ -186,12 +186,33 @@
     "field": "binding.template"
   },
   {
-    "name": "v1 API key cannot stamp",
+    "name": "v1 API key may stamp (AWS SigV4, HMAC recipes, pre-release X JSON)",
     "shape": "api_key",
     "delivery": "http",
     "binding": {"in":"stamp"},
+    "ok": true
+  },
+  {
+    "name": "v2 API key may stamp alone",
+    "shape": "api_key",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"stamp","name":"","template":""}]},
+    "ok": true
+  },
+  {
+    "name": "v2 key and ID may stamp alone (AWS SigV4, HMAC)",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"stamp","name":"","template":""}]},
+    "ok": true
+  },
+  {
+    "name": "v2 key and ID stamp must be alone",
+    "shape": "key_id",
+    "delivery": "http",
+    "binding": {"v":2,"placements":[{"in":"stamp","name":"","template":""},{"in":"header","name":"x-id","template":"{part:id}"}]},
     "ok": false,
-    "field": "binding.in"
+    "field": "binding.placements.0.in"
   },
   {
     "name": "v1 signed set requires stamp",
@@ -657,8 +678,8 @@
     "field": "binding.placements.0.in"
   },
   {
-    "name": "v2 stamp requires signed set",
-    "shape": "api_key",
+    "name": "v2 stamp needs a signed set or a single key",
+    "shape": "password",
     "delivery": "http",
     "binding": {"v":2,"placements":[{"in":"stamp","name":"","template":""}]},
     "ok": false,

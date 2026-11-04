@@ -394,9 +394,12 @@ export class BrokerOps {
         if (operationId && Object.keys(parts).length !== 1) {
           return err('Refused: signed operations work with single-part keys only. Nothing was sent.', 'BAD_REQUEST');
         }
-        secret = stampRecipe
+        // What the stamp code reads: X's four values, or {"id","secret"} (AWS SigV4, HMAC recipes).
+        secret = stampRecipe && s.setup!.shape === 'signed_set'
           ? JSON.stringify(oauth1FromParts(parts))
-          : Object.values(parts)[0];
+          : stampRecipe && s.setup!.shape === 'key_id'
+            ? JSON.stringify({ id: parts.id, secret: parts.secret })
+            : Object.values(parts)[0];
       }
       const values = parts ? Object.values(parts) : [secret];
       if (values.some((value) => looksLikePrivateKey(value))) {

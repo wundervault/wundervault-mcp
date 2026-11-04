@@ -220,9 +220,9 @@ export function validateBindingV2(
       if (binding.in !== 'stamp') return badBinding('binding.in', 'a signed set requires a stamp');
     } else if (shape !== 'api_key') {
       return badBinding('binding', 'this shape requires named-part placements');
-    } else if (binding.in === 'stamp') {
-      return badBinding('binding.in', 'only a signed set may use a stamp');
     }
+    // A single key may stamp too: AWS SigV4 and HMAC recipes take one secret as the MAC key,
+    // and a pre-release X entry holds its four values as one JSON value.
     return { ok: true, binding: { ...binding, v: 1 } };
   }
 
@@ -250,8 +250,8 @@ export function validateBindingV2(
       return badBinding(`${field}.in`, 'unknown placement location');
     }
     if (p.in === 'stamp') {
-      if (shape !== 'signed_set' || raw.placements.length !== 1) {
-        return badBinding(`${field}.in`, 'a stamp must be alone and requires a signed set');
+      if (!['signed_set', 'api_key', 'key_id'].includes(shape) || raw.placements.length !== 1) {
+        return badBinding(`${field}.in`, 'a stamp must be alone, on a signed set, a single key, or an ID and secret');
       }
       if (p.name !== '' || p.template !== '') {
         return badBinding(field, 'a stamp has an empty name and template');

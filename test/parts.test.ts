@@ -324,8 +324,9 @@ describe('validateBindingV2', () => {
     refused(v2([{ in: 'stamp', name: '', template: '{part:consumer_key}' }]), 'signed_set');
   });
 
-  it('refuses a stamp for an API key', () => {
-    refused(v2([{ in: 'stamp', name: '', template: '' }]), 'api_key');
+  it('refuses a stamp for a password, and accepts one for a single key', () => {
+    refused(v2([{ in: 'stamp', name: '', template: '' }]), 'password');
+    expect(checked(v2([{ in: 'stamp', name: '', template: '' }]), 'api_key').placements[0]!.in).toBe('stamp');
   });
 
   it('keeps a v1 basic username rather than converting it', () => {
