@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'vitest';
@@ -216,16 +216,42 @@ test('add-signature refuses a duplicate key_id without changing the signatures f
   });
 });
 
+// check-release-keys.mjs reads ../dist/release-keys.js, so each case runs a copy of the script
+// beside a stub key list: the shipped list holds the owner's key and must not be edited by a test.
+function checkKeys(keys: unknown[], args: string[] = []) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'wv-keys-'));
+  try {
+    mkdirSync(path.join(dir, 'scripts', 'lib'), { recursive: true });
+    mkdirSync(path.join(dir, 'dist'));
+    copyFileSync(path.join(root, 'scripts', 'check-release-keys.mjs'), path.join(dir, 'scripts', 'check-release-keys.mjs'));
+    copyFileSync(path.join(root, 'scripts', 'lib', 'release-cli.mjs'), path.join(dir, 'scripts', 'lib', 'release-cli.mjs'));
+    writeFileSync(path.join(dir, 'dist', 'release-keys.js'), `export const RELEASE_KEYS = ${JSON.stringify(keys)};\n`);
+    const r = spawnSync(process.execPath, [path.join(dir, 'scripts', 'check-release-keys.mjs'), ...args],
+      { encoding: 'utf8', timeout: 30000 });
+    return { status: r.status, output: `${r.stdout}${r.stderr}` };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+const KEY32 = Buffer.alloc(32, 7).toString('base64');
+
 test('check-release-keys refuses the empty configured key list', () => {
-  refused(run('check-release-keys.mjs', []), /RELEASE_KEYS is empty/);
+  refused(checkKeys([]), /RELEASE_KEYS is empty/);
 });
 
 test('check-release-keys allows the empty configured key list explicitly', () => {
-  const result = run('check-release-keys.mjs', ['--allow-empty']);
+  const result = checkKeys([], ['--allow-empty']);
   assert.equal(result.status, 0, result.output);
   assert.match(result.output, /Release keys OK \(0\)/);
 });
 
-// check-release-keys.mjs imports a fixed dist/release-keys.js and supports only
-// --allow-empty, not a module override. A test:true fixture cannot be supplied without
-// modifying the built application, so that case is intentionally not exercised here.
+test('check-release-keys refuses a test key and a duplicate id', () => {
+  refused(checkKeys([{ id: 't', publicKey: KEY32, test: true }]), /TEST release key refused/);
+  refused(checkKeys([{ id: 'a', publicKey: KEY32 }, { id: 'a', publicKey: KEY32 }]), /Duplicate/);
+});
+
+test('the shipped key list passes the release check', () => {
+  const result = run('check-release-keys.mjs', []);
+  assert.equal(result.status, 0, result.output);
+  assert.match(result.output, /Release keys OK \(1\)/);
+});

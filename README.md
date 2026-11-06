@@ -94,7 +94,7 @@ and is short enough to read first.
 names node and the broker by their full paths, for example:
 
 ```bash
-sudo /usr/bin/node /usr/bin/wundervault-agent --pair
+sudo /opt/wundervault/current/node /opt/wundervault/current/app/bin/wundervault-agent --pair
 ```
 
 Use full paths with `sudo`, not bare names: `sudo` may look a name up on your own PATH, and a folder
@@ -193,7 +193,7 @@ If something on Windows or macOS fails, tell us what it printed:
 - **A log on your computer.** Every call is recorded by the broker, signed, and checked
   against a copy of its chain we hold, so a changed log is detected. For "run without asking"
   secrets, where the secret went and why stays on your computer; we never see it.
-  `sudo /usr/bin/node /usr/bin/wundervault-agent --destinations` opens it (full paths, as for pairing).
+  `sudo /opt/wundervault/current/node /opt/wundervault/current/app/bin/wundervault-agent --destinations` opens it (full paths, as for pairing).
 - **HTTPS only**, with real certificate checks; redirects are not followed; private network
   addresses are refused unless you allowed one for that secret.
 

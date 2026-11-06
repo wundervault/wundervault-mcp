@@ -4,6 +4,35 @@ Changes to `@wundervault/mcp-server`: the MCP server, the broker (`wundervault-a
 installers. The full history, with the website's changes beside it, is at
 <https://wundervault.com/changelog>.
 
+## [2.2.0] — 2026-11-06
+
+The last update installed by hand: from this version on, brokers update from the vault.
+
+### Added
+
+- **Update now.** A root updater installs updates the owner starts from the vault (Computers ›
+  Update now, one passkey check). The browser seals the order to the broker; the server relays it and
+  cannot read or forge it. The updater checks a release record signed with the owner's release key
+  (`src/release-keys.ts`) and every file's sha256, installs beside the running version, switches,
+  restarts and checks health, and rolls back by itself if the new version is unhealthy. Updates are
+  forward-only. Node.js is bundled and checked against the Node.js release team's signatures
+  (`packaging/node-release-keys/`).
+- **Install root.** Code and the bundled Node live in a root-owned folder, separate from broker data:
+  `/opt/wundervault` on Linux and macOS, `C:\Program Files\Wundervault` on Windows. Pair with
+  `sudo /opt/wundervault/current/node /opt/wundervault/current/app/bin/wundervault-agent --pair` (the installers print it).
+- **Sealed setups.** The broker reads each secret's setup (placements, addresses, approval rules) from a
+  copy sealed to it and the owner's browser, refuses a changed or older one, and pins the newest it has
+  seen. Approval details for payments, signatures and recipes are sealed on locked accounts.
+- **Keys with named parts.** An ID and a secret (or more parts) each go where the setup says; AWS
+  SigV4 and exchange HMAC stamps take an ID and a secret.
+
+### Fixed
+
+- Signed requests to an address with a non-default port signed a `Host` without the port.
+- Windows: a local client that reset its connection during the broker's hello crashed the broker.
+- Windows: install root setup and the updater's health check (both new in this release) work on a
+  real Windows machine, not only in simulation.
+
 ## [2.1.0] — 2026-10-29
 
 ### Security
