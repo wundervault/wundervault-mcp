@@ -78,12 +78,12 @@ describe('round 1 Windows layout boundaries', () => {
       windows.indexOf("if ($Action -eq 'uninstall') {"),
     );
     expect(writer).toContain('if ([System.IO.File]::Exists($Path))');
-    expect(writer).toContain('[System.IO.File]::Replace($Temp, $Path, $null)');
+    expect(writer).toContain('[System.IO.File]::Replace($Temp, $Path, [NullString]::Value)');
     expect(writer).toContain('[System.IO.File]::Move($Temp, $Path)');
     expect(writer).not.toContain('Move-Item');
     expect(windows).not.toMatch(/Move-Item[^\r\n]*-Force/);
     expect(windows).toContain('Write-LayoutFile $Active (');
-    expect(windows).toContain('[System.IO.File]::Replace($Temp, $ManifestPath, $null)');
+    expect(windows).toContain('[System.IO.File]::Replace($Temp, $ManifestPath, [NullString]::Value)');
   });
 
   it('grants and verifies exactly Read, Write, Synchronize without destructive rights', () => {
@@ -238,4 +238,11 @@ describe.skipIf(!canRun)('round 1 non-root POSIX layouts', () => {
       f.cleanup();
     }
   }, 150_000);
+});
+
+describe('Windows layout: no $null into a .NET string parameter', () => {
+  it('never passes $null as File.Replace\'s backup path (PowerShell 5.1 makes it "")', () => {
+    const windows = readFileSync(new URL('../packaging/layout-windows.ps1', import.meta.url), 'utf8');
+    expect(windows).not.toMatch(/::Replace\([^)]*\$null\)/);
+  });
 });

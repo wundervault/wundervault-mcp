@@ -370,7 +370,9 @@ export class BrokerNotAuthentic extends Error {}
  * The order matters and is the whole point: nonce out, signature in, verify, and only then
  * does the caller get a socket it may write a token to.
  */
-export function connectToEndpoint(ep: Endpoint, timeoutMs: number): Promise<net.Socket> {
+export function connectToEndpoint(
+  ep: Endpoint, timeoutMs: number, pubFile?: string,
+): Promise<net.Socket> {
   if (ep.kind === 'path') {
     return Promise.resolve(net.createConnection(ep.address));
   }
@@ -382,7 +384,7 @@ export function connectToEndpoint(ep: Endpoint, timeoutMs: number): Promise<net.
         `No broker is listening: ${ep.file} is missing or unreadable.`));
       return;
     }
-    const pub = loadBrokerPublicKey();
+    const pub = loadBrokerPublicKey(pubFile);
     if (!pub) {
       reject(new BrokerNotAuthentic(
         `Cannot verify the broker: ${brokerPubPath()} is missing or unreadable, and this ` +
@@ -469,9 +471,11 @@ export function connectToEndpoint(ep: Endpoint, timeoutMs: number): Promise<net.
   });
 }
 
-function loadBrokerPublicKey(): crypto.KeyObject | null {
+// `file` lets the root updater name the published key's fixed path: it runs as SYSTEM with a
+// minimal environment, where the path helpers' account detection does not apply.
+function loadBrokerPublicKey(file?: string): crypto.KeyObject | null {
   try {
-    const b64 = fs.readFileSync(brokerPubPath(), 'utf8').trim();
+    const b64 = fs.readFileSync(file ?? brokerPubPath(), 'utf8').trim();
     return crypto.createPublicKey({
       key: Buffer.from(b64, 'base64'), format: 'der', type: 'spki',
     });

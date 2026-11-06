@@ -11,6 +11,7 @@ import {
   type ReleaseRecord,
 } from './release-verify.js';
 import { extractNodeMember } from './tar-read.js';
+import { connectToEndpoint } from './endpoint.js';
 import type { UpdaterDeps } from './updater.js';
 
 function syncDirectory(dir: string): void {
@@ -424,9 +425,25 @@ export function defaultDeps(): UpdaterDeps {
         await runProgram(exe, ['restart', 'wundervault-agent.service'], root, env, false, 60_000);
       }
     },
-    ping() {
+    async ping() {
+      // Windows has no socket path: the broker listens on a loopback port named in mgmt.port and
+      // proves itself with a signed hello. Connecting to `socket` there could never succeed, so
+      // every Windows update was judged unhealthy and its rollback too ("rollback failed"; found
+      // on win199, 2026-11-05). Same connection as every agent's, key at its fixed path.
+      let client: net.Socket;
+      if (windows) {
+        const run = path.join(programData, 'wundervault', 'run');
+        try {
+          client = await connectToEndpoint(
+            { kind: 'port', file: path.join(run, 'mgmt', 'mgmt.port') }, 5_000,
+            path.join(run, 'broker.pub'));
+        } catch {
+          return null;
+        }
+      } else {
+        client = net.createConnection(socket);
+      }
       return new Promise(resolve => {
-        const client = net.createConnection(socket);
         let buffer = Buffer.alloc(0);
         let finished = false;
         const finish = (reply: { version: string; store_ok: boolean } | null): void => {
@@ -437,7 +454,8 @@ export function defaultDeps(): UpdaterDeps {
           resolve(reply);
         };
         const timer = setTimeout(() => finish(null), 5_000);
-        client.once('connect', () => client.write('{"action":"ping"}\n'));
+        if (windows) client.write('{"action":"ping"}\n');
+        else client.once('connect', () => client.write('{"action":"ping"}\n'));
         client.on('data', (chunk: Buffer) => {
           if (finished) return;
           if (buffer.length + chunk.length > 64 * 1024) {
