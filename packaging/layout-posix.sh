@@ -1,4 +1,6 @@
 #!/bin/sh
+# "A && B || die" is used on purpose throughout: die exits, so it runs exactly when A or B fails.
+# shellcheck disable=SC2015
 set -eu
 set -f
 umask 022
@@ -70,7 +72,7 @@ ROOT=$PREFIX/opt/wundervault
 SPOOL=$PREFIX/var/lib/wundervault-update
 UNIT_DIR=$PREFIX/etc/systemd/system
 PLIST=$PREFIX/Library/LaunchDaemons/com.wundervault.update.plist
-SCRIPT_DIR=$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")" && pwd -P)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(/usr/bin/dirname -- "$0")" && pwd -P)
 MANIFEST=$ROOT/state/manifest.json
 ROOT_GROUP=root
 CHOWN=/bin/chown
@@ -366,9 +368,12 @@ LOCK_TEMP=
 release_lock() {
     if [ -n "$LOCK_TEMP" ]; then
         # Do not remove a successor's lock if ours was broken while we were running.
+        # -ef is not in POSIX but every /bin/sh this runs under has it (dash, bash on macOS, busybox).
+        # shellcheck disable=SC3013
         if [ "$LOCK_TEMP" -ef "$ROOT/state/lock" ]; then
             /bin/rm -f "$ROOT/state/lock"
         fi
+        # shellcheck disable=SC3013
         if [ "$LOCK_TEMP" -ef "$ROOT/state/lock.break" ]; then
             /bin/rm -f "$ROOT/state/lock.break"
         fi
