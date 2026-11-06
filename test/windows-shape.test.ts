@@ -604,3 +604,32 @@ describe('the packaged PowerShell must be readable by the PowerShell that ships 
     });
   }
 });
+
+describe('withHello: a client that resets mid-hello', () => {
+  it('does not raise an unhandled error (which would end the broker)', async () => {
+    process.env.WUNDERVAULT_PLATFORM_SHAPE = 'windows';
+    const endpoint = await import('../src/endpoint.js');
+    const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const signer = endpoint.helloSignerFrom(privateKey.export({ type: 'pkcs8', format: 'pem' }) as string);
+    const errors: unknown[] = [];
+    const onUncaught = (e: unknown) => errors.push(e);
+    process.on('uncaughtException', onUncaught);
+    let accepted!: () => void;
+    const got = new Promise<void>((r) => { accepted = r; });
+    const srv: net.Server = net.createServer((sock) => {
+      endpoint.withHello(() => { /* never reached */ }, signer, () => 0)(sock);
+      // What a reset delivers to an accepted socket, without depending on the kernel's timing.
+      setImmediate(() => { sock.emit('error', Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })); accepted(); });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+    const c = net.createConnection({ host: '127.0.0.1', port: (srv.address() as net.AddressInfo).port });
+    c.on('error', () => {});
+    c.on('connect', () => c.write('{"hello":"wv-broker-hel'));
+    await got;
+    await new Promise((r) => setTimeout(r, 50));
+    process.off('uncaughtException', onUncaught);
+    c.destroy();
+    await new Promise<void>((r) => srv.close(() => r()));
+    expect(errors).toEqual([]);
+  });
+});

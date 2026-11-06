@@ -286,6 +286,10 @@ export function withHello(
     // before handing it on. Nothing is decoded here except one complete line.
     let buf: Buffer = Buffer.alloc(0);
     let settled = false;
+    // AN ERROR LISTENER BEFORE THE HANDOFF. The real handler adds its own only once it has the
+    // socket, so a client that reset the connection mid-hello raised an unhandled 'error' and
+    // took the whole broker down (review win r2 F1). It stays harmless after the handoff.
+    socket.on('error', () => { /* a client that hangs up mid-hello is not an event */ });
 
     const handOff = (rest: Buffer) => {
       if (settled) return;
