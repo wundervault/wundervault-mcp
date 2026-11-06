@@ -239,7 +239,7 @@ function Save-Manifest {
         $Stream.Dispose()
     }
     if ([System.IO.File]::Exists($ManifestPath)) {
-        [System.IO.File]::Replace($Temp, $ManifestPath, $null)
+        [System.IO.File]::Replace($Temp, $ManifestPath, [NullString]::Value)   # $null becomes "" in PowerShell 5.1: "path is not of a legal form"
     } else {
         [System.IO.File]::Move($Temp, $ManifestPath)
     }
@@ -297,7 +297,7 @@ function Write-LayoutFile {
         $Stream.Dispose()
     }
     if ([System.IO.File]::Exists($Path)) {
-        [System.IO.File]::Replace($Temp, $Path, $null)
+        [System.IO.File]::Replace($Temp, $Path, [NullString]::Value)
     } else {
         [System.IO.File]::Move($Temp, $Path)
     }
