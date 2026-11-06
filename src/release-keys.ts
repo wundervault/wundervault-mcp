@@ -10,4 +10,7 @@ export interface ReleaseKey {
  * Test builds replace this file with scripts/use-test-key.mjs. CI refuses a release
  * whose list holds a key with test:true, so a test signer cannot ship by accident.
  */
-export const RELEASE_KEYS: readonly ReleaseKey[] = [];
+export const RELEASE_KEYS: readonly ReleaseKey[] = [
+  // "Wundervault release key" in the owner's vault (signing key, Asks me first), created 2026-11-06.
+  { id: 'wv-release-1', publicKey: 'Oxzd8zjw406H9gHHU1EGyToVhzbUy0Pj0zmZ7dkXL58=' },
+];
