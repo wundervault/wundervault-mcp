@@ -82,4 +82,32 @@ describe('updater ping on Windows', () => {
     const { defaultDeps } = await import('../src/updater-platform.js');
     expect(await defaultDeps().ping()).toBeNull();
   });
+
+  it('answers null quickly for a stale mgmt.port naming a closed port', async () => {
+    const id = identity();
+    const srv = await broker(id.priv, id.pubB64);
+    await new Promise<void>((r) => srv.close(() => r()));   // the file stays, nothing listens
+    const { defaultDeps } = await import('../src/updater-platform.js');
+    const t = Date.now();
+    expect(await defaultDeps().ping()).toBeNull();
+    expect(Date.now() - t).toBeLessThan(6_000);
+  });
+
+  it('answers null within the handshake deadline for a listener that never speaks', async () => {
+    const id = identity();
+    const run = path.join(dir, 'data', 'wundervault', 'run');
+    fs.mkdirSync(path.join(run, 'mgmt'), { recursive: true });
+    fs.writeFileSync(path.join(run, 'broker.pub'), id.pubB64);
+    const sockets: net.Socket[] = [];
+    const silent = net.createServer((s) => { sockets.push(s); });
+    await new Promise<void>((r) => silent.listen(0, '127.0.0.1', () => r()));
+    fs.writeFileSync(path.join(run, 'mgmt', 'mgmt.port'), JSON.stringify({
+      port: (silent.address() as net.AddressInfo).port, pid: 1, server_id: 'a'.repeat(32) }));
+    const { defaultDeps } = await import('../src/updater-platform.js');
+    const t = Date.now();
+    expect(await defaultDeps().ping()).toBeNull();
+    expect(Date.now() - t).toBeLessThan(8_000);
+    sockets.forEach((s) => s.destroy());
+    await new Promise<void>((r) => silent.close(() => r()));
+  }, 15_000);
 });
