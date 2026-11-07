@@ -770,3 +770,32 @@ describe('SessionCache.expire (round 1, F2)', () => {
     expect(logins).toBe(1);
   });
 });
+
+describe('SessionCache round 3', () => {
+  it('runs one login at a time per group, even for different keys (F2)', async () => {
+    const c = new SessionCache();
+    let active = 0; let most = 0;
+    const login = async () => { active++; most = Math.max(most, active); await new Promise((r) => setTimeout(r, 20)); active--; return 's'; };
+    await Promise.all([
+      c.singleFlight('k1', () => c.exclusive('g', login)),
+      c.singleFlight('k2', () => c.exclusive('g', login)),
+      c.singleFlight('k3', () => c.exclusive('g', login)),
+    ]);
+    expect(most).toBe(1);
+  });
+  it('a session with no stated lifetime still expires (B2)', () => {
+    let t = 0;
+    const c = new SessionCache(() => t);
+    c.set('k', 's');
+    t = SessionCache.DEFAULT_TTL_SECONDS * 1000 - 1;
+    expect(c.get('k')).toBe('s');
+    t += 1;
+    expect(c.get('k')).toBeUndefined();
+  });
+  it('remembers recent sessions per group, bounded', () => {
+    const c = new SessionCache();
+    for (let i = 0; i < 20; i++) c.remember('g', `s${i}`);
+    expect(c.seen('g')).toHaveLength(SessionCache.MAX_HISTORY);
+    expect(c.seen('g')).toContain('s19');
+  });
+});

@@ -59,7 +59,7 @@ export function activityCheckPath(): string {
   return path.join(path.dirname(activityLogPath()), 'activity-check.json');
 }
 
-export type ActivityKind = 'call' | 'ssh' | 'ssh_closed' | 'pay' | 'sign' | '2fa' | 'pruned' | 'gap';
+export type ActivityKind = 'call' | 'ssh' | 'git' | 'ssh_closed' | 'pay' | 'sign' | '2fa' | 'pruned' | 'gap';
 export type Approval = 'none' | 'asked' | 'approved' | 'not_approved';
 
 /** What the broker reports about one use. */

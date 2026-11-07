@@ -727,7 +727,12 @@ export class BrokerOps {
         // now, on this call, not at the next restart.
         SIGN_IN_SESSIONS.deleteWhere((k) => k.startsWith(prefix) && k !== key);
         const internal = si.pin ? { certPin: si.pin } : undefined;
-        const doLogin = async (): Promise<string> => {
+        const doLogin = (): Promise<string> => SIGN_IN_SESSIONS.exclusive(prefix, async () => {
+          const s2 = await doLoginOnce();
+          SIGN_IN_SESSIONS.remember(prefix, s2);
+          return s2;
+        });
+        const doLoginOnce = async (): Promise<string> => {
           let replyHeaders: Record<string, string | string[] | undefined> = {};
           const rendered = renderLoginBody(si.recipe, lg);
           const loginDef = {
@@ -777,7 +782,7 @@ export class BrokerOps {
           usedSessions.push(session);
           result = await performOperation(def, agentBody, session, si.approvedOrigins, undefined, undefined, internal);
         }
-        for (const form of secretFormsFor([...usedSessions, lg.password]).sort((a, b) => b.length - a.length)) {
+        for (const form of secretFormsFor([...usedSessions, ...SIGN_IN_SESSIONS.seen(prefix), lg.password]).sort((a, b) => b.length - a.length)) {
           result = scrubSecret(result, form) as typeof result;
         }
         if (result.status) rec.status = result.status;
@@ -861,7 +866,7 @@ export class BrokerOps {
     audited_host: string;
   } | OpError> {
     const rec: ActivityRecord = {
-      kind: 'ssh', outcome: 'refused', agent: this.agentName, entry_id: args.entryId,
+      kind: args.op?.kind === 'git' ? 'git' : 'ssh', outcome: 'refused', agent: this.agentName, entry_id: args.entryId,
       reason: args.purpose, address: `ssh://${String(args.op?.destination ?? '')}`,
       extra: {
         op: String(args.op?.kind ?? ''),

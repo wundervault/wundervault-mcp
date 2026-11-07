@@ -727,6 +727,21 @@ describe('BrokerOps.call with sign-in recipes', () => {
     } finally { echoHistory = false; }
   });
 
+  it('a LATER call still scrubs a session retired by an earlier re-login (round 3, F1)', async () => {
+    const e = entry();
+    entries.set(e.id, e);
+    success(await call(e.id));
+    currentSession = null;
+    success(await call(e.id)); // re-login: the first session is retired
+    echoHistory = true;
+    try {
+      const r = await call(e.id); // uses the cached second session; reply lists both
+      success(r);
+      expect(issuedSessions).toHaveLength(2);
+      expectNoSecrets(r, issuedSessions);
+    } finally { echoHistory = false; }
+  });
+
   it('a POST that meets an ended session is not sent again (round 1, B3)', async () => {
     const e = entry();
     entries.set(e.id, e);

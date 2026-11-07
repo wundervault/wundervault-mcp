@@ -381,8 +381,41 @@ export function scrubResponse(
 export class SessionCache {
   private readonly sessions = new Map<string, { session: string; expiresAt?: number }>();
   private readonly flights = new Map<string, Promise<string>>();
+  /** Every session seen per group (agent+entry+address), kept to scrub later replies (round 3, F1). */
+  private readonly history = new Map<string, string[]>();
+  /** One login at a time per group, whatever recipe or value is current (round 3, F2). */
+  private readonly locks = new Map<string, Promise<unknown>>();
+  static readonly MAX_SESSIONS = 256;
+  static readonly MAX_HISTORY = 16;
+  /** A session with no stated lifetime is still not kept for ever (round 3, B2). */
+  static readonly DEFAULT_TTL_SECONDS = 12 * 3600;
 
   constructor(private readonly now: () => number = Date.now) {}
+
+  remember(group: string, session: string): void {
+    const list = (this.history.get(group) ?? []).filter((s) => s !== session);
+    list.push(session);
+    while (list.length > SessionCache.MAX_HISTORY) list.shift();
+    this.history.delete(group);
+    this.history.set(group, list);
+    while (this.history.size > SessionCache.MAX_SESSIONS) {
+      this.history.delete(this.history.keys().next().value as string);
+    }
+  }
+
+  seen(group: string): string[] {
+    return [...(this.history.get(group) ?? [])];
+  }
+
+  async exclusive<T>(group: string, fn: () => Promise<T>): Promise<T> {
+    const before = this.locks.get(group) ?? Promise.resolve();
+    const run = before.catch(() => undefined).then(fn);
+    const tail = run.catch(() => undefined);
+    this.locks.set(group, tail);
+    try { return await run; } finally {
+      if (this.locks.get(group) === tail) this.locks.delete(group);
+    }
+  }
 
   get(key: string): string | undefined {
     const cached = this.sessions.get(key);
@@ -395,9 +428,12 @@ export class SessionCache {
   }
 
   set(key: string, session: string, expiresAfterSeconds?: number): void {
-    const cached: { session: string; expiresAt?: number } = { session };
-    if (expiresAfterSeconds !== undefined) {
-      cached.expiresAt = this.now() + expiresAfterSeconds * 1000;
+    const cached: { session: string; expiresAt?: number } = {
+      session, expiresAt: this.now() + (expiresAfterSeconds ?? SessionCache.DEFAULT_TTL_SECONDS) * 1000,
+    };
+    this.sessions.delete(key);
+    while (this.sessions.size >= SessionCache.MAX_SESSIONS) {
+      this.sessions.delete(this.sessions.keys().next().value as string);
     }
     this.sessions.set(key, cached);
   }
