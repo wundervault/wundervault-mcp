@@ -376,11 +376,16 @@ export class BrokerOps {
       // The fingerprint is part of what the owner approves: a different certificate is a
       // different approval, never a silent change.
       // Folded into the HASH, not the approved address (which stays a plain origin).
-      const recipeSha = signInRecipeSha(rc.recipe, pin ? `${origin}#cert-sha256=${pin.sha256}` : origin);
+      const hashOrigin = pin ? `${origin}#cert-sha256=${pin.sha256}` : origin;
+      const recipeSha = signInRecipeSha(rc.recipe, hashOrigin);
       const approvedAs = origin;
+      // What the owner's page hashes: it recomputes sha256(canonicalJson(detail.recipe)) from
+      // what it shows and never takes our hash, so detail.recipe must be EXACTLY the object
+      // signInRecipeSha hashes (signin.ts).
+      const shownRecipe = { type: 'sign_in', v: 1, origin: hashOrigin, recipe: rc.recipe };
       const vk = await this.api.ensureVaultKey();
       const refused = await approveStamp(this.deps(), {
-        entryId, s, vaultKey: vk, recipe: { sign_in: rc.recipe, ...(pin ? { certificate_sha256: pin.sha256 } : {}) },
+        entryId, s, vaultKey: vk, recipe: shownRecipe,
         recipeSha, origin: approvedAs,
         summary: describeSignIn(rc.recipe, origin, '')
           + (pin ? ` This address uses its own certificate; trust only this one (fingerprint ${pin.sha256.slice(0, 16)}…).` : ''),

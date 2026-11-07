@@ -14,6 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import tls from 'node:tls';
 import { execFileSync } from 'node:child_process';
+import { canonicalJson } from '../src/opdef.js';
 import { BrokerOps } from '../src/broker-ops.js';
 import type { ActivityRecord } from '../src/activity-log.js';
 import { signInRecipeSha, validateSignInRecipe, type SignInRecipe } from '../src/signin.js';
@@ -395,6 +396,12 @@ function expectApproval(id: string, proposed: SignInRecipe, hashOrigin = origin(
   expect(ask).toContain(id);
   // A pinned certificate is folded into the hash; the approved address stays the plain origin.
   expect(ask).toContain(signInRecipeSha(checkedRecipe(proposed), hashOrigin));
+  // The owner's page recomputes sha256(canonicalJson(detail.recipe)) itself (dashboard.js
+  // _commitFields); it must land on the hash the broker checks, or no approval could match.
+  const detail = (approvalRequests[0].body as { detail?: { recipe?: unknown } }).detail;
+  expect(detail?.recipe).toBeDefined();
+  expect(crypto.createHash('sha256').update(canonicalJson(detail!.recipe)).digest('hex'))
+    .toBe(signInRecipeSha(checkedRecipe(proposed), hashOrigin));
   expect(ask).toContain(origin());
   expectNoSecrets(approvalRequests, [...passwords, ...issuedSessions]);
 }
