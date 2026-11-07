@@ -567,7 +567,7 @@ async function main() {
         modules.loadOpenSshEd25519(privateKey),
         (event) => { signEvents.push([event]); },
         '127.0.0.1',
-        { dir: agentDir, socketMode: 0o666, publicKeyMode: 0o644, pinnedHostKey: differentKey },
+        { dir: agentDir, socketMode: 0o666, publicKeyMode: 0o644, pinnedHostKey: differentKey, pinnedUser: target.user },
       );
 
       // A HostKeyAlias alone is still the same server. Pin the second agent to a

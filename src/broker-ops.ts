@@ -1128,7 +1128,7 @@ export class BrokerOps {
       }
       handle = startAgent(identity, undefined, auditedHost, {
         dir, socketMode: 0o666, publicKeyMode: 0o644,
-        ...(pin ? { pinnedHostKey: pin.hostKey } : {}),
+        ...(pin ? { pinnedHostKey: pin.hostKey, pinnedUser: pin.target.user } : {}),
       });
     } catch (e) {
       fs.rmSync(dir, { recursive: true, force: true });

@@ -13,7 +13,7 @@ async function attempt(label, pin) {
   const id = loadOpenSshEd25519(fs.readFileSync(path.join(tmp, 'k'), 'utf8'));
   const dir = fs.mkdtempSync(path.join(tmp, 's')); fs.chmodSync(dir, 0o755);
   const events = [];
-  const h = startAgent(id, (e) => events.push(e), '127.0.0.1', { dir, socketMode: 0o666, publicKeyMode: 0o644, ...(pin ? { pinnedHostKey: pin } : {}) });
+  const h = startAgent(id, (e) => events.push(e), '127.0.0.1', { dir, socketMode: 0o666, publicKeyMode: 0o644, ...(pin ? { pinnedHostKey: pin, pinnedUser: process.env.USER } : {}) });
   const kh = path.join(dir, 'known_hosts'); fs.writeFileSync(kh, `127.0.0.1 ${realHostKey}\n`);
   const r = await new Promise((res) => { const c = spawn('ssh', [...hardenedSshOptions(h.socketPath, h.publicKeyPath), '-o', `UserKnownHostsFile=${kh}`, '-o', 'StrictHostKeyChecking=yes', `${os.userInfo().username}@127.0.0.1`, 'echo', 'OK'], { env: { ...process.env, SSH_AUTH_SOCK: h.socketPath } }); let o = '', e = ''; c.stdout.on('data', (d) => o += d); c.stderr.on('data', (d) => e += d); const t = setTimeout(() => c.kill(), 20000); c.on('close', (code) => { clearTimeout(t); res({ code, o, e }); }); });
   h.close();

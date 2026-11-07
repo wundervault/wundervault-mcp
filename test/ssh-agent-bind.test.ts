@@ -102,9 +102,9 @@ function signRequest(identity: LoadedIdentity, data: Buffer): Buffer {
   return Buffer.concat([Buffer.from([13]), s(identity.keyBlob), s(data), Buffer.alloc(4)]);
 }
 
-function userauth(identity: LoadedIdentity, sessionId: Buffer, hostBound?: Buffer): Buffer {
+function userauth(identity: LoadedIdentity, sessionId: Buffer, hostBound?: Buffer, user = 'opc'): Buffer {
   return Buffer.concat([
-    s(sessionId), Buffer.from([50]), s('opc'), s('ssh-connection'),
+    s(sessionId), Buffer.from([50]), s(user), s('ssh-connection'),
     s(hostBound ? 'publickey-hostbound-v00@openssh.com' : 'publickey'),
     Buffer.from([1]), s('ssh-ed25519'), s(identity.keyBlob),
     ...(hostBound ? [s(hostBound)] : []),
@@ -259,7 +259,7 @@ describe('pinned signing through handleAgentMessage', () => {
     const reply = handleAgentMessage(
       signRequest(identity, userauth(identity, sessionId)), identity,
       (outcome, reason) => outcomes.push({ outcome, reason }), conn,
-      { pinnedHostKey: pinned.blob.toString('base64') },
+      { pinnedHostKey: pinned.blob.toString('base64'), pinnedUser: 'opc' },
     );
     expect(reply[0]).toBe(5);
     expect(outcomes[0].outcome).toBe('refused_binding');
@@ -268,7 +268,7 @@ describe('pinned signing through handleAgentMessage', () => {
 
   it('signs only userauth for the last non-forwarding pinned bind', () => {
     const conn: AgentConnectionState = { binds: [] };
-    const opts = { pinnedHostKey: pinned.blob.toString('base64') };
+    const opts = { pinnedHostKey: pinned.blob.toString('base64'), pinnedUser: 'opc' };
     const sign = (data: Buffer) => handleAgentMessage(signRequest(identity, data), identity, undefined, conn, opts);
     expect(handleAgentMessage(bindRequest(pinned, sessionId), identity, undefined, conn)[0]).toBe(6);
 
@@ -285,9 +285,30 @@ describe('pinned signing through handleAgentMessage', () => {
     expect(sign(data)[0]).toBe(5);
   });
 
+  it('refuses a userauth for another account on the approved server (review 13 r1 F1)', () => {
+    const conn: AgentConnectionState = { binds: [] };
+    const outcomes: Array<{ outcome: string; reason?: string }> = [];
+    const opts = { pinnedHostKey: pinned.blob.toString('base64'), pinnedUser: 'opc' };
+    const sign = (data: Buffer) => handleAgentMessage(signRequest(identity, data), identity,
+      (outcome, reason) => outcomes.push({ outcome, reason }), conn, opts);
+    expect(handleAgentMessage(bindRequest(pinned, sessionId), identity, undefined, conn)[0]).toBe(6);
+    for (const user of ['root', 'OPC', 'opc ', 'opc2', '']) {
+      expect(sign(userauth(identity, sessionId, undefined, user))[0]).toBe(5);
+      expect(sign(userauth(identity, sessionId, pinned.blob, user))[0]).toBe(5);
+    }
+    expect(outcomes.every(o => o.outcome === 'refused_binding')).toBe(true);
+    const ok = userauth(identity, sessionId);
+    expectSignature(sign(ok), ok, identity);
+  });
+
+  it('will not start a pinned agent without the approved user name', () => {
+    expect(() => startAgent(identity, undefined, 'x', { pinnedHostKey: pinned.blob.toString('base64') }))
+      .toThrow(/approved user name/);
+  });
+
   it('supports host-bound userauth and checks its server key too', () => {
     const conn: AgentConnectionState = { binds: [] };
-    const opts = { pinnedHostKey: pinned.blob.toString('base64') };
+    const opts = { pinnedHostKey: pinned.blob.toString('base64'), pinnedUser: 'opc' };
     expect(handleAgentMessage(bindRequest(pinned, sessionId), identity, undefined, conn)[0]).toBe(6);
     const data = userauth(identity, sessionId, pinned.blob);
     expectSignature(handleAgentMessage(signRequest(identity, data), identity, undefined, conn, opts), data, identity);
@@ -378,7 +399,7 @@ function exchange(socket: Socket, body: Buffer): Promise<Buffer> {
   ): Promise<void> {
     const events: SignEvent[] = [];
     const agent = startAgent(socketIdentity, (event) => events.push(event), 'approved.example',
-      pin === undefined ? {} : { pinnedHostKey: pin });
+      pin === undefined ? {} : { pinnedHostKey: pin, pinnedUser: 'opc' });
     const sockets: Socket[] = [];
     const open = async () => {
       const socket = await connect(agent.socketPath);

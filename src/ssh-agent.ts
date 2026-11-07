@@ -354,11 +354,13 @@ function isBoundUserauth(
   data: Buffer,
   identity: LoadedIdentity,
   bind: AgentConnectionState['binds'][number],
+  user: string | undefined,
 ): boolean {
   try {
     const r = new Reader(data);
     if (!r.str().equals(bind.sessionId) || r.byte() !== 50) return false; // SSH_MSG_USERAUTH_REQUEST
-    r.str();                                  // user name
+    // The approved name, byte for byte: another account on the same server is a new approval.
+    if (user === undefined || !r.str().equals(Buffer.from(user, 'utf8'))) return false;
     if (r.str().toString('utf8') !== 'ssh-connection') return false;
     const method = r.str().toString('utf8');
     if (method !== 'publickey' && method !== 'publickey-hostbound-v00@openssh.com') return false;
@@ -441,7 +443,7 @@ export function handleAgentMessage(
           reason = 'The last server session bind is for forwarding, not authentication.';
         } else if (!bind.hostKeyBlob.equals(parseOpenSshPublicKey(opts.pinnedHostKey))) {
           reason = 'The bound server identity does not match the approved server.';
-        } else if (!isBoundUserauth(data, identity, bind)) {
+        } else if (!isBoundUserauth(data, identity, bind, opts.pinnedUser)) {
           reason = 'The signing data is not a userauth request for the bound session.';
         }
         if (reason) {
@@ -504,6 +506,9 @@ export interface AgentSocketOptions {
   publicKeyMode?: number;
   /** Approved server public key: an OpenSSH public key line or a base64 wire blob. */
   pinnedHostKey?: string;
+  /** The approved sign-in name on that server. With a pin, a userauth for any other name is
+   *  refused: the owner approved user@host, not the host (review 13 r1 F1). */
+  pinnedUser?: string;
 }
 
 export function startAgent(
@@ -518,9 +523,13 @@ export function startAgent(
 
   // Validate before creating files, and snapshot the pin so the caller cannot change
   // the signing policy by mutating its options while a session is open.
+  if (opts.pinnedHostKey !== undefined &&
+      (typeof opts.pinnedUser !== 'string' || opts.pinnedUser.length === 0)) {
+    throw new Error('A pinned SSH agent needs the approved user name too.');
+  }
   const agentOpts: AgentSocketOptions = opts.pinnedHostKey === undefined
     ? {}
-    : { pinnedHostKey: parseOpenSshPublicKey(opts.pinnedHostKey).toString('base64') };
+    : { pinnedHostKey: parseOpenSshPublicKey(opts.pinnedHostKey).toString('base64'), pinnedUser: opts.pinnedUser };
 
   const providedDir = typeof opts.dir === 'string' && opts.dir.length > 0;
   const dir = providedDir ? opts.dir! : mkdtempSync(path.join(os.tmpdir(), 'wv-agent-'));
