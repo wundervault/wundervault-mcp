@@ -160,7 +160,15 @@ export function createServer(args: { url?: string } = {}) {
                 + '{body_field: name}, {sha256:[parts]}, {sha512:[parts]}, {sha256_hex:[parts]}, {json:{name: part}} '
                 + '(sorted keys, no spaces). Parts read the request before the stamp is placed; put timestamps and '
                 + 'nonces in the request yourself. place values may use {stamp} and {key_id}. The owner approves '
-                + 'each recipe once per address; the first call waits for that.',
+                + 'each recipe once per address; the first call waits for that. '
+                + 'STORED LOGINS (a username and password, e.g. a router or a self-hosted app whose API wants you to '
+                + 'sign in first): add request.sign_in = {login:{method:"POST"|"PUT", path, body_format:"json"|"form", '
+                + 'body (use "{{username}}" and "{{password}}" where they go)}, session_from:{cookie:name}|{json:"a.b"}|'
+                + '{header:name}, send_session_as:{cookie:name}|{header:name, template:"Bearer {{session}}"}, '
+                + 'signed_out_when?:[401], expires_after_seconds?}. The broker signs in, keeps the session, and sends '
+                + 'it on this and later calls; you never see the password or the session. The owner approves each '
+                + 'sign-in once per address. A device on the owner\'s own network with its own (self-signed) '
+                + 'certificate: add request.trust_certificate:true; the owner approves that exact certificate.',
             },
             purpose: { type: 'string', description: 'Why this is needed (audit log).' },
           },

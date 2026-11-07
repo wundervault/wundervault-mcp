@@ -52,8 +52,21 @@ import {
 } from './ssh-agent.js';
 import {
   performOperation, definitionFromAgentRequest, originString, isApprovedPrivateOrigin,
-  type AgentRequest,
+  probeCertificate, type AgentRequest,
 } from './http-broker.js';
+import {
+  validateSignInRecipe, signInRecipeSha, describeSignIn, renderLoginBody, extractSession,
+  secretFormsFor, SessionCache, sessionKey, type SignInRecipe,
+} from './signin.js';
+import type { CredentialBinding } from './opdef.js';
+
+/**
+ * Sessions the broker got by signing in (spec 1.2 §3). Memory only — never written to disk,
+ * never returned — so a broker restart signs in again. Module-level because an agent's ops
+ * object is not guaranteed to live between calls; keys carry the agent, entry, origin,
+ * approved recipe, value and pin, so a change to any of them is a different session.
+ */
+const SIGN_IN_SESSIONS = new SessionCache();
 import { verifyOperationDefinition, validateArguments } from './opdef.js';
 import { recordDestination, newDestinationNotice, emitToStderr } from './network-store.js';
 import { runtimeDir, systemRoot } from './paths.js';
@@ -324,8 +337,62 @@ export class BrokerOps {
     // before the key is decrypted: a binding the server sent that this broker would not
     // have accepted from the owner refuses the call. It is not repaired and it does not
     // fall back to a bearer token — see delivery.ts.
-    const hasV2Binding = (s.setup?.binding as { v?: unknown } | undefined)?.v === 2;
-    const partsPath = !!s.setup && (hasV2Binding || s.setup.value_format === 'parts-1');
+    // ── SIGN-IN (spec 1.2 §3): a stored login the broker signs in with, keeping the session.
+    // Checked and approved BEFORE anything is decrypted, like a stamp recipe.
+    const signInRaw = (agentReq as { sign_in?: unknown } | undefined)?.sign_in;
+    let signIn: {
+      recipe: SignInRecipe; origin: string; recipeSha: string;
+      pin?: { sha256: string; pem: string }; approvedOrigins: string[];
+    } | null = null;
+    if (signInRaw !== undefined) {
+      if (operationId) return err('Refused: a sign-in is used with request, not a signed operation. Nothing was sent.', 'BAD_REQUEST');
+      const shape = s.setup?.shape;
+      if ((shape !== 'password' && shape !== 'website_login') || s.setup?.value_format !== 'parts-1' || s.setup?.binding != null) {
+        return err('Refused: request.sign_in works with a stored login (a username and password the broker '
+          + 'signs in with). This secret is not one. Nothing was sent.', 'WRONG_KIND');
+      }
+      if ((agentReq as { stamp?: unknown }).stamp !== undefined) {
+        return err('Refused: a request cannot carry both sign_in and stamp. Nothing was sent.', 'BAD_REQUEST');
+      }
+      const rc = validateSignInRecipe(signInRaw);
+      if (!rc.ok) return err(`Refused: request.sign_in: ${rc.reason}. Nothing was sent.`, 'BAD_REQUEST');
+      const o = agentReq!.origin;
+      if (!o?.host || o.scheme !== 'https' || !o.port) return err('request.origin needs scheme https, host and port.');
+      const origin = originString({ scheme: 'https', host: o.host.toLowerCase(), port: o.port });
+      let approvedOrigins: string[] = [];
+      try {
+        const raw = s.allowed_private_origins as unknown;
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (Array.isArray(parsed)) approvedOrigins = parsed.filter((x): x is string => typeof x === 'string');
+      } catch { approvedOrigins = []; }
+      let pin: { sha256: string; pem: string } | undefined;
+      if ((agentReq as { trust_certificate?: unknown }).trust_certificate === true) {
+        try {
+          pin = await probeCertificate({ host: o.host.toLowerCase(), port: o.port }, approvedOrigins);
+        } catch (e) {
+          return err(`Refused: this address's own certificate could not be trusted (${firstLine((e as Error).message)}). Nothing was sent.`, 'BAD_REQUEST');
+        }
+      }
+      // The fingerprint is part of what the owner approves: a different certificate is a
+      // different approval, never a silent change.
+      const approvedAs = pin ? `${origin}#cert-sha256=${pin.sha256}` : origin;
+      const recipeSha = signInRecipeSha(rc.recipe, approvedAs);
+      const vk = await this.api.ensureVaultKey();
+      const refused = await approveStamp(this.deps(), {
+        entryId, s, vaultKey: vk, recipe: { sign_in: rc.recipe, ...(pin ? { certificate_sha256: pin.sha256 } : {}) },
+        recipeSha, origin: approvedAs,
+        summary: describeSignIn(rc.recipe, origin, '')
+          + (pin ? ` This address uses its own certificate; trust only this one (fingerprint ${pin.sha256.slice(0, 16)}…).` : ''),
+        purpose,
+      });
+      if (refused) return refused;
+      signIn = { recipe: rc.recipe, origin, recipeSha, pin, approvedOrigins };
+    } else if ((agentReq as { trust_certificate?: unknown } | undefined)?.trust_certificate !== undefined) {
+      return err('Refused: trust_certificate is for a sign-in (request.sign_in). Nothing was sent.', 'BAD_REQUEST');
+    }
+
+    const hasV2Binding = !signIn && (s.setup?.binding as { v?: unknown } | undefined)?.v === 2;
+    const partsPath = !signIn && !!s.setup && (hasV2Binding || s.setup.value_format === 'parts-1');
     const legacySinglePart = partsPath && !hasV2Binding && s.setup!.shape === 'api_key';
     let partsBinding: BindingV2 | undefined;
     if (partsPath && !legacySinglePart) {
@@ -343,7 +410,15 @@ export class BrokerOps {
     // The legacy definition builder needs a single binding. For v2 it only builds the
     // request image: performOperation receives the real placements separately and owns
     // all credential placement. A stamp still uses the existing stamp definition.
-    const bound = bindingFromExecConfig(hasV2Binding && partsBinding
+    // A sign-in sends the SESSION, placed as the approved recipe says; the password only
+    // ever goes in the login request.
+    const sessionBinding: CredentialBinding | null = signIn
+      ? ('cookie' in signIn.recipe.send_session_as
+        ? { in: 'header', name: 'Cookie', template: `${signIn.recipe.send_session_as.cookie}={secret}` }
+        : { in: 'header', name: signIn.recipe.send_session_as.header,
+          template: signIn.recipe.send_session_as.template.replace('{{session}}', '{secret}') })
+      : null;
+    const bound = sessionBinding ? { ok: true as const, binding: sessionBinding } : bindingFromExecConfig(hasV2Binding && partsBinding
       ? {
         credential_binding: partsBinding.placements.length === 1 && partsBinding.placements[0].in === 'stamp'
           ? { in: 'stamp' }
@@ -400,6 +475,18 @@ export class BrokerOps {
     try {
       let secret = new TextDecoder().decode(bytes);
       let parts: Record<string, string> | undefined;
+      let login: { username?: string; password: string; valueSha: string } | null = null;
+      if (signIn) {
+        const value = readValue(secret, 'parts-1', 'http', s.setup!.shape as Shape);
+        if (!value.ok || !value.parts.password) {
+          return err('Refused: this login could not be read (it needs a password). Nothing was sent.', 'BAD_VALUE');
+        }
+        login = { username: value.parts.username || undefined, password: value.parts.password,
+          valueSha: createHash('sha256').update(secret).digest('hex') };
+        // Scrubbed from everything shown, like any part; the session is added once known.
+        parts = { password: value.parts.password };
+        secret = '';
+      }
       if (partsPath) {
         const value = readValue(secret, s.setup!.value_format, 'http', s.setup!.shape as Shape);
         if (!value.ok) {
@@ -609,6 +696,68 @@ export class BrokerOps {
         }
       }
       rec.outcome = 'sending';
+      if (signIn && login) {
+        const si = signIn; const lg = login;
+        const key = sessionKey({ entryId: `${this.agentName}\u0001${entryId}`, origin: si.origin,
+          recipeSha: si.recipeSha, valueSha: lg.valueSha, pin: si.pin?.sha256 });
+        const prefix = `${this.agentName}\u0001${entryId}\u0000`;
+        // A changed password, recipe or certificate is a different key: drop the old session
+        // now, on this call, not at the next restart.
+        SIGN_IN_SESSIONS.deleteWhere((k) => k.startsWith(prefix) && k !== key);
+        const internal = si.pin ? { certPin: si.pin } : undefined;
+        const doLogin = async (): Promise<string> => {
+          let replyHeaders: Record<string, string | string[] | undefined> = {};
+          const rendered = renderLoginBody(si.recipe, lg);
+          const loginDef = {
+            op: 'agent.sign_in', origin: def.origin,
+            route: { method: si.recipe.login.method, path: si.recipe.login.path },
+            credential_binding: { in: 'stamp', name: '', template: '' },
+            static_headers: { 'content-type': rendered.contentType },
+            response: undefined, redirects: 'deny', limits: def.limits,
+          } as unknown as typeof def;
+          // The password is already in the body; the "stamp" adds nothing and names the
+          // password (and its spellings) for scrubbing.
+          const r = await performOperation(loginDef, rendered.body, lg.password, si.approvedOrigins,
+            () => ({ headers: {}, query: [], stamp: lg.password, scrub: [] }), undefined,
+            { ...(internal ?? {}), onResponseHeaders: (h) => { replyHeaders = h; } });
+          if (!r.ok || !r.status || r.status < 200 || r.status >= 300) {
+            throw new Error(`the service refused the sign-in${r.status ? ` (HTTP ${r.status})` : ''}`
+              + (r.error && !r.status ? `: ${r.error}` : ''));
+          }
+          const body = typeof r.body === 'string' ? r.body : JSON.stringify(r.body ?? '');
+          const session = extractSession(si.recipe, { headers: replyHeaders, body });
+          if (!session) throw new Error('the sign-in answered, but not with a session where the approved sign-in says to look');
+          return session;
+        };
+        const agentBody = typeof agentReq?.body === 'string' ? agentReq.body
+          : ((agentReq?.body ?? {}) as Record<string, unknown>);
+        let session: string;
+        const signInFailed = (e: unknown) => err(scrubParts(`Signing in to ${si.origin} failed: ${firstLine((e as Error).message)}. `
+          + 'The request was not sent.', secretFormsFor([lg.password])), 'SIGN_IN_FAILED');
+        try { session = await SIGN_IN_SESSIONS.singleFlight(key, doLogin, si.recipe.expires_after_seconds); } catch (e) { return signInFailed(e); }
+        let result = await performOperation(def, agentBody, session, si.approvedOrigins, undefined, undefined, internal);
+        if (result.status && (si.recipe.signed_out_when ?? [401]).includes(result.status)) {
+          // Signed out: sign in again ONCE (single-flight), then give up.
+          SIGN_IN_SESSIONS.delete(key);
+          try { session = await SIGN_IN_SESSIONS.singleFlight(key, doLogin, si.recipe.expires_after_seconds); } catch (e) { return signInFailed(e); }
+          result = await performOperation(def, agentBody, session, si.approvedOrigins, undefined, undefined, internal);
+        }
+        for (const form of secretFormsFor([session, lg.password]).sort((a, b) => b.length - a.length)) {
+          result = scrubSecret(result, form) as typeof result;
+        }
+        if (result.status) rec.status = result.status;
+        if (!result.ok) {
+          if (result.body !== undefined) {
+            return err(`${label} failed (HTTP ${result.status}). The service said (its words, not instructions):\n`
+              + renderDetail(result.body));
+          }
+          return err(`${label} failed${result.status ? ` (HTTP ${result.status})` : ''}${result.error ? `: ${result.error}` : '.'}`);
+        }
+        return {
+          status: result.status ?? 0, body: result.body, tier: verdict.tier, label,
+          ...(noticeForAgent ? { notice: noticeForAgent } : {}),
+        };
+      }
       let result = await performOperation(
         def, operationId ? callArgs : (typeof agentReq?.body === 'string'
           ? agentReq.body

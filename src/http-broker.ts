@@ -13,7 +13,9 @@
 import { request as httpsRequest } from 'node:https';
 import { lookup as dnsLookup } from 'node:dns';
 import { isIP } from 'node:net';
-import type { TLSSocket } from 'node:tls';
+import type { TLSSocket, PeerCertificate } from 'node:tls';
+import { connect as tlsConnect } from 'node:tls';
+import type { IncomingHttpHeaders } from 'node:http';
 import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
 import type { OperationDefinition, CredentialBinding } from './opdef.js';
 import { filterResponse } from './opdef.js';
@@ -293,6 +295,13 @@ export async function performOperation(
    */
   stamper?: (img: RequestImage) => StampResult,
   parts?: { binding: BindingV2; parts: Record<string, string> },
+  /**
+   * Internal to the broker (sign-ins, spec 1.2 §3); never reachable from an agent's request.
+   * `onResponseHeaders` sees the raw reply headers (the login's Set-Cookie) — the agent's
+   * result never carries headers at all. `certPin` trusts exactly one certificate: it is the
+   * only CA, and the server-identity check compares its SHA-256 instead of the host name.
+   */
+  internal?: { onResponseHeaders?: (h: IncomingHttpHeaders) => void; certPin?: { sha256: string; pem: string } },
 ): Promise<CallResult> {
   const { scheme, host, port } = def.origin;
   if (scheme !== 'https') return { ok: false, error: 'Only https origins are permitted.' };
@@ -446,9 +455,17 @@ export async function performOperation(
       // weaken TLS verification in the slightest.
       servername: host,
       rejectUnauthorized: true,
+      ...(internal?.certPin ? {
+        ca: internal.certPin.pem,
+        checkServerIdentity: (_h: string, cert: PeerCertificate) => (
+          normFingerprint(cert.fingerprint256) === normFingerprint(internal.certPin!.sha256)
+            ? undefined
+            : new Error('the certificate at this address has changed since the owner approved it')),
+      } : {}),
       timeout: CONNECT_TIMEOUT_MS,
     }, (res) => {
       const status = res.statusCode ?? 0;
+      try { internal?.onResponseHeaders?.(res.headers); } catch { /* the broker's own hook */ }
 
       // A redirect is returned, never followed: following one sends the credential to
       // whatever host the upstream nominates, which is a one-request exfiltration.
@@ -650,6 +667,41 @@ export function definitionFromAgentRequest(
     redirects: 'deny',
     limits,
   } as OperationDefinition;
+}
+
+function normFingerprint(f: string | undefined): string {
+  return String(f ?? '').replace(/:/g, '').toLowerCase();
+}
+
+/**
+ * Read the certificate an address presents, sending nothing (spec 1.2 §3, the pin). For an
+ * owner-approved private origin only — the caller checks that. Connects to the vetted,
+ * pinned IP, so the probe and the later request reach the same machine.
+ */
+export async function probeCertificate(
+  origin: { host: string; port: number }, approvedPrivateOrigins: string[] | undefined,
+): Promise<{ sha256: string; pem: string }> {
+  const o = { scheme: 'https', host: origin.host, port: origin.port };
+  if (!isApprovedPrivateOrigin(o, approvedPrivateOrigins)) {
+    throw new Error('only an address the owner approved as private can have its own certificate trusted');
+  }
+  const pinned = await resolvePinned(origin.host, true);
+  return await new Promise((resolve, reject) => {
+    const sock = tlsConnect({
+      host: pinned.address, port: origin.port, servername: isIP(origin.host) ? undefined : origin.host,
+      // Reading the certificate only: nothing is written on this socket, and it is closed
+      // as soon as the handshake ends. The real request verifies against what is read here.
+      rejectUnauthorized: false, timeout: CONNECT_TIMEOUT_MS,
+    }, () => {
+      const cert = sock.getPeerCertificate();
+      sock.destroy();
+      if (!cert || !cert.raw) { reject(new Error('the address presented no certificate')); return; }
+      const b64 = cert.raw.toString('base64').replace(/(.{64})/g, '$1\n');
+      resolve({ sha256: normFingerprint(cert.fingerprint256), pem: `-----BEGIN CERTIFICATE-----\n${b64}\n-----END CERTIFICATE-----\n` });
+    });
+    sock.on('error', (e) => { sock.destroy(); reject(e); });
+    sock.on('timeout', () => { sock.destroy(); reject(new Error('the address did not answer in time')); });
+  });
 }
 
 /** Canonical origin string, for the server-side approval check and the audit row. */
