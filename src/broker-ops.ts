@@ -715,7 +715,8 @@ export class BrokerOps {
         const si = signIn; const lg = login;
         const key = sessionKey({ entryId: `${this.agentName}\u0001${entryId}`, origin: si.origin,
           recipeSha: si.recipeSha, valueSha: lg.valueSha, pin: si.pin?.sha256 });
-        const prefix = `${this.agentName}\u0001${entryId}\u0000`;
+        // Same agent, entry AND address: another address's session is not stale (round 1, F5).
+        const prefix = `${this.agentName}\u0001${entryId}\u0000${si.origin}\u0000`;
         // A changed password, recipe or certificate is a different key: drop the old session
         // now, on this call, not at the next restart.
         SIGN_IN_SESSIONS.deleteWhere((k) => k.startsWith(prefix) && k !== key);
@@ -752,8 +753,17 @@ export class BrokerOps {
         try { session = await SIGN_IN_SESSIONS.singleFlight(key, doLogin, si.recipe.expires_after_seconds); } catch (e) { return signInFailed(e); }
         let result = await performOperation(def, agentBody, session, si.approvedOrigins, undefined, undefined, internal);
         if (result.status && (si.recipe.signed_out_when ?? [401]).includes(result.status)) {
-          // Signed out: sign in again ONCE (single-flight), then give up.
-          SIGN_IN_SESSIONS.delete(key);
+          // Signed out: forget this session (only if still current; a refresh another call
+          // started is shared, not restarted) and sign in again ONCE.
+          SIGN_IN_SESSIONS.expire(key, session);
+          const readOnly = def.route.method === 'GET' || def.route.method === 'HEAD';
+          if (!readOnly) {
+            // Not resent: a service may have acted on it before answering "signed out", and
+            // a second copy could repeat that (round 1, B3). The next call signs in afresh.
+            return err(`${label}: the service said the session had ended (HTTP ${result.status}). `
+              + 'The request was not sent again, in case it had already taken effect. Check, then call again; '
+              + 'the broker will sign in first.', 'SIGNED_OUT');
+          }
           try { session = await SIGN_IN_SESSIONS.singleFlight(key, doLogin, si.recipe.expires_after_seconds); } catch (e) { return signInFailed(e); }
           result = await performOperation(def, agentBody, session, si.approvedOrigins, undefined, undefined, internal);
         }
@@ -843,7 +853,13 @@ export class BrokerOps {
     const rec: ActivityRecord = {
       kind: 'ssh', outcome: 'refused', agent: this.agentName, entry_id: args.entryId,
       reason: args.purpose, address: `ssh://${String(args.op?.destination ?? '')}`,
-      extra: { op: String(args.op?.kind ?? '') },
+      extra: {
+        op: String(args.op?.kind ?? ''),
+        // push / fetch / … for a git session, so the owner's log tells them apart (round 1, F6).
+        ...(args.op?.kind === 'git' && typeof (args.op as { subcommand?: unknown }).subcommand === 'string'
+          && ['push', 'pull', 'fetch', 'clone', 'ls-remote'].includes((args.op as { subcommand: string }).subcommand)
+          ? { git: (args.op as { subcommand: string }).subcommand } : {}),
+      },
     };
     try {
       const r = await this.sshAgentOpenInner(args, rec);

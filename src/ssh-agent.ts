@@ -490,7 +490,7 @@ export type BrokeredOp =
   | { kind: 'rsync'; destination: string; rsyncArgs: string[] }
   // vault_git: every URL git will connect to for this subcommand, resolved by the caller
   // with git's own rules (pushurl, insteadOf). The broker checks EACH one.
-  | { kind: 'git'; destination: string; urls: string[] };
+  | { kind: 'git'; destination: string; urls: string[]; subcommand?: string };
 
 /**
  * Is this destination one the entry authorises, and what host should the audit name?

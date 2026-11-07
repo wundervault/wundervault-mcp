@@ -68,6 +68,8 @@ let port = 0;
 let broker: BrokerOps;
 let entries = new Map<string, Record<string, unknown>>();
 let wire: WireRequest[] = [];
+let holdSignedOut = 0;
+let heldSignedOut: http.ServerResponse[] = [];
 let checks: CheckBody[] = [];
 let approvalRequests: ApprovalRequest[] = [];
 let denyRecipeApproval = false;
@@ -218,8 +220,26 @@ async function startRouter(certificate: Certificate, requestedPort = 0): Promise
         return;
       }
 
+      if (received.method === 'POST' && received.url === '/reboot') {
+        if (!currentSession || received.headers.cookie !== `sid=${currentSession}`) {
+          sendJson(res, { error: 'Signed out' }, 401);
+          return;
+        }
+        sendJson(res, { ok: true });
+        return;
+      }
+
       if (received.method === 'GET' && received.url === '/status') {
         if (!currentSession || received.headers.cookie !== `sid=${currentSession}`) {
+          if (holdSignedOut > 0) {
+            // Release every "signed out" together, so the callers race to refresh.
+            heldSignedOut.push(res);
+            if (heldSignedOut.length >= holdSignedOut) {
+              holdSignedOut = 0;
+              for (const held of heldSignedOut.splice(0)) sendJson(held, { error: 'Signed out' }, 401);
+            }
+            return;
+          }
           sendJson(res, { error: 'Signed out' }, 401);
           return;
         }
@@ -673,6 +693,32 @@ describe('BrokerOps.call with sign-in recipes', () => {
     expect(requests[1].headers.cookie).toBe(`sid=${oldSession}`);
     expect(requests[2].headers.cookie).toBe(`sid=${currentSession}`);
     expect(approvalRequests).toEqual([]);
+  });
+
+  it('three calls that all meet an ended session share ONE re-login (round 1, F2)', async () => {
+    const e = entry();
+    entries.set(e.id, e);
+    success(await call(e.id));
+    currentSession = null;
+    holdSignedOut = 3;
+    const results = await Promise.all([call(e.id), call(e.id), call(e.id)]);
+    for (const r of results) success(r);
+    expect(wire.filter((w) => w.url === '/status')).toHaveLength(1 + 3 + 3);
+    expect(logins).toBe(2);
+  });
+
+  it('a POST that meets an ended session is not sent again (round 1, B3)', async () => {
+    const e = entry();
+    entries.set(e.id, e);
+    success(await call(e.id));
+    currentSession = null;
+    const r = await call(e.id, { method: 'POST', path: '/reboot', body: {} });
+    expect(JSON.stringify(r)).toContain('not sent again');
+    expect(wire.filter((x) => x.url === '/reboot')).toHaveLength(1);
+    expect(logins).toBe(1);
+    // The next call signs in first, then goes through.
+    success(await call(e.id, { method: 'POST', path: '/reboot', body: {} }));
+    expect(logins).toBe(2);
   });
 
   it('shares one login among five concurrent first calls', async () => {

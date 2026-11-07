@@ -407,6 +407,15 @@ export class SessionCache {
     this.flights.delete(key);
   }
 
+  /**
+   * The service said `used` is signed out. Forget it only if it is still the cached one,
+   * and never cancel a login already in flight: two calls that both got a 401 then share
+   * ONE re-login instead of each starting their own (review round 1, F2).
+   */
+  expire(key: string, used: string): void {
+    if (this.sessions.get(key)?.session === used) this.sessions.delete(key);
+  }
+
   deleteWhere(pred: (key: string) => boolean): void {
     const keys = new Set([...this.sessions.keys(), ...this.flights.keys()]);
     for (const key of keys) {

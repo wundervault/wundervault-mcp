@@ -216,7 +216,7 @@ export function createServer(args: { url?: string } = {}) {
             target_dir: { type: 'string', description: 'clone only: folder name to create inside repo_dir.' },
             refspecs: { type: 'array', items: { type: 'string' }, description: 'push/pull/fetch: branches or refspecs, e.g. ["main"].' },
             flags: { type: 'array', items: { type: 'string' }, description: 'Allowed: push --force-with-lease --tags --set-upstream --dry-run --delete --follow-tags; pull --ff-only --rebase --no-rebase; fetch --tags --prune --dry-run --depth=N; clone --depth=N --branch=NAME --single-branch --no-checkout; ls-remote --heads --tags.' },
-            timeout_seconds: { type: 'number', description: 'Default 120, at most 900.' },
+            timeout_seconds: { type: 'number', description: 'Default 120, at most 870.' },
           },
           required: ['entry_id', 'purpose', 'subcommand', 'repo_dir'],
         },
@@ -406,14 +406,16 @@ export function createServer(args: { url?: string } = {}) {
         const { entry_id: _e, purpose: _p, repo_dir: _r, timeout_seconds: _t, ...reqRaw } = a;
         const v = validateGitRequest(reqRaw);
         if (!v.ok) return fail(`Refused: ${v.reason}. Nothing connected.`);
-        const timeoutSeconds = Math.max(1, Math.min(Number(a.timeout_seconds ?? 120) || 120, 900));
+        // 870, not 900: the signing session lives timeout + 30 s and the broker caps it at 900,
+        // so git can never outlast the session that signs for it (round 1, B4).
+        const timeoutSeconds = Math.max(1, Math.min(Number(a.timeout_seconds ?? 120) || 120, 870));
         // Resolved with git's own rules (pushurl, insteadOf) and with ssh disabled, so
         // working out WHERE git would go cannot itself connect anywhere.
         const resolved = await resolveGitUrls(v.req, repoDir, runGit, gitEnv(process.env, 'false'));
         if (!resolved.ok) return fail(`Refused: ${resolved.reason}. Nothing connected.`);
         const first = parseGitSshUrl(resolved.urls[0]);
         const destination = first.ok ? (first.user ? `${first.user}@${first.host}` : first.host) : '';
-        const op: BrokeredOp = { kind: 'git', destination, urls: resolved.urls };
+        const op: BrokeredOp = { kind: 'git', destination, urls: resolved.urls, subcommand: v.req.subcommand };
         const opened = await broker.send('ssh_agent_open', {
           entry_id, purpose: purpose.slice(0, 200), op_spec: op, ttl_seconds: timeoutSeconds + 30,
         });

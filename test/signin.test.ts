@@ -749,3 +749,24 @@ describe('sessionKey', () => {
     }
   });
 });
+
+describe('SessionCache.expire (round 1, F2)', () => {
+  it('forgets only the session that was reported ended, and never cancels a login in flight', async () => {
+    const c = new SessionCache();
+    c.set('k', 'old');
+    c.expire('k', 'other');
+    expect(c.get('k')).toBe('old');
+    c.expire('k', 'old');
+    expect(c.get('k')).toBeUndefined();
+    let logins = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const p1 = c.singleFlight('k', async () => { logins++; await gate; return 'new'; });
+    c.expire('k', 'old');
+    const p2 = c.singleFlight('k', async () => { logins++; return 'second'; });
+    release();
+    expect(await p1).toBe('new');
+    expect(await p2).toBe('new');
+    expect(logins).toBe(1);
+  });
+});
