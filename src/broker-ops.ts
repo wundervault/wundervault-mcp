@@ -375,8 +375,9 @@ export class BrokerOps {
       }
       // The fingerprint is part of what the owner approves: a different certificate is a
       // different approval, never a silent change.
-      const approvedAs = pin ? `${origin}#cert-sha256=${pin.sha256}` : origin;
-      const recipeSha = signInRecipeSha(rc.recipe, approvedAs);
+      // Folded into the HASH, not the approved address (which stays a plain origin).
+      const recipeSha = signInRecipeSha(rc.recipe, pin ? `${origin}#cert-sha256=${pin.sha256}` : origin);
+      const approvedAs = origin;
       const vk = await this.api.ensureVaultKey();
       const refused = await approveStamp(this.deps(), {
         entryId, s, vaultKey: vk, recipe: { sign_in: rc.recipe, ...(pin ? { certificate_sha256: pin.sha256 } : {}) },
@@ -389,6 +390,15 @@ export class BrokerOps {
       signIn = { recipe: rc.recipe, origin, recipeSha, pin, approvedOrigins };
     } else if ((agentReq as { trust_certificate?: unknown } | undefined)?.trust_certificate !== undefined) {
       return err('Refused: trust_certificate is for a sign-in (request.sign_in). Nothing was sent.', 'BAD_REQUEST');
+    }
+
+    // Stored-only entries (a login, a password with no binding, a 2FA seed) are never sent
+    // as they are. Without request.sign_in nothing here may use them.
+    const storedOnlyShape = s.setup?.shape === 'website_login' || s.setup?.shape === 'two_factor'
+      || (s.setup?.shape === 'password' && s.setup?.binding == null);
+    if (storedOnlyShape && !signIn) {
+      return err('Refused: this secret is stored only and is not sent by the broker. A login can be used with '
+        + 'request.sign_in (the broker signs in for you), and a 2FA seed with vault_2fa_code. Nothing was sent.', 'STORED_ONLY');
     }
 
     const hasV2Binding = !signIn && (s.setup?.binding as { v?: unknown } | undefined)?.v === 2;

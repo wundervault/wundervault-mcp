@@ -123,7 +123,10 @@ export function setupProblem(setup: {
       || (shape === 'password' && setup.binding == null);
     if (storedOnly) {
       if (setup.binding != null) return 'this shape has no web credential binding';
-      return forUse ? 'this key is stored only and is not sent by the broker' : null;
+      // Fetchable, never SENT as it is: the operation decides (spec 1.2 B3). vault_2fa_code
+      // turns a seed into a code; an approved request.sign_in sends the password only in the
+      // login request. Plain vault_call refuses these entries itself (broker-ops STORED_ONLY).
+      return null;
     }
     if (setup.binding == null && shape !== 'api_key') return 'this shape needs a binding';
     if (setup.binding != null) {
