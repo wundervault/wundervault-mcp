@@ -490,8 +490,15 @@ describe('resolveGitUrls with a fake runner', () => {
       const result = await resolveGitUrls(test.req, '/test/repo', async (args, cwd, receivedEnv) => {
         calls += 1;
         expect(args).toEqual(test.args);
-        expect(cwd).toBe('/test/repo');
-        expect(receivedEnv).toBe(env);
+        if (test.req.subcommand === 'clone') {
+          // A clone resolves in an empty folder outside any repository (round 2, F1).
+          expect(cwd).not.toBe('/test/repo');
+          expect(receivedEnv.HOME).toBe(env.HOME);
+          expect(receivedEnv.GIT_CEILING_DIRECTORIES).toBeTruthy();
+        } else {
+          expect(cwd).toBe('/test/repo');
+          expect(receivedEnv).toBe(env);
+        }
         return { code: 0, stdout: 'git@good.example:a/b.git\n', stderr: '' };
       }, env);
 
@@ -624,11 +631,23 @@ describe('resolveGitUrls with real repository configuration', () => {
         )).toEqual({ ok: true, urls: ['git@evil.example:a/b.git'] });
       }
 
+      // A clone does NOT read the folder's own config, so the folder's rewrite must not be
+      // what the broker checks: the clone will contact good.example (round 2, F1). This test
+      // used to expect evil.example — it agreed with the bug.
       expect(await resolveGitUrls(
         { subcommand: 'clone', url: 'git@good.example:a/b.git' },
         repo,
         runGit,
         env,
+      )).toEqual({ ok: true, urls: ['git@good.example:a/b.git'] });
+    });
+  });
+
+  unixIt('a clone resolves with the configuration the clone itself uses (global rewrites apply)', async () => {
+    await withRepository(async ({ repo, env }) => {
+      execFileSync('git', ['config', '--global', 'url.git@evil.example:.insteadOf', 'git@good.example:'], { env, cwd: repo });
+      expect(await resolveGitUrls(
+        { subcommand: 'clone', url: 'git@good.example:a/b.git' }, repo, runGit, env,
       )).toEqual({ ok: true, urls: ['git@evil.example:a/b.git'] });
     });
   });

@@ -69,6 +69,7 @@ let broker: BrokerOps;
 let entries = new Map<string, Record<string, unknown>>();
 let wire: WireRequest[] = [];
 let holdSignedOut = 0;
+let echoHistory = false;
 let heldSignedOut: http.ServerResponse[] = [];
 let checks: CheckBody[] = [];
 let approvalRequests: ApprovalRequest[] = [];
@@ -249,6 +250,11 @@ async function startRouter(certificate: Certificate, requestedPort = 0): Promise
           'x-echo': currentSession,
           'x-echo-password': password,
         });
+        if (echoHistory) {
+          // A diagnostics reply that lists every session ever issued, old ones included.
+          res.end(JSON.stringify({ ok: true, history: issuedSessions }));
+          return;
+        }
         res.end(hostileBody(currentSession, false));
         return;
       }
@@ -705,6 +711,20 @@ describe('BrokerOps.call with sign-in recipes', () => {
     for (const r of results) success(r);
     expect(wire.filter((w) => w.url === '/status')).toHaveLength(1 + 3 + 3);
     expect(logins).toBe(2);
+  });
+
+  it('after a re-login, the OLD session is scrubbed too (round 2, F2)', async () => {
+    const e = entry();
+    entries.set(e.id, e);
+    success(await call(e.id));
+    currentSession = null;
+    echoHistory = true;
+    try {
+      const r = await call(e.id);
+      success(r);
+      expect(issuedSessions).toHaveLength(2);
+      expectNoSecrets(r, issuedSessions);
+    } finally { echoHistory = false; }
   });
 
   it('a POST that meets an ended session is not sent again (round 1, B3)', async () => {

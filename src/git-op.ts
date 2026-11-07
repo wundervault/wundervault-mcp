@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
 import { isIP } from 'node:net';
 import { hardenedSshOptions } from './ssh-agent.js';
 
@@ -365,10 +368,18 @@ export async function resolveGitUrls(
   }
 
   let result: GitResult;
+  // A clone does not read the configuration of the folder it runs in; resolving its URL
+  // there would apply that folder's url.*.insteadOf rewrites, which the clone itself then
+  // ignores — checking one host and connecting to another (round 2, F1). Resolve it in an
+  // empty folder outside any repository, which is what the clone sees.
+  const scratch = request.subcommand === 'clone' ? mkdtempSync(join(tmpdir(), 'wv-git-')) : null;
   try {
-    result = await runGit(args, repoDir, env);
+    result = await runGit(args, scratch ?? repoDir,
+      scratch ? { ...env, GIT_CEILING_DIRECTORIES: dirname(scratch) } : env);
   } catch {
     return { ok: false, reason: 'no such remote' };
+  } finally {
+    if (scratch) rmSync(scratch, { recursive: true, force: true });
   }
   if (result.code !== 0) {
     return { ok: false, reason: 'no such remote' };
@@ -440,14 +451,19 @@ export async function runGit(
   }
 
   return new Promise((resolve) => {
-    const child = spawn('git', args, { cwd, env, stdio: 'pipe' });
+    // Its own process group, so a timeout kills git AND everything it started (ssh, helpers)
+    // before the signing session closes (round 2, B3).
+    const child = spawn('git', args, { cwd, env, stdio: 'pipe', detached: process.platform !== 'win32' });
     const stdout = outputCollector();
     const stderr = outputCollector();
     let finished = false;
 
     const timer = setTimeout(() => {
       finish(124, '\n[git timed out]\n');
-      child.kill('SIGKILL');
+      try {
+        if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGKILL');
+        else child.kill('SIGKILL');
+      } catch { child.kill('SIGKILL'); }
       child.stdout.destroy();
       child.stderr.destroy();
       child.stdin.destroy();

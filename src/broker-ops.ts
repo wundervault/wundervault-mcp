@@ -391,7 +391,13 @@ export class BrokerOps {
           + (pin ? ` This address uses its own certificate; trust only this one (fingerprint ${pin.sha256.slice(0, 16)}…).` : ''),
         purpose,
       });
-      if (refused) return refused;
+      if (refused) {
+        // Not approved (or approval revoked): no session for this address survives it, so a
+        // later re-approval signs in afresh (round 2, F4).
+        const gone = `${this.agentName}\u0001${entryId}\u0000${origin}\u0000`;
+        SIGN_IN_SESSIONS.deleteWhere((k) => k.startsWith(gone));
+        return refused;
+      }
       signIn = { recipe: rc.recipe, origin, recipeSha, pin, approvedOrigins };
     } else if ((agentReq as { trust_certificate?: unknown } | undefined)?.trust_certificate !== undefined) {
       return err('Refused: trust_certificate is for a sign-in (request.sign_in). Nothing was sent.', 'BAD_REQUEST');
@@ -751,6 +757,9 @@ export class BrokerOps {
         const signInFailed = (e: unknown) => err(scrubParts(`Signing in to ${si.origin} failed: ${firstLine((e as Error).message)}. `
           + 'The request was not sent.', secretFormsFor([lg.password])), 'SIGN_IN_FAILED');
         try { session = await SIGN_IN_SESSIONS.singleFlight(key, doLogin, si.recipe.expires_after_seconds); } catch (e) { return signInFailed(e); }
+        // Every session this call used is scrubbed from what it returns, not only the last
+        // one: a reply after a re-login can still echo the old one (round 2, F2).
+        const usedSessions = [session];
         let result = await performOperation(def, agentBody, session, si.approvedOrigins, undefined, undefined, internal);
         if (result.status && (si.recipe.signed_out_when ?? [401]).includes(result.status)) {
           // Signed out: forget this session (only if still current; a refresh another call
@@ -765,9 +774,10 @@ export class BrokerOps {
               + 'the broker will sign in first.', 'SIGNED_OUT');
           }
           try { session = await SIGN_IN_SESSIONS.singleFlight(key, doLogin, si.recipe.expires_after_seconds); } catch (e) { return signInFailed(e); }
+          usedSessions.push(session);
           result = await performOperation(def, agentBody, session, si.approvedOrigins, undefined, undefined, internal);
         }
-        for (const form of secretFormsFor([session, lg.password]).sort((a, b) => b.length - a.length)) {
+        for (const form of secretFormsFor([...usedSessions, lg.password]).sort((a, b) => b.length - a.length)) {
           result = scrubSecret(result, form) as typeof result;
         }
         if (result.status) rec.status = result.status;
