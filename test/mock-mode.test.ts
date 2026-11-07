@@ -15,6 +15,7 @@ const ARGS: Record<string, Record<string, unknown>> = {
   vault_pay: { entry_id: 'demo-0003', payment_required: 'e30=', purpose: 'demo' },
   vault_sign: { entry_id: 'demo-0004', data: 'hello', purpose: 'demo' },
   vault_2fa_code: { entry_id: 'demo-0005', purpose: 'demo' },
+  vault_git: { entry_id: 'demo-0002', purpose: 'demo', subcommand: 'push', repo_dir: '/tmp', remote: 'origin' },
 };
 
 describe('demo mode', () => {

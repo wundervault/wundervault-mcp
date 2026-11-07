@@ -1005,8 +1005,8 @@ class AgentDaemon {
         if (!entry() || !purpose()) return { error: 'ssh_agent_open needs entry_id and purpose.' };
         const ttl = Number.isFinite(msg.ttl_seconds) ? Number(msg.ttl_seconds) : 300;
         const op = msg.op_spec as BrokeredOp | undefined;
-        if (!op || (op.kind !== 'ssh' && op.kind !== 'rsync') || typeof op.destination !== 'string') {
-          return { error: 'ssh_agent_open needs op_spec {kind, destination, remoteArgv|rsyncArgs}.' };
+        if (!op || (op.kind !== 'ssh' && op.kind !== 'rsync' && op.kind !== 'git') || typeof op.destination !== 'string') {
+          return { error: 'ssh_agent_open needs op_spec {kind, destination, remoteArgv|rsyncArgs|urls}.' };
         }
         return await ops.sshAgentOpen({
           entryId: entry(),

@@ -8,6 +8,9 @@ import {
 import { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import { BrokerClient, brokerClient } from './broker-client.js';
 import { runSshWithAgent, type BrokeredOp } from './ssh-agent.js';
+import {
+  validateGitRequest, resolveGitUrls, runGit, gitEnv, sshCommandFor, buildGitArgv, parseGitSshUrl,
+} from './git-op.js';
 import type { AgentRequest } from './http-broker.js';
 import type { VaultEntry } from './types.js';
 import { VERSION } from './version.js';
@@ -70,6 +73,9 @@ function mockToolResult(name: string, args: Record<string, any>) {
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ Signed after the owner approved. signature: ZGVtby1zaWduYXR1cmU=  public_key: ZGVtby1wdWJsaWMta2V5  `
         + `algorithm: ed25519. The signing key never left the broker.${MOCK_NOTE}` }] });
+    case 'vault_git':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `✅ git ${args.subcommand ?? 'push'} completed (exit 0). 1 signature; the key never left the broker.${MOCK_NOTE}` }] });
     case 'vault_2fa_code':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ 2FA code: 123456 (valid for 25 more seconds). The seed never left the broker.${MOCK_NOTE}` }] });
@@ -180,6 +186,31 @@ export function createServer(args: { url?: string } = {}) {
             purpose: { type: 'string', description: 'Why this payment is needed. The owner sees it if they are asked.' },
           },
           required: ['entry_id', 'payment_required', 'purpose'],
+        },
+      },
+      {
+        name: 'vault_git',
+        description: (
+          'Run git push, pull, fetch, clone or ls-remote over SSH with a vaulted SSH key that never '
+          + 'leaves the broker. Every address git would connect to (including a separate push address '
+          + 'and any rewrite in git config) must be in the entry\'s permitted SSH hosts, or nothing '
+          + 'connects. Only SSH remotes; no submodules, no hooks during the run. Linux and macOS only.'
+        ),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            entry_id: { type: 'string', description: 'Vault entry holding the SSH key.' },
+            purpose: { type: 'string', description: 'Why (activity log).' },
+            subcommand: { type: 'string', enum: ['push', 'pull', 'fetch', 'clone', 'ls-remote'] },
+            repo_dir: { type: 'string', description: 'The local repository (for clone: the folder to clone into).' },
+            remote: { type: 'string', description: 'Named remote, e.g. origin. Required except for clone.' },
+            url: { type: 'string', description: 'clone only: the SSH address, e.g. git@github.com:owner/repo.git.' },
+            target_dir: { type: 'string', description: 'clone only: folder name to create inside repo_dir.' },
+            refspecs: { type: 'array', items: { type: 'string' }, description: 'push/pull/fetch: branches or refspecs, e.g. ["main"].' },
+            flags: { type: 'array', items: { type: 'string' }, description: 'Allowed: push --force-with-lease --tags --set-upstream --dry-run --delete --follow-tags; pull --ff-only --rebase --no-rebase; fetch --tags --prune --dry-run --depth=N; clone --depth=N --branch=NAME --single-branch --no-checkout; ls-remote --heads --tags.' },
+            timeout_seconds: { type: 'number', description: 'Default 120, at most 900.' },
+          },
+          required: ['entry_id', 'purpose', 'subcommand', 'repo_dir'],
         },
       },
       {
@@ -355,6 +386,52 @@ export function createServer(args: { url?: string } = {}) {
         return CallToolResultSchema.parse({ content: [{ type: 'text', text:
           `✅ Signed (${r.algorithm}). The key was used in the broker, not returned to you.\n`
           + `signature: ${r.signature}\npublic key: ${r.public_key}` }] });
+      }
+
+      if (request.params.name === 'vault_git') {
+        const a = (request.params.arguments ?? {}) as Record<string, unknown>;
+        const fail = (text: string) => CallToolResultSchema.parse({ content: [{ type: 'text', text }], isError: true });
+        const entry_id = String(a.entry_id ?? '');
+        const purpose = String(a.purpose ?? '');
+        const repoDir = typeof a.repo_dir === 'string' ? a.repo_dir : '';
+        if (!entry_id || !purpose || !repoDir) return fail('vault_git needs entry_id, purpose, subcommand and repo_dir.');
+        const { entry_id: _e, purpose: _p, repo_dir: _r, timeout_seconds: _t, ...reqRaw } = a;
+        const v = validateGitRequest(reqRaw);
+        if (!v.ok) return fail(`Refused: ${v.reason}. Nothing connected.`);
+        const timeoutSeconds = Math.max(1, Math.min(Number(a.timeout_seconds ?? 120) || 120, 900));
+        // Resolved with git's own rules (pushurl, insteadOf) and with ssh disabled, so
+        // working out WHERE git would go cannot itself connect anywhere.
+        const resolved = await resolveGitUrls(v.req, repoDir, runGit, gitEnv(process.env, 'false'));
+        if (!resolved.ok) return fail(`Refused: ${resolved.reason}. Nothing connected.`);
+        const first = parseGitSshUrl(resolved.urls[0]);
+        const destination = first.ok ? (first.user ? `${first.user}@${first.host}` : first.host) : '';
+        const op: BrokeredOp = { kind: 'git', destination, urls: resolved.urls };
+        const opened = await broker.send('ssh_agent_open', {
+          entry_id, purpose: purpose.slice(0, 200), op_spec: op, ttl_seconds: timeoutSeconds + 30,
+        });
+        if (opened.error) return fail(String(opened.error));
+        const sessionId = String(opened.session_id ?? '');
+        let r: { code: number; stdout: string; stderr: string };
+        let signs = 0;
+        try {
+          r = await runGit(
+            buildGitArgv(v.req), repoDir,
+            gitEnv(process.env, sshCommandFor(String(opened.socket_path ?? ''), String(opened.public_key_path ?? ''))),
+            timeoutSeconds * 1000,
+          );
+        } finally {
+          const closed = await broker.send('ssh_agent_close', { session_id: sessionId }).catch(() => ({ signs: 0 }));
+          signs = Number((closed as { signs?: unknown }).signs ?? 0);
+        }
+        const head = r.code === 0
+          ? `✅ git ${v.req.subcommand} completed (exit 0).`
+          : `❌ git ${v.req.subcommand} failed (exit ${r.code}).`;
+        return CallToolResultSchema.parse({
+          content: [{ type: 'text', text:
+            `${head}\n${signs} signature(s) for ${String(opened.audited_host ?? destination)}; the key never left the broker.\n`
+            + `--- stdout ---\n${r.stdout || '(empty)'}\n--- stderr ---\n${r.stderr || '(empty)'}` }],
+          isError: r.code !== 0,
+        });
       }
 
       if (request.params.name === 'vault_2fa_code') {

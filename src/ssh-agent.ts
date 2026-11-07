@@ -31,6 +31,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, chmodSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { parseGitSshUrl } from './git-op.js';
 
 // ── protocol constants (PROTOCOL.agent) ────────────────────────────────────────
 const SSH_AGENT_FAILURE = 5;
@@ -486,7 +487,10 @@ export function quoteForRemoteShell(arg: string): string {
 
 export type BrokeredOp =
   | { kind: 'ssh'; destination: string; remoteArgv: string[] }
-  | { kind: 'rsync'; destination: string; rsyncArgs: string[] };
+  | { kind: 'rsync'; destination: string; rsyncArgs: string[] }
+  // vault_git: every URL git will connect to for this subcommand, resolved by the caller
+  // with git's own rules (pushurl, insteadOf). The broker checks EACH one.
+  | { kind: 'git'; destination: string; urls: string[] };
 
 /**
  * Is this destination one the entry authorises, and what host should the audit name?
@@ -506,6 +510,23 @@ export function checkSshDestination(
     return { ok: false, error:
       'Refused: this entry lists no permitted SSH hosts, so it authorises nothing. '
       + "Add ssh_hosts to the entry's exec_config in the dashboard." };
+  }
+
+  if (op.kind === 'git') {
+    if (!Array.isArray(op.urls) || op.urls.length === 0 || op.urls.length > 16) {
+      return { ok: false, error: 'Refused: a git operation must name the addresses it connects to.' };
+    }
+    const hosts: string[] = [];
+    for (const u of op.urls) {
+      const parsed = typeof u === 'string' ? parseGitSshUrl(u) : { ok: false as const, reason: 'not text' };
+      if (!parsed.ok) return { ok: false, error: 'Refused: git would connect to an address that is not SSH.' };
+      if (!allowedHosts.includes(parsed.host)) {
+        return { ok: false, error:
+          `Refused: git would connect to "${parsed.host}", which is not in this entry's permitted hosts (${allowedHosts.join(', ')}).` };
+      }
+      if (!hosts.includes(parsed.host)) hosts.push(parsed.host);
+    }
+    return { ok: true, auditedHost: hosts.join(',') };
   }
 
   const host = hostOf(op.destination);
@@ -554,6 +575,7 @@ export function checkSshDestination(
  * here makes the check the thing that decides.
  */
 export function buildSshArgv(op: BrokeredOp, socketPath: string, publicKeyPath: string): string[] {
+  if (op.kind === 'git') throw new Error('a git operation is run by vault_git, not as an ssh command');
   if (op.kind === 'ssh') {
     // One quoted string, not N arguments: see quoteForRemoteShell.
     return [
