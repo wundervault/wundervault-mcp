@@ -192,9 +192,28 @@ describe('SSH ask on first use', () => {
     expect(r.code).toBe('HOST_KEY_CHANGED');
     expect(r.error).toContain(fingerprint(OTHER_KEY));
     expect(r.error).toContain(fingerprint(HOST_KEY));
-    expect(r.error).toContain('Replace on the key page');
+    expect(r.error).toContain('remove this server on the secret');
     expect(approveStamp).not.toHaveBeenCalled();
     expectNoSession();
+  });
+
+  it.each(['debian@example.com:000022', 'debian@example.com.', 'debian@EXAMPLE.com', 'debian@example.com:022'])(
+    'refuses a destination not written in its approved form (review 13 r2 F1): %s',
+    async (destination) => {
+      const { ops, keyscan } = broker([approval()]);
+      const r = await open(ops, destination);
+      if (!('error' in r)) throw new Error('a non-canonical destination opened a session');
+      expect(r.code).toBe('BAD_REQUEST');
+      expect(r.error).toContain('debian@example.com');
+      expect(keyscan).not.toHaveBeenCalled();
+      expectNoSession();
+    },
+  );
+
+  it('accepts the approved form with the default port written out', async () => {
+    const { ops } = broker([approval()]);
+    const r = await open(ops, 'debian@example.com:22');
+    if ('error' in r) throw new Error(JSON.stringify(r));
   });
 
   it('asks to pin an owner-added address that has no identity yet', async () => {

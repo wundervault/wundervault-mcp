@@ -118,10 +118,10 @@ test('describePlacement uses plain words for each supported form', () => {
     describePlacement(origin, { in: 'query', name: 'api_key', template: '{secret}' }),
   ];
   assert.deepEqual(descriptions, [
-    'Send this key to api.example.com in the Authorization header (as a Bearer token)',
-    'Send this key to api.example.com in a header named X-Api-Key',
-    'Send this key to api.example.com in a header named X-Api-Key, after "Token "',
-    'Send this key to api.example.com after ? in the address, as ?api_key=…',
+    'Send this secret to api.example.com in the Authorization header (as a Bearer token)',
+    'Send this secret to api.example.com in a header named X-Api-Key',
+    'Send this secret to api.example.com in a header named X-Api-Key, after "Token "',
+    'Send this secret to api.example.com after ? in the address, as ?api_key=…',
   ]);
   for (const description of descriptions) {
     assert.doesNotMatch(description, /template|binding|placement/i);
@@ -129,7 +129,7 @@ test('describePlacement uses plain words for each supported form', () => {
   }
   assert.equal(
     describePlacement('https://api.example.com:8443', { in: 'header', name: 'x-api-key', template: '{secret}' }),
-    'Send this key to api.example.com:8443 in a header named X-Api-Key',
+    'Send this secret to api.example.com:8443 in a header named X-Api-Key',
   );
 });
 
@@ -141,4 +141,17 @@ test('isAskBinding recognises only exactly {ask:true}', () => {
     { in: 'header', name: 'authorization', template: 'Bearer {secret}' },
     Object.create({ ask: true }),
   ]) assert.equal(isAskBinding(value), false);
+});
+
+test('describePlacement tells apart proposals that differ only after the secret (review 13 r2 F2)', () => {
+  const origin = 'https://api.example.com:443';
+  const a = describePlacement(origin, { in: 'header', name: 'x-api-key', template: '{secret}' });
+  const b = describePlacement(origin, { in: 'header', name: 'x-api-key', template: '{secret}:tenant=production' });
+  const c = describePlacement(origin, { in: 'query', name: 'k', template: 'p-{secret}' });
+  const d = describePlacement(origin, { in: 'header', name: 'x-api-key', template: 'Token{secret}' });
+  const e = describePlacement(origin, { in: 'header', name: 'x-api-key', template: 'Token {secret}' });
+  assert.notEqual(a, b);
+  assert.match(b, /followed by ":tenant=production"/);
+  assert.match(c, /after "p-"/);
+  assert.notEqual(d, e);
 });

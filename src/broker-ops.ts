@@ -1002,6 +1002,12 @@ export class BrokerOps {
       }
       const target = normalizeSshTarget(op.destination);
       if (!target) return err('Refused: give an SSH destination as user@host[:port].', 'BAD_REQUEST');
+      // The command runs op.destination as written, so it must already be the approved form:
+      // 'u@Host.', 'u@h:000022' would be approved as one thing and run as another (review 13 r2 F1).
+      const canonical = `${target.user}@${target.host}${target.port === 22 ? '' : ':' + target.port}`;
+      if (op.destination !== canonical && op.destination !== `${target.user}@${target.host}:${target.port}`) {
+        return err(`Refused: write the SSH destination as ${canonical}.`, 'BAD_REQUEST');
+      }
       if (op.kind === 'git') {
         const urls = (op as unknown as { urls?: unknown }).urls;
         if (!Array.isArray(urls) || urls.length === 0) {
@@ -1044,7 +1050,7 @@ export class BrokerOps {
       if (changed?.ssh?.host_key) {
         return err(`Refused: this server's identity changed since you approved it. `
           + `Approved identity ${hostFingerprint(changed.ssh.host_key)}; current identity ${hostFingerprint(scanned)}. `
-          + 'The owner must use Replace on the key page to approve the new identity. No signing session was opened.', 'HOST_KEY_CHANGED');
+          + 'The owner can remove this server on the secret\'s page in the vault; the next connection then asks to approve the new identity. No signing session was opened.', 'HOST_KEY_CHANGED');
       }
       const recipeSha = sshHostSha(target, scanned);
       const approved = matching.some((item) => item.ssh?.host_key === scanned && item.recipe_sha256 === recipeSha);

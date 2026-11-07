@@ -93,16 +93,20 @@ export function placementSha(origin: string, sendAs: SendAs): string {
 export function describePlacement(origin: string, sendAs: SendAs): string {
   const address = new URL(origin);
   const host = address.hostname + (address.port && address.port !== '443' ? `:${address.port}` : '');
+  // Text before AND after the secret, quoted exactly (spaces kept): two proposals that differ
+  // only there must not read the same (review 13 r2 F2).
+  const at = sendAs.template.indexOf('{secret}');
+  const before = sendAs.template.slice(0, at);
+  const after = sendAs.template.slice(at + '{secret}'.length);
+  const around = (before ? `, after ${JSON.stringify(before)}` : '') + (after ? `, followed by ${JSON.stringify(after)}` : '');
   if (sendAs.in === 'query') {
-    return `Send this key to ${host} after ? in the address, as ?${sendAs.name}=…`;
+    return `Send this secret to ${host} after ? in the address, as ?${sendAs.name}=…` + around;
   }
   if (sendAs.name.toLowerCase() === 'authorization' && sendAs.template === 'Bearer {secret}') {
-    return `Send this key to ${host} in the Authorization header (as a Bearer token)`;
+    return `Send this secret to ${host} in the Authorization header (as a Bearer token)`;
   }
   const name = sendAs.name.split('-').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join('-');
-  const before = sendAs.template.slice(0, sendAs.template.indexOf('{secret}'));
-  return `Send this key to ${host} in a header named ${name}`
-    + (before ? `, after ${JSON.stringify(before)}` : '');
+  return `Send this secret to ${host} in a header named ${name}` + around;
 }
 
 export function isAskBinding(b: unknown): boolean {
