@@ -70,6 +70,9 @@ function mockToolResult(name: string, args: Record<string, any>) {
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ Signed after the owner approved. signature: ZGVtby1zaWduYXR1cmU=  public_key: ZGVtby1wdWJsaWMta2V5  `
         + `algorithm: ed25519. The signing key never left the broker.${MOCK_NOTE}` }] });
+    case 'vault_2fa_code':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `✅ 2FA code: 123456 (valid for 25 more seconds). The seed never left the broker.${MOCK_NOTE}` }] });
     default:
       return CallToolResultSchema.parse({ content: [{ type: 'text', text: `Unknown tool: ${name}${MOCK_NOTE}` }], isError: true });
   }
@@ -177,6 +180,23 @@ export function createServer(args: { url?: string } = {}) {
             purpose: { type: 'string', description: 'Why this payment is needed. The owner sees it if they are asked.' },
           },
           required: ['entry_id', 'payment_required', 'purpose'],
+        },
+      },
+      {
+        name: 'vault_2fa_code',
+        description: (
+          'Get the current 2FA (authenticator) code for a vaulted login or 2FA secret, to type into a '
+          + 'sign-in that asks for one. You get the 6- or 8-digit code and how many seconds it stays '
+          + 'valid; the seed that makes the codes never leaves the broker. If the code was about to '
+          + 'expire, this waits up to 5 seconds and returns the next one.'
+        ),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            entry_id: { type: 'string', description: 'Vault entry holding the 2FA seed (a 2FA secret, or a website login with its 2FA field filled).' },
+            purpose: { type: 'string', description: 'What you are signing in to, and why. The owner sees it.' },
+          },
+          required: ['entry_id', 'purpose'],
         },
       },
       {
@@ -335,6 +355,18 @@ export function createServer(args: { url?: string } = {}) {
         return CallToolResultSchema.parse({ content: [{ type: 'text', text:
           `✅ Signed (${r.algorithm}). The key was used in the broker, not returned to you.\n`
           + `signature: ${r.signature}\npublic key: ${r.public_key}` }] });
+      }
+
+      if (request.params.name === 'vault_2fa_code') {
+        const a = (request.params.arguments ?? {}) as Record<string, unknown>;
+        const fail = (text: string) => CallToolResultSchema.parse({ content: [{ type: 'text', text }], isError: true });
+        const entry_id = String(a.entry_id ?? '');
+        const purpose = String(a.purpose ?? '');
+        if (!entry_id || !purpose) return fail('vault_2fa_code needs entry_id and purpose.');
+        const r = await broker.send('2fa_code', { entry_id, purpose: purpose.slice(0, 200) });
+        if (r.error) return fail(String(r.error));
+        return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+          `✅ 2FA code: ${r.code} (valid for ${r.expires_in_seconds} more seconds). The seed never left the broker.` }] });
       }
 
       if (request.params.name === 'vault_ssh_exec') {

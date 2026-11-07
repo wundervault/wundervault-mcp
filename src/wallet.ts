@@ -159,7 +159,7 @@ export function readPolicy(args: {
 
 // ── commitments and owner tokens ───────────────────────────────────────────
 
-export type ApprovalKind = 'payment' | 'signature' | 'recipe';
+export type ApprovalKind = 'payment' | 'signature' | 'recipe' | '2fa';
 
 /** sha256 of the canonical JSON of what the owner was shown. The dashboard computes the same. */
 export function commitment(fields: Record<string, string | number>): string {

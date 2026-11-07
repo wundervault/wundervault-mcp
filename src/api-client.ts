@@ -165,7 +165,7 @@ export class AgentVaultAPI {
      * approval — the only time the server holds a payee, an amount, a recipe or a digest,
      * and it erases it when the request is decided or expires.
      */
-    kind?: 'call' | 'payment' | 'signature' | 'recipe';
+    kind?: 'call' | 'payment' | 'signature' | 'recipe' | '2fa';
     detail?: Record<string, unknown>;
     /** A payment the owner's rules already allow. Logged without detail; tier 1 only. */
     within_rules?: boolean;

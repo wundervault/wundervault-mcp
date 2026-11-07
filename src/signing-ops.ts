@@ -15,7 +15,9 @@
 import { createHash } from 'node:crypto';
 import type { AgentVaultAPI } from './api-client.js';
 import { decryptSecretContent } from './crypto.js';
-import { modeAllowsWallet, modeAllowsSign, wrongModeMessage } from './ssh-agent.js';
+import { modeAllowsWallet, modeAllowsSign, modeAllowsHttpBroker, wrongModeMessage } from './ssh-agent.js';
+import { readValue, setupProblem, type Shape } from './parts.js';
+import { parseSeed, currentCode } from './totp.js';
 import {
   parsePaymentRequired, selectOffer, paymentHeader, formatUnits, sameAddress, NETWORKS, type Chain, type Offer, type PaymentRequired,
 } from './x402.js';
@@ -330,6 +332,66 @@ export async function sign(d: Deps, args: {
       }
       return { signature: signBytes(key, data), public_key: key.publicKey, algorithm: key.algorithm };
     } finally { bytes.fill(0); }
+  });
+}
+
+// ── 2FA codes (vault_2fa_code) ─────────────────────────────────────────────
+
+/**
+ * The current authenticator code for a stored seed. The seed never leaves this function:
+ * not in the result, not in an error (parseSeed's reasons carry none of the input).
+ * A tier-2 entry asks the owner first, every time, like every other tier-2 use.
+ */
+export async function twoFactorCode(d: Deps & { sleep?: (ms: number) => Promise<void> }, args: {
+  entryId: string; purpose: string;
+}): Promise<{ code: string; expires_in_seconds: number } | OpError> {
+  const s = await d.api.getSecret(args.entryId);
+  d.onSecret?.(s);
+  if (!modeAllowsHttpBroker(s.entry_mode)) return err(wrongModeMessage(s.entry_mode, 'http'), 'WRONG_MODE');
+  const setup = s.setup;
+  const shape = setup?.shape;
+  if (!setup || (shape !== 'website_login' && shape !== 'two_factor') || setup.value_format !== 'parts-1') {
+    return err('Refused: this secret holds no 2FA seed. The owner can add one as a "2FA code" secret, '
+      + 'or in a website login\'s 2FA field.', 'WRONG_KIND');
+  }
+  const problem = setupProblem(setup, false);
+  if (problem) return err(`Refused: this secret's settings could not be used (${problem}).`, 'BAD_CONFIG');
+  const vaultKey = await d.api.ensureVaultKey();
+  return guarded(async () => {
+    if (String(s.access_tier ?? '1') === '2') {
+      const fields = { entry_id: args.entryId, purpose_sha256: createHash('sha256').update(args.purpose).digest('hex') };
+      const approval = await ownerApproval(d, {
+        entryId: args.entryId, kind: '2fa', commit: commitment(fields), vaultKey, purpose: args.purpose,
+        sealed: s.vault_locked === true ? { agentId: s.agent_id!, name: s.name! } : undefined,
+        detail: { ...fields, purpose: args.purpose.slice(0, 200) },
+      });
+      if ('error' in approval) return approval;
+    }
+    const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
+    let seedText = '';
+    try {
+      const value = readValue(new TextDecoder().decode(bytes), 'parts-1', 'http', shape as Shape);
+      if (!value.ok) return err('Refused: this secret\'s value could not be read. Nothing was used.', 'BAD_CONFIG');
+      seedText = (shape === 'two_factor' ? value.parts.seed : value.parts.totp) ?? '';
+    } finally { bytes.fill(0); }
+    if (!seedText.trim()) {
+      return err('Refused: this login has no 2FA seed. The owner can add it in the dashboard.', 'NO_SEED');
+    }
+    const parsed = parseSeed(seedText);
+    seedText = '';
+    if (!parsed.ok) return err(`Refused: the stored 2FA seed is not usable (${parsed.reason}) The owner can paste it again.`, 'BAD_SEED');
+    try {
+      const now = d.now ?? Date.now;
+      const first = currentCode(parsed, now());
+      if (first.waitMs > 0) {
+        // Under 5 seconds left: wait for the next window rather than hand over a code that
+        // expires mid-login, or one a strict service would not accept yet.
+        await (d.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))))(first.waitMs);
+        const next = currentCode(parsed, now());
+        return { code: next.code, expires_in_seconds: next.expiresInSeconds };
+      }
+      return { code: first.code, expires_in_seconds: first.expiresInSeconds };
+    } finally { parsed.seed.fill(0); }
   });
 }
 

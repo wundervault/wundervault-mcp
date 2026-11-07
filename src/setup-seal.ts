@@ -33,7 +33,7 @@ export interface T2Detail {
 
 export interface T2OpDetail {
   name: string;
-  kind: 'payment' | 'signature' | 'recipe';
+  kind: 'payment' | 'signature' | 'recipe' | '2fa';
   detail: Record<string, unknown>;
 }
 
@@ -117,7 +117,7 @@ function validOpDetail(value: unknown): value is T2OpDetail & { v: 1 } {
     keys.every(key => Object.hasOwn(value, key)) && value.v === 1 &&
     // Characters, as the vault page counts a name (review cl5 browser F3), not UTF-16 units.
     typeof value.name === 'string' && Array.from(value.name).length <= 256 &&
-    (value.kind === 'payment' || value.kind === 'signature' || value.kind === 'recipe') &&
+    (value.kind === 'payment' || value.kind === 'signature' || value.kind === 'recipe' || value.kind === '2fa') &&
     isObject(value.detail);
 }
 

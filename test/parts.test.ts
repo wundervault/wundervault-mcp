@@ -549,9 +549,9 @@ describe('signed sets', () => {
     })).toThrow('missing part: token_secret');
   });
 
-  it('defines all eight shapes and the optional website-login part', () => {
+  it('defines all nine shapes and the optional website-login part', () => {
     expect(Object.keys(SHAPES)).toEqual([
-      'api_key', 'key_id', 'signed_set', 'password', 'website_login',
+      'api_key', 'key_id', 'signed_set', 'password', 'website_login', 'two_factor',
       'ssh_key', 'wallet', 'signing_key',
     ]);
     expect(SHAPES.website_login.optionalParts).toEqual({ totp: 'TOTP' });

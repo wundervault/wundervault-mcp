@@ -64,7 +64,7 @@ import { SetupPins, sealT2Detail, t2MatchMac, newRequestId } from './setup-seal.
 import { renderDetail } from './render.js';
 import { SigningState } from './wallet.js';
 import { validateRecipe, recipeSha256, describeRecipe, computeStamp, parseStampedValue, looksLikeOAuth1Value, type Recipe, type StampedValue } from './stamp.js';
-import { pay as payOp, sign as signOp, approveStamp, type Deps, type PayResult } from './signing-ops.js';
+import { pay as payOp, sign as signOp, twoFactorCode as twoFactorOp, approveStamp, type Deps, type PayResult } from './signing-ops.js';
 import type { ActivityRecord } from './activity-log.js';
 import type { AnchorClient } from './activity-anchor.js';
 import { scrubSecret } from './http-broker.js';
@@ -216,6 +216,21 @@ export class BrokerOps {
         rec.approval = 'approved';
         if (ok.algorithm) rec.extra = { ...rec.extra, algorithm: ok.algorithm };
       }
+      return r;
+    } catch (e) {
+      rec.outcome = 'error'; rec.detail = firstLine((e as Error).message);
+      throw e;
+    } finally { this.record(rec); }
+  }
+
+  // ── 2fa_code ─────────────────────────────────────────────────────────────
+  async twoFactorCode(args: { entryId: string; purpose: string }) {
+    const rec: ActivityRecord = { kind: '2fa', outcome: 'refused', agent: this.agentName, entry_id: args.entryId, reason: args.purpose };
+    try {
+      const r = await twoFactorOp(this.depsNaming(rec), args);
+      finish(rec, r);
+      // The code itself is never logged: it is short-lived, but the log is readable by agents.
+      if (!('error' in r)) { rec.outcome = 'sent'; if (rec.tier === '2') rec.approval = 'approved'; }
       return r;
     } catch (e) {
       rec.outcome = 'error'; rec.detail = firstLine((e as Error).message);

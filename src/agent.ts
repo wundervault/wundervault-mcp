@@ -1041,6 +1041,11 @@ class AgentDaemon {
         }) as unknown as Record<string, unknown>;
       }
 
+      case '2fa_code': {
+        if (!entry() || !purpose()) return { error: '2fa_code needs entry_id and purpose.' };
+        return await ops.twoFactorCode({ entryId: entry(), purpose: purpose() }) as unknown as Record<string, unknown>;
+      }
+
       case 'ssh_agent_close':
         return ops.closeSsh(String(msg.session_id ?? '')) as unknown as Record<string, unknown>;
 

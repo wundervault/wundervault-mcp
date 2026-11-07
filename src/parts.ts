@@ -35,6 +35,11 @@ export const SHAPES = {
     parts: { username: 'Username', password: 'Password' },
     optionalParts: { totp: 'TOTP' }, delivery: null,
   },
+  // An authenticator seed on its own. Stored only: the broker never sends it anywhere; it
+  // turns it into the current 6-digit code for vault_2fa_code.
+  two_factor: {
+    parts: { seed: 'Seed' }, optionalParts: {}, delivery: null,
+  },
   ssh_key: {
     parts: { private_key: 'Private key' }, optionalParts: {}, delivery: 'ssh',
   },
@@ -91,7 +96,7 @@ function isShape(value: unknown): value is Shape {
 function shapeMatchesDelivery(shape: Shape, delivery: Delivery): boolean {
   // A website login may be stored and listed alongside HTTP entries, but has no binding.
   return SHAPES[shape].delivery === delivery
-    || (shape === 'website_login' && delivery === 'http');
+    || ((shape === 'website_login' || shape === 'two_factor') && delivery === 'http');
 }
 
 /**
@@ -114,7 +119,8 @@ export function setupProblem(setup: {
   if (format === 'raw' && shape !== RAW_SHAPES[delivery]) return 'raw values require a single-part shape';
   if (format === 'parts-1' && delivery !== 'http') return 'SSH, wallet and signing values must use the raw format';
   if (delivery === 'http') {
-    const storedOnly = shape === 'website_login' || (shape === 'password' && setup.binding == null);
+    const storedOnly = shape === 'website_login' || shape === 'two_factor'
+      || (shape === 'password' && setup.binding == null);
     if (storedOnly) {
       if (setup.binding != null) return 'this shape has no web credential binding';
       return forUse ? 'this key is stored only and is not sent by the broker' : null;
@@ -249,7 +255,7 @@ export function validateBindingV2(
   if (!Object.hasOwn(RAW_SHAPES, delivery) || !shapeMatchesDelivery(shape, delivery)) {
     return badBinding('delivery', 'shape does not allow this delivery');
   }
-  if (delivery !== 'http' || shape === 'website_login') {
+  if (delivery !== 'http' || shape === 'website_login' || shape === 'two_factor') {
     return badBinding('binding', 'this shape has no web credential binding');
   }
   if (!isObject(raw)) return badBinding('binding', 'binding must be an object');

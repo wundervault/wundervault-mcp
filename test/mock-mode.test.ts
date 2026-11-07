@@ -14,6 +14,7 @@ const ARGS: Record<string, Record<string, unknown>> = {
   vault_ssh_exec: { entry_id: 'demo-0002', destination: 'demo@host', purpose: 'demo', remote_argv: ['true'] },
   vault_pay: { entry_id: 'demo-0003', payment_required: 'e30=', purpose: 'demo' },
   vault_sign: { entry_id: 'demo-0004', data: 'hello', purpose: 'demo' },
+  vault_2fa_code: { entry_id: 'demo-0005', purpose: 'demo' },
 };
 
 describe('demo mode', () => {
