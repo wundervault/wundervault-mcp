@@ -502,7 +502,7 @@ UNIT_SRC="${HERE}/${UNIT_NAME}"
 root_only_chain "$UNIT_SRC" || { echo "ERROR: ${CHAIN_BAD}. That is the service template; reinstall the package as root. Nothing has been changed." >&2; exit 1; }
 
 echo "This will:"
-echo "  1. create the system account '${ACCOUNT}' for the secret broker (no login, no home)"
+echo "  1. create the system account '${ACCOUNT}' for the Wundervault helper app (no login, no home)"
 echo "  2. create ${STATE_DIR}, mode 0700, owned by ${ACCOUNT}"
 echo "  3. install ${UNIT_PATH}, which runs the broker: ${EXEC}"
 echo "  4. enable and start the broker"
@@ -842,8 +842,8 @@ fi
 
 if systemctl is-active --quiet "$UNIT_NAME"; then
   echo
-  echo "The secret broker is running. ${STATE_DIR} is readable only by ${ACCOUNT},"
-  echo "which means your agents cannot read the credentials it holds."
+  echo "The Wundervault helper app is running. It runs in the background; there's nothing to open."
+  echo "${STATE_DIR} is readable only by ${ACCOUNT}, so your agents cannot read the secrets it holds."
   # One block, in order, and the last thing printed (2.0.1): the --migrate line used to come
   # after the pair line, marked "no sudo", and read as "pair without sudo".
   # The short command only when it runs the copy just installed (review rounds 1-2): an older
@@ -864,13 +864,14 @@ if systemctl is-active --quiet "$UNIT_NAME"; then
   # node by name too: the launcher starts `#!/usr/bin/env node`, and sudo may find node on the
   # caller's PATH. The node named here passed root_only_chain.
   echo "  1. Pair this computer, once:   sudo ${SERVICE_NODE} ${AGENT_CMD} --pair"
+  echo "     Already paired (you updated)? Skip this: an update keeps the pairing."
   echo "     It prints a code and a fingerprint. Type the code into your vault and check the"
   echo "     fingerprint matches before you confirm. Neither value is a secret."
   echo "  2. Only if this computer ran Wundervault version 1, as your normal user (no sudo):"
   echo "       ${AGENT_CMD} --migrate"
 else
   echo
-  echo "The secret broker did not start. What it said:" >&2
+  echo "The Wundervault helper app did not start. What it said:" >&2
   systemctl status "$UNIT_NAME" --no-pager -l 2>&1 | tail -20 >&2
   exit 1
 fi

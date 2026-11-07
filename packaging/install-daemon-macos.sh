@@ -538,7 +538,7 @@ PLIST_SRC="${HERE}/${LABEL}.plist"
 root_only_chain "$PLIST_SRC" || { echo "ERROR: ${CHAIN_BAD}. That is the service template; reinstall the package as root. Nothing has been changed." >&2; exit 1; }
 
 echo "This will:"
-echo "  1. create the hidden service account '${ACCOUNT}' for the secret broker"
+echo "  1. create the hidden service account '${ACCOUNT}' for the Wundervault helper app"
 echo "  2. create ${STATE_DIR} (0700) and ${RUN_DIR} (0755), owned by ${ACCOUNT}"
 echo "  3. install ${PLIST_PATH}, which runs the broker: ${NODE} ${EXEC}"
 echo "  4. start the broker"
@@ -957,25 +957,25 @@ if launchctl print "system/${LABEL}" >/dev/null 2>&1; then
     KEY_MODE=$(printf '%s' "$REPLY" | sed -n 's/.*"key_mode":"\([a-z-]*\)".*/\1/p')
     case "$KEY_MODE" in
       local-file)
-        echo "The secret broker is running, on the random store key." ;;
+        echo "The Wundervault helper app is running, on the random store key. It runs in the background; there's nothing to open." ;;
       derived|derived-shared)
-        echo "WARNING: the broker is running on a DERIVED store key, not the one this" >&2
+        echo "WARNING: the helper app is running on a DERIVED store key, not the one this" >&2
         echo "         installer wrote. Check ${STORE_KEY} is readable by ${ACCOUNT}:" >&2
         echo "           sudo ls -l ${STORE_KEY}" >&2
         echo "           sudo tail -20 ${STATE_DIR}/agent.log" >&2
         echo "         Do not describe this machine as having a random store key." >&2 ;;
       *)
-        echo "The secret broker is running. Store key mode: ${KEY_MODE:-unreported}." ;;
+        echo "The Wundervault helper app is running. Store key mode: ${KEY_MODE:-unreported}." ;;
     esac
   else
-    echo "The secret broker is loaded, but the management socket did not answer."
+    echo "The Wundervault helper app is loaded, but the management socket did not answer."
     echo "Neither socat nor nc could reach ${SOCK}; check it by hand:"
     echo "  sudo tail -20 ${STATE_DIR}/agent.log"
   fi
 
   if [ -n "$RUNNING_UID" ] && [ "$RUNNING_UID" != "$ACCOUNT" ]; then
     echo >&2
-    echo "ERROR: the broker is running as '${RUNNING_UID}', not '${ACCOUNT}'." >&2
+    echo "ERROR: the helper app is running as '${RUNNING_UID}', not '${ACCOUNT}'." >&2
     echo "       There is no boundary in that state. Do not migrate agents to it." >&2
     exit 1
   fi
@@ -1003,13 +1003,14 @@ if launchctl print "system/${LABEL}" >/dev/null 2>&1; then
   # node by name too: the launcher starts `#!/usr/bin/env node`, and sudo may find node on the
   # caller's PATH. The node named here passed root_only_chain.
   echo "  1. Pair this computer, once:   sudo ${NODE} ${AGENT_CMD} --pair"
+  echo "     Already paired (you updated)? Skip this: an update keeps the pairing."
   echo "     It prints a code and a fingerprint. Type the code into your vault and check the"
   echo "     fingerprint matches before you confirm. Neither value is a secret."
   echo "  2. Only if this computer ran Wundervault version 1, as your normal user (no sudo):"
   echo "       ${AGENT_CMD} --migrate"
 else
   echo
-  echo "The secret broker did not start. What it said:" >&2
+  echo "The Wundervault helper app did not start. What it said:" >&2
   tail -20 "${STATE_DIR}/agent.log" 2>/dev/null >&2 || true
   launchctl print "system/${LABEL}" 2>&1 | head -20 >&2 || true
   exit 1

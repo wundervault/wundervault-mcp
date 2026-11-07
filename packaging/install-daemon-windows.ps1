@@ -505,7 +505,7 @@ $owned = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Objec
     (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $Account
 })
 if ($state -ne 'Running' -or $owned.Count -eq 0) {
-    Fail "The task registered but the broker is not running (state: $state, last result: $($info.LastTaskResult), processes owned by ${Account}: $($owned.Count)).`n`nThe usual causes:`n  - node or the broker path is wrong: $NodePath`n                                     $AgentPath`n  - the broker refused to start. Run it by hand to see why:`n      $NodePath `"$AgentPath`"`n  - the account lacks 'log on as a batch job' (this script grants it; a group policy can take it away)."
+    Fail "The task registered but the Wundervault helper app is not running (state: $state, last result: $($info.LastTaskResult), processes owned by ${Account}: $($owned.Count)).`n`nThe usual causes:`n  - node or the broker path is wrong: $NodePath`n                                     $AgentPath`n  - the broker refused to start. Run it by hand to see why:`n      $NodePath `"$AgentPath`"`n  - the account lacks 'log on as a batch job' (this script grants it; a group policy can take it away)."
 }
 
 # -- 7. what to do next --------------------------------------------------------
@@ -518,6 +518,7 @@ Write-Host @"
 
   2. Pair this machine, once, in a terminal no agent is driving:
        wundervault-agent --pair
+     Already paired (you updated)? Skip this: an update keeps the pairing.
 
   3. Hand your agents over, ONE AT A TIME, checking each before the next:
        wundervault-agent --migrate
