@@ -351,8 +351,8 @@ export async function twoFactorCode(d: Deps & { sleep?: (ms: number) => Promise<
   const setup = s.setup;
   const shape = setup?.shape;
   if (!setup || (shape !== 'website_login' && shape !== 'two_factor') || setup.value_format !== 'parts-1') {
-    return err('Refused: this secret holds no 2FA seed. The owner can add one as a "2FA code" secret, '
-      + 'or in a website login\'s 2FA field.', 'WRONG_KIND');
+    return err('Refused: this secret holds no authenticator setup key. The owner can add one as an '
+      + '"Authenticator code" secret, or in a login\'s "Authenticator setup key" box.', 'WRONG_KIND');
   }
   const problem = setupProblem(setup, false);
   if (problem) return err(`Refused: this secret's settings could not be used (${problem}).`, 'BAD_CONFIG');
@@ -375,11 +375,11 @@ export async function twoFactorCode(d: Deps & { sleep?: (ms: number) => Promise<
       seedText = (shape === 'two_factor' ? value.parts.seed : value.parts.totp) ?? '';
     } finally { bytes.fill(0); }
     if (!seedText.trim()) {
-      return err('Refused: this login has no 2FA seed. The owner can add it in the dashboard.', 'NO_SEED');
+      return err('Refused: this login has no authenticator setup key. The owner can add it in the dashboard.', 'NO_SEED');
     }
     const parsed = parseSeed(seedText);
     seedText = '';
-    if (!parsed.ok) return err(`Refused: the stored 2FA seed is not usable (${parsed.reason}) The owner can paste it again.`, 'BAD_SEED');
+    if (!parsed.ok) return err(`Refused: the stored authenticator setup key is not usable (${parsed.reason}) The owner can paste it again.`, 'BAD_SEED');
     try {
       const now = d.now ?? Date.now;
       const first = currentCode(parsed, now());

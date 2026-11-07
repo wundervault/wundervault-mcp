@@ -78,7 +78,7 @@ function mockToolResult(name: string, args: Record<string, any>) {
         `✅ git ${args.subcommand ?? 'push'} completed (exit 0). 1 signature; the key never left the broker.${MOCK_NOTE}` }] });
     case 'vault_2fa_code':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
-        `✅ 2FA code: 123456 (valid for 25 more seconds). The seed never left the broker.${MOCK_NOTE}` }] });
+        `✅ Authenticator code: 123456 (valid for 25 more seconds). The setup key never left the broker.${MOCK_NOTE}` }] });
     default:
       return CallToolResultSchema.parse({ content: [{ type: 'text', text: `Unknown tool: ${name}${MOCK_NOTE}` }], isError: true });
   }
@@ -224,7 +224,7 @@ export function createServer(args: { url?: string } = {}) {
       {
         name: 'vault_2fa_code',
         description: (
-          'Get the current 2FA (authenticator) code for a vaulted login or 2FA secret, to type into a '
+          'Get the current authenticator-app code (the 6-digit 2FA code) for a vaulted login or Authenticator code secret, to type into a '
           + 'sign-in that asks for one. You get the 6- or 8-digit code and how many seconds it stays '
           + 'valid; the seed that makes the codes never leaves the broker. If the code was about to '
           + 'expire, this waits up to 5 seconds and returns the next one.'
@@ -232,7 +232,7 @@ export function createServer(args: { url?: string } = {}) {
         inputSchema: {
           type: 'object',
           properties: {
-            entry_id: { type: 'string', description: 'Vault entry holding the 2FA seed (a 2FA secret, or a website login with its 2FA field filled).' },
+            entry_id: { type: 'string', description: 'Vault entry holding the authenticator setup key (an Authenticator code secret, or a login with its Authenticator setup key filled). Only authenticator-app codes: not text-message or email codes, not passkeys.' },
             purpose: { type: 'string', description: 'What you are signing in to, and why. The owner sees it.' },
           },
           required: ['entry_id', 'purpose'],
@@ -456,7 +456,7 @@ export function createServer(args: { url?: string } = {}) {
         const r = await broker.send('2fa_code', { entry_id, purpose: purpose.slice(0, 200) });
         if (r.error) return fail(String(r.error));
         return CallToolResultSchema.parse({ content: [{ type: 'text', text:
-          `✅ 2FA code: ${r.code} (valid for ${r.expires_in_seconds} more seconds). The seed never left the broker.` }] });
+          `✅ Authenticator code: ${r.code} (valid for ${r.expires_in_seconds} more seconds). The setup key never left the broker.` }] });
       }
 
       if (request.params.name === 'vault_ssh_exec') {

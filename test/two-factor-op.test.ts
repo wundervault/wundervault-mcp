@@ -67,12 +67,12 @@ describe('vault_2fa_code', () => {
 
   it('refuses a website login with no 2FA seed (check 4)', async () => {
     const r = await twoFactorCode(deps('website_login', { username: 'u', password: 'p', totp: '' }, { nowMs: 1 }), { entryId: 'e1', purpose: 'x' });
-    expect(r).toMatchObject({ error: expect.stringContaining('this login has no 2FA seed') });
+    expect(r).toMatchObject({ error: expect.stringContaining('this login has no authenticator setup key') });
   });
 
   it('refuses a secret that is not a login or 2FA secret, without reading it', async () => {
     const r = await twoFactorCode(deps('password', { username: 'u', password: 'p' }, { nowMs: 1 }), { entryId: 'e1', purpose: 'x' });
-    expect(r).toMatchObject({ error: expect.stringContaining('holds no 2FA seed') });
+    expect(r).toMatchObject({ error: expect.stringContaining('holds no authenticator setup key') });
   });
 
   it('a bad stored seed is refused without echoing it (check 2)', async () => {
