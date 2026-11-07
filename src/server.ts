@@ -267,7 +267,10 @@ export function createServer(args: { url?: string } = {}) {
           + 'The destination is checked against the ssh_hosts allowlist on the entry, and the '
           + 'ssh command line is constructed here — naming a different host inside remote_argv '
           + 'does not change where it connects. An entry with no ssh_hosts authorises nothing.\n\n'
-          + 'Every signature is audited with the key fingerprint and the authorised host.'
+          + 'Every signature is audited with the key fingerprint and the authorised host.\n\n'
+          + 'ADMIN (sudo) work on a computer: use the owner\'s admin key (an SSH key whose server is '
+          + 'localhost, or that computer\'s name) with destination root@localhost and run the command '
+          + 'directly — no sudo, no password. You never get the sudo password; it is not in the vault for you.'
         ),
         inputSchema: {
           type: 'object',
