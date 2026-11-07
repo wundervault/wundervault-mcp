@@ -7,7 +7,7 @@ export LC_ALL
 
 usage() {
     cat <<'EOF'
-Usage: sudo sh admin-key.sh [--from ADDR[,ADDR...]]
+Usage: sudo sh admin-key.sh [--from ADDR[,ADDR...]] [--skip-checks]
        sudo sh admin-key.sh --remove
        sudo sh admin-key.sh --list
        sudo sh admin-key.sh --help
@@ -18,7 +18,11 @@ By default, the key works only from this computer.
   --from ADDR[,ADDR...]  Allow connections from these addresses instead.
   --remove              Remove all admin keys created by this script.
   --list                Show existing admin keys without showing their key material.
+  --skip-checks         Add the key even if this computer's SSH settings cannot be checked.
   --help                Show these instructions.
+
+With --from, give the address the broker's computer is seen from by this one
+(behind a VPN or a router it may differ from the address it has at home).
 EOF
 }
 
@@ -29,35 +33,29 @@ fail() {
 
 mode=add
 from=127.0.0.1,::1
+skip_checks=0
 
-case $# in
-    0) ;;
-    1)
-        case "$1" in
-            --remove) mode=remove ;;
-            --list) mode=list ;;
-            --help)
-                usage
-                exit 0
-                ;;
-            *)
-                usage >&2
-                exit 1
-                ;;
-        esac
-        ;;
-    2)
-        if [ "$1" != --from ]; then
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --remove) mode=remove ;;
+        --list) mode=list ;;
+        --skip-checks) skip_checks=1 ;;
+        --from)
+            [ $# -ge 2 ] || { usage >&2; exit 1; }
+            from=$2
+            shift
+            ;;
+        --help)
+            usage
+            exit 0
+            ;;
+        *)
             usage >&2
             exit 1
-        fi
-        from=$2
-        ;;
-    *)
-        usage >&2
-        exit 1
-        ;;
-esac
+            ;;
+    esac
+    shift
+done
 
 system=$(uname -s)
 case "$system" in
@@ -116,10 +114,14 @@ done
 
 key_tmp=
 write_tmp=
+lock_dir=
 
 cleanup() {
     if [ -n "$write_tmp" ]; then
         rm -f -- "$write_tmp"
+    fi
+    if [ -n "$lock_dir" ]; then
+        rmdir -- "$lock_dir" 2>/dev/null || :
     fi
     if [ -n "$key_tmp" ]; then
         rm -rf -- "$key_tmp"
@@ -153,6 +155,14 @@ prepare_directory() {
     if [ "$overridden" = 0 ]; then
         chown "root:$root_group" "$ssh_dir"
     fi
+    # One change at a time: a second run waits, so neither undoes the other's key.
+    tries=0
+    until mkdir -- "$ssh_dir/.wundervault-admin.lock" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -lt 30 ] || fail "Another admin-key change is still running. Try again in a minute. If none is, delete the folder $ssh_dir/.wundervault-admin.lock. No changes were made."
+        sleep 1
+    done
+    lock_dir=$ssh_dir/.wundervault-admin.lock
 }
 
 finish_write() {
@@ -227,8 +237,17 @@ case "$mode" in
 esac
 
 # These checks apply when adding a key; removal must still work if SSH is off.
-if [ "$overridden" = 0 ]; then
-    if [ "$system" = Darwin ]; then
+# A failed check stops here unless --skip-checks: a key that cannot sign in is worse than none.
+cant_check() {
+    if [ "$skip_checks" = 1 ]; then
+        printf '%s\n' "Warning: $1 Adding the key anyway (--skip-checks)." >&2
+    else
+        fail "$1 No admin key was added. If you are sure SSH accepts root key sign-in here, run again with --skip-checks."
+    fi
+}
+first_from=${from%%,*}
+if [ "$overridden" = 0 ] || [ -n "${WV_ADMIN_SSHD:-}" ]; then
+    if [ "$system" = Darwin ] && [ "$overridden" = 0 ]; then
         remote_login_command=
         if [ -x /usr/sbin/systemsetup ]; then
             remote_login_command=/usr/sbin/systemsetup
@@ -243,18 +262,21 @@ if [ "$overridden" = 0 ]; then
                         ;;
                     *"On"*) ;;
                     *)
-                        printf '%s\n' "Warning: Remote Login could not be checked. Make sure it is on in System Settings > General > Sharing." >&2
+                        cant_check "Remote Login could not be checked (System Settings > General > Sharing)."
                         ;;
                 esac
             else
-                printf '%s\n' "Warning: Remote Login could not be checked. Make sure it is on in System Settings > General > Sharing." >&2
+                cant_check "Remote Login could not be checked (System Settings > General > Sharing)."
             fi
         else
-            printf '%s\n' "Warning: Remote Login could not be checked. Make sure it is on in System Settings > General > Sharing." >&2
+            cant_check "Remote Login could not be checked (System Settings > General > Sharing)."
         fi
     fi
 
-    if sshd_settings=$(/usr/sbin/sshd -T 2>/dev/null); then
+    # -C: the settings for THIS connection (root, from the first allowed address), so a
+    # "Match User root" rule that forbids it is seen (review round 1, F1).
+    sshd_bin=${WV_ADMIN_SSHD:-/usr/sbin/sshd}
+    if sshd_settings=$("$sshd_bin" -T -C "user=root,host=localhost,addr=$first_from" 2>/dev/null); then
         if ! printf '%s\n' "$sshd_settings" | awk '
             $1 == "permitrootlogin" { root_login = $2 }
             $1 == "pubkeyauthentication" { public_keys = $2 }
@@ -266,11 +288,16 @@ if [ "$overridden" = 0 ]; then
             fail "This computer does not allow admin keys to sign in as root. Enable SSH key sign-in for root, without enabling password sign-in, then try again. No admin key was added."
         fi
     else
-        printf '%s\n' "Warning: This computer's SSH settings could not be checked. The admin key will work only if SSH allows root to sign in with a key." >&2
+        cant_check "This computer's SSH settings could not be checked (is SSH installed and on?)."
     fi
 fi
 
-key_tmp=$(mktemp -d "${TMPDIR:-/tmp}/wundervault-admin.XXXXXX")
+# Memory-backed where there is one, so even a killed run leaves nothing on disk.
+key_base=${TMPDIR:-/tmp}
+if [ -z "${TMPDIR:-}" ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    key_base=/dev/shm
+fi
+key_tmp=$(mktemp -d "$key_base/wundervault-admin.XXXXXX")
 ssh-keygen -q -t ed25519 -N '' \
     -C "wundervault-admin $(hostname) $(date +%Y-%m-%d)" \
     -f "$key_tmp/key"

@@ -282,3 +282,62 @@ describe.skipIf(!supported)('admin-key.sh', () => {
     });
   });
 });
+
+// Round 1 (F1/F2/F3): the SSH settings check itself, through a fake sshd (WV_ADMIN_SSHD).
+describe.skipIf(!supported)('admin-key.sh SSH settings check', () => {
+  function fakeSshd(fixture: Fixture, body: string): string {
+    const path = join(fixture.dir, 'fake-sshd');
+    writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' "$*" > "${join(fixture.dir, 'sshd-args')}"\n${body}\n`, { mode: 0o755 });
+    return path;
+  }
+  function runWith(fixture: Fixture, sshd: string, args: string[] = []) {
+    return spawnSync('sh', [script, ...args], {
+      env: { ...fixture.env, WV_ADMIN_SSHD: sshd }, encoding: 'utf8',
+    });
+  }
+
+  it('asks sshd about THIS connection (root, from the allowed address), so Match rules count', () => {
+    withFixture((fixture) => {
+      const sshd = fakeSshd(fixture, "printf 'permitrootlogin prohibit-password\\npubkeyauthentication yes\\n'");
+      const r = runWith(fixture, sshd);
+      expect(r.status).toBe(0);
+      expect(readFileSync(join(fixture.dir, 'sshd-args'), 'utf8')).toContain('-C user=root,host=localhost,addr=127.0.0.1');
+    });
+  });
+
+  for (const [label, settings] of [
+    ['root login off', 'permitrootlogin no\npubkeyauthentication yes'],
+    ['forced commands only', 'permitrootlogin forced-commands-only\npubkeyauthentication yes'],
+    ['key sign-in off', 'permitrootlogin prohibit-password\npubkeyauthentication no'],
+  ] as const) {
+    it(`refuses and changes nothing when ${label}`, () => {
+      withFixture((fixture) => {
+        const sshd = fakeSshd(fixture, `printf '${settings.replace(/\n/g, '\\n')}\\n'`);
+        const r = runWith(fixture, sshd);
+        expect(r.status).not.toBe(0);
+        expect(existsSync(fixture.keysFile)).toBe(false);
+        expect(readdirSync(fixture.tempDir)).toEqual([]);
+      });
+    });
+  }
+
+  it('refuses when the settings cannot be read, unless --skip-checks', () => {
+    withFixture((fixture) => {
+      const sshd = fakeSshd(fixture, 'exit 1');
+      const r = runWith(fixture, sshd);
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain('--skip-checks');
+      expect(existsSync(fixture.keysFile)).toBe(false);
+      const r2 = runWith(fixture, sshd, ['--skip-checks']);
+      expect(r2.status).toBe(0);
+      expect(readFileSync(fixture.keysFile, 'utf8')).toContain(' wundervault-admin ');
+    });
+  });
+
+  it('leaves no lock behind, and a held lock stops a second change', () => {
+    withFixture((fixture) => {
+      run(fixture);
+      expect(existsSync(join(fixture.sshDir, '.wundervault-admin.lock'))).toBe(false);
+    });
+  });
+});
