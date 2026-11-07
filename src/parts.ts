@@ -128,6 +128,12 @@ export function setupProblem(setup: {
       // login request. Plain vault_call refuses these entries itself (broker-ops STORED_ONLY).
       return null;
     }
+    // Spec 1.3: a single key may wait for its first use; the broker then asks the owner once
+    // how to send it (broker-ops, NEEDS_PLACEMENT / send_as). Exactly {ask:true}, nothing else.
+    if (shape === 'api_key' && isObject(setup.binding) && Object.keys(setup.binding).length === 1
+        && (setup.binding as Record<string, unknown>).ask === true) {
+      return null;
+    }
     if (setup.binding == null && shape !== 'api_key') return 'this shape needs a binding';
     if (setup.binding != null) {
       const checked = validateBindingV2(setup.binding, shape, 'http');

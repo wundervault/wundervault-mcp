@@ -22,6 +22,7 @@ import { canonicalJson } from './opdef.js';
 import { decryptSecretContent } from './crypto.js';
 import { defaultStorePath } from './network-store.js';
 import { NETWORKS, UINT_STRING, isAddressFor, sameAddress, type Chain, type NetworkName } from './x402.js';
+import { normalizeOrigin, placementSha, validateSendAs, type SendAs } from './placement.js';
 
 // ── policy ─────────────────────────────────────────────────────────────────
 
@@ -33,8 +34,15 @@ export interface WalletRules {
   solanaRpc?: string;
 }
 
+export interface StampApproval {
+  recipe_sha256: string;
+  origin: string;
+  label?: string;
+  placement?: SendAs;
+}
+
 export interface StampRules {
-  approved: Array<{ recipe_sha256: string; origin: string; label?: string }>;
+  approved: StampApproval[];
 }
 
 export interface Policy {
@@ -145,12 +153,26 @@ export function readPolicy(args: {
     for (const raw of st.approved) {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'an approval is not an object' };
       const r = raw as Record<string, unknown>;
-      if (only(r, ['recipe_sha256', 'origin', 'label']) || typeof r.recipe_sha256 !== 'string'
+      if (only(r, ['recipe_sha256', 'origin', 'label', 'placement']) || typeof r.recipe_sha256 !== 'string'
           || !/^[0-9a-f]{64}$/.test(r.recipe_sha256) || typeof r.origin !== 'string'
           || !/^https:\/\/[a-z0-9.-]{1,253}:[0-9]{1,5}$/.test(r.origin) || !LABEL(r.label)) {
         return { ok: false, reason: 'an approved recipe is malformed' };
       }
-      approved.push({ recipe_sha256: r.recipe_sha256, origin: r.origin, ...(r.label ? { label: r.label as string } : {}) });
+      let placement: SendAs | undefined;
+      if (r.placement !== undefined) {
+        const checked = validateSendAs(r.placement);
+        if (!checked.ok || normalizeOrigin(r.origin) !== r.origin
+            || placementSha(r.origin, checked.sendAs) !== r.recipe_sha256
+            || canonicalJson(r.placement) !== canonicalJson(checked.sendAs)) {
+          return { ok: false, reason: 'an approved recipe is malformed' };
+        }
+        placement = checked.sendAs;
+      }
+      approved.push({
+        recipe_sha256: r.recipe_sha256, origin: r.origin,
+        ...(r.label ? { label: r.label as string } : {}),
+        ...(placement ? { placement } : {}),
+      });
     }
     policy.stamped = { approved };
   }

@@ -75,7 +75,8 @@ import { BEARER, bindingFromExecConfig, looksLikePrivateKey, secretForms, valida
 import { checkAgentHeaders, oauth1FromParts, readValue, scrub as scrubParts, secretFormsAll, validateBindingV2, type BindingV2, type Shape } from './parts.js';
 import { SetupPins, sealT2Detail, t2MatchMac, newRequestId } from './setup-seal.js';
 import { renderDetail } from './render.js';
-import { SigningState } from './wallet.js';
+import { SigningState, readPolicy } from './wallet.js';
+import { normalizeOrigin, validateSendAs, placementRecipe, placementSha, describePlacement, isAskBinding, type SendAs } from './placement.js';
 import { validateRecipe, recipeSha256, describeRecipe, computeStamp, parseStampedValue, looksLikeOAuth1Value, type Recipe, type StampedValue } from './stamp.js';
 import { pay as payOp, sign as signOp, twoFactorCode as twoFactorOp, approveStamp, type Deps, type PayResult } from './signing-ops.js';
 import type { ActivityRecord } from './activity-log.js';
@@ -283,7 +284,7 @@ export class BrokerOps {
    */
   async call(args: {
     entryId: string; purpose: string; operationId?: string;
-    callArgs?: Record<string, unknown>; request?: AgentRequest;
+    callArgs?: Record<string, unknown>; request?: AgentRequest & { send_as?: unknown };
   }): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
     // One line in the activity log for every call, whatever happens to it. The inner body
     // fills in what it learns (the key's name, the address, the approval, the status) as
@@ -318,12 +319,12 @@ export class BrokerOps {
 
   private async callInner(args: {
     entryId: string; purpose: string; operationId?: string;
-    callArgs?: Record<string, unknown>; request?: AgentRequest;
+    callArgs?: Record<string, unknown>; request?: AgentRequest & { send_as?: unknown };
   }, rec: ActivityRecord): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
     const { entryId, purpose } = args;
     const operationId = args.operationId || '';
     const callArgs = args.callArgs ?? {};
-    const agentReq = args.request;
+    let agentReq = args.request;
 
     const s = await this.api.getSecret(entryId);
     rec.key = s.name;
@@ -332,11 +333,18 @@ export class BrokerOps {
       return err(wrongModeMessage(s.entry_mode, 'http'), 'WRONG_MODE');
     }
 
+    const askBinding = (s.setup?.shape === 'api_key' && isAskBinding(s.setup.binding))
+      || isAskBinding(coerceCfg(s.exec_config).credential_binding);
+    if (!askBinding && agentReq?.send_as !== undefined) {
+      return err('Refused: request.send_as is only for keys set to ask on first use. Nothing was sent.', 'BAD_REQUEST');
+    }
+    if (askBinding && operationId) {
+      return err('Refused: a key set to ask on first use is used with request, not a signed operation. Nothing was sent.', 'BAD_REQUEST');
+    }
+
     // The credential binding always comes from the ENTRY. An agent may choose where a
-    // request goes; it never chooses how the secret is framed on the way out. Checked
-    // before the key is decrypted: a binding the server sent that this broker would not
-    // have accepted from the owner refuses the call. It is not repaired and it does not
-    // fall back to a bearer token — see delivery.ts.
+    // request goes; it never chooses how the secret is framed on the way out, except for
+    // an ask-entry's owner-approved proposal. Checked before the key is decrypted.
     // ── SIGN-IN (spec 1.2 §3): a stored login the broker signs in with, keeping the session.
     // Checked and approved BEFORE anything is decrypted, like a stamp recipe.
     const signInRaw = (agentReq as { sign_in?: unknown } | undefined)?.sign_in;
@@ -345,6 +353,7 @@ export class BrokerOps {
       pin?: { sha256: string; pem: string }; approvedOrigins: string[];
     } | null = null;
     if (signInRaw !== undefined) {
+      if (askBinding) return err('Refused: request.sign_in is not used with a key set to ask on first use. Nothing was sent.', 'BAD_REQUEST');
       if (operationId) return err('Refused: a sign-in is used with request, not a signed operation. Nothing was sent.', 'BAD_REQUEST');
       const shape = s.setup?.shape;
       if ((shape !== 'password' && shape !== 'website_login') || s.setup?.value_format !== 'parts-1' || s.setup?.binding != null) {
@@ -407,16 +416,72 @@ export class BrokerOps {
     // as they are. Without request.sign_in nothing here may use them.
     const storedOnlyShape = s.setup?.shape === 'website_login' || s.setup?.shape === 'two_factor'
       || (s.setup?.shape === 'password' && s.setup?.binding == null);
-    if (storedOnlyShape && !signIn) {
+    if (storedOnlyShape && !signIn && !askBinding) {
       return err('Refused: this secret is stored only and is not sent by the broker. A login can be used with '
         + 'request.sign_in (the broker signs in for you), and a 2FA seed with vault_2fa_code. Nothing was sent.', 'STORED_ONLY');
     }
 
-    const hasV2Binding = !signIn && (s.setup?.binding as { v?: unknown } | undefined)?.v === 2;
+    // Recognise {ask:true} before either binding validator sees it. The approved list is
+    // owner-sealed, and its version is checked even when no new approval is needed.
+    let approvedPlacement: SendAs | undefined;
+    if (askBinding) {
+      const origin = agentReq?.origin ? normalizeOrigin(agentReq.origin) : null;
+      if (!origin) return err('Refused: request.origin needs an https host and a valid port, without credentials, a path or an IPv6 literal. Nothing was sent.', 'BAD_REQUEST');
+      if ((agentReq as { stamp?: unknown }).stamp !== undefined) {
+        return err('Refused: request.stamp is for stamped keys, and this one is not. Nothing was sent.', 'BAD_REQUEST');
+      }
+      if (agentReq!.send_as !== undefined) {
+        const checked = validateSendAs(agentReq!.send_as);
+        if (!checked.ok) return err(`Refused: request.send_as: ${checked.reason}. Nothing was sent.`, 'BAD_REQUEST');
+        approvedPlacement = checked.sendAs;
+        // A conflicting agent header is refused BEFORE asking the owner.
+        const headers = validateAgentHeaders(agentReq!.headers, approvedPlacement);
+        if (!headers.ok) return err(`Refused: ${headers.field}: ${headers.reason}. Nothing was sent.`, 'BAD_REQUEST');
+      }
+      const vaultKey = await this.api.ensureVaultKey();
+      const sealed = s as unknown as { policy_ciphertext?: string | null; policy_nonce?: string | null };
+      const checked = readPolicy({
+        ciphertext: sealed.policy_ciphertext, nonce: sealed.policy_nonce,
+        vaultKey, entryId, kind: 'stamped',
+      });
+      if (!checked.ok) return err(`Refused: this key's settings could not be read (${checked.reason}). Nothing was sent.`, 'BAD_POLICY');
+      if (checked.policy) {
+        const problem = this.deps().state.acceptPolicy(checked.policy);
+        if (problem) return err(`Refused: this key's settings could not be accepted (${problem}). Nothing was sent.`, 'BAD_POLICY');
+      }
+      if (approvedPlacement) {
+        const refused = await approveStamp(this.deps(), {
+          entryId, s, vaultKey, origin,
+          recipe: placementRecipe(origin, approvedPlacement),
+          recipeSha: placementSha(origin, approvedPlacement),
+          summary: describePlacement(origin, approvedPlacement), purpose,
+        });
+        if (refused) return refused;
+      } else {
+        const approved = checked.policy?.stamped?.approved.filter((item) => item.origin === origin && item.placement) ?? [];
+        const distinct = [...new Map(approved.map((item) => [item.recipe_sha256, item])).values()];
+        if (distinct.length === 0) {
+          return err(`Refused: this key has no approved way to be sent to ${origin} yet. Propose one with request.send_as {in:"header"|"query", name, template:"... {secret} ..."} — the owner approves it once. Nothing was sent.`, 'NEEDS_PLACEMENT');
+        }
+        if (distinct.length !== 1) {
+          return err(`Refused: this key has several approved ways to be sent to ${origin}. Name one with request.send_as {in:"header"|"query", name, template:"... {secret} ..."}. Nothing was sent.`, 'NEEDS_PLACEMENT');
+        }
+        approvedPlacement = distinct[0].placement!;
+      }
+      // Use the same normalised address for execution as for approval, including 443.
+      const address = new URL(origin);
+      agentReq = {
+        ...agentReq!, origin: {
+          scheme: 'https', host: address.hostname, port: Number(address.port || '443'),
+        },
+      };
+    }
+
+    const hasV2Binding = !signIn && !askBinding && (s.setup?.binding as { v?: unknown } | undefined)?.v === 2;
     const partsPath = !signIn && !!s.setup && (hasV2Binding || s.setup.value_format === 'parts-1');
     const legacySinglePart = partsPath && !hasV2Binding && s.setup!.shape === 'api_key';
     let partsBinding: BindingV2 | undefined;
-    if (partsPath && !legacySinglePart) {
+    if (partsPath && !legacySinglePart && !askBinding) {
       // validateBindingV2 reads a v1 binding as well (a signed set's {in:'stamp'} included).
       const checked = validateBindingV2(s.setup!.binding, s.setup!.shape as Shape, 'http');
       if (!checked.ok) {
@@ -439,7 +504,8 @@ export class BrokerOps {
         : { in: 'header', name: signIn.recipe.send_session_as.header,
           template: signIn.recipe.send_session_as.template.replace('{{session}}', '{secret}') })
       : null;
-    const bound = sessionBinding ? { ok: true as const, binding: sessionBinding } : bindingFromExecConfig(hasV2Binding && partsBinding
+    const chosenBinding = approvedPlacement ?? sessionBinding;
+    const bound = chosenBinding ? { ok: true as const, binding: chosenBinding } : bindingFromExecConfig(hasV2Binding && partsBinding
       ? {
         credential_binding: partsBinding.placements.length === 1 && partsBinding.placements[0].in === 'stamp'
           ? { in: 'stamp' }
@@ -514,6 +580,9 @@ export class BrokerOps {
           return err(`Refused: this key could not be read (${value.reason}). Nothing was sent.`, 'BAD_VALUE');
         }
         parts = value.parts;
+        if (askBinding && Object.keys(parts).length !== 1) {
+          return err('Refused: a key set to ask on first use must have a single part. Nothing was sent.', 'BAD_VALUE');
+        }
         if (operationId && Object.keys(parts).length !== 1) {
           return err('Refused: signed operations work with single-part keys only. Nothing was sent.', 'BAD_REQUEST');
         }
