@@ -510,7 +510,9 @@ async function main() {
 
   try {
     try {
-      root = fs.mkdtempSync(path.join(os.tmpdir(), 'wv-real-machine-12-'));
+      // Short on purpose: a Unix socket path is capped at 104 bytes on macOS, and the Mac's
+      // long per-user temp folder made the signing socket unreachable (kit bug, found 11-06).
+      root = fs.mkdtempSync(process.platform === 'win32' ? path.join(os.tmpdir(), 'wv12-') : '/tmp/wv12-');
       const redirected = {
         WUNDERVAULT_SYSTEM_ROOT: path.join(root, 'sys'),
         WUNDERVAULT_USER_ROOT: path.join(root, 'user'),
@@ -720,6 +722,7 @@ async function main() {
             op: { kind: 'git', destination: `${user}@localhost`, urls: urls.urls, subcommand: 'push' },
             ttlSeconds: 120,
           });
+          // Exactly as vault_git does (server.ts).
           const result = await modules.runGit(
             modules.buildGitArgv(fixture.req),
             fixture.work,
@@ -823,24 +826,9 @@ async function main() {
           op,
           ttlSeconds: 120,
         });
-        const hardened = modules.hardenedSshOptions(opened.socket_path, opened.public_key_path);
-        const equivalent = [...hardened, 'root@localhost', 'id -u'];
-        let args = equivalent;
-        // The fixed-command equivalent also works with builds whose argv helper
-        // has a different internal parameter layout. Never drop SSH hardening.
-        try {
-          const built = modules.buildSshArgv(op, opened.socket_path, opened.public_key_path);
-          if (Array.isArray(built)
-            && built.every((arg) => typeof arg === 'string')
-            && JSON.stringify(built.slice(0, hardened.length)) === JSON.stringify(hardened)
-            && built[hardened.length] === 'root@localhost'
-            && ['id -u', "'id' '-u'"].includes(built.slice(hardened.length + 1).join(' '))) {
-            args = built;
-          }
-        } catch {
-          // Use the equivalent hardened argv for this fixed, non-user-supplied command.
-        }
-        const result = await runSsh(args);
+        // The production path (vault_ssh_exec's runner), including its private key-file copy.
+        const ran = await modules.runSshWithAgent({ op, socketPath: opened.socket_path, publicKeyPath: opened.public_key_path, timeoutMs: 60000 });
+        const result = { code: ran.exitCode, stdout: ran.stdout, stderr: ran.stderr };
         assert(result.code === 0, `admin SSH failed: ${result.stderr}`);
         assert(result.stdout.trim() === '0', 'admin command did not return uid 0');
       } finally {
