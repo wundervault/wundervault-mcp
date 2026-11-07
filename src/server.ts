@@ -429,7 +429,8 @@ export function createServer(args: { url?: string } = {}) {
         try {
           r = await runGit(
             buildGitArgv(v.req), repoDir,
-            gitEnv(process.env, sshCommandFor(String(opened.socket_path ?? ''), String(opened.public_key_path ?? ''))),
+            gitEnv(process.env, sshCommandFor(String(opened.socket_path ?? ''), String(opened.public_key_path ?? ''),
+              typeof opened.known_hosts_path === 'string' ? opened.known_hosts_path : undefined)),
             timeoutSeconds * 1000,
           );
         } finally {
@@ -513,6 +514,7 @@ export function createServer(args: { url?: string } = {}) {
             op,
             socketPath: String(opened.socket_path ?? ''),
             publicKeyPath: String(opened.public_key_path ?? ''),
+            ...(typeof opened.known_hosts_path === 'string' ? { knownHostsPath: opened.known_hosts_path } : {}),
             cwd: workingDir,
             timeoutMs: Math.max(1, Math.min(timeoutSeconds, 900)) * 1000,
           });

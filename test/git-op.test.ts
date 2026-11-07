@@ -297,17 +297,17 @@ describe('validateGitRequest', () => {
 
 describe('parseGitSshUrl', () => {
   it.each([
-    ['git@good.example:a/b.git', 'good.example', 'git'],
-    ['good.example:a/b.git', 'good.example', undefined],
-    ['ssh://git@good.example/a/b.git', 'good.example', 'git'],
-    ['ssh://good.example:2222/a/b.git', 'good.example', undefined],
-    ['ssh://git@GOOD.example:22/a/b.git', 'good.example', 'git'],
-    ['ssh://git@[2001:db8::1]:2222/a/b.git', '2001:db8::1', 'git'],
-    ['ssh://[::1]/a/b.git', '::1', undefined],
-  ])('parses %s', (url, host, user) => {
-    expect(parseGitSshUrl(url)).toEqual(
-      user === undefined ? { ok: true, host } : { ok: true, host, user },
-    );
+    ['git@good.example:a/b.git', 'good.example', 'git', undefined],
+    ['good.example:a/b.git', 'good.example', undefined, undefined],
+    ['ssh://git@good.example/a/b.git', 'good.example', 'git', undefined],
+    ['ssh://good.example:2222/a/b.git', 'good.example', undefined, 2222],
+    ['ssh://git@GOOD.example:22/a/b.git', 'good.example', 'git', undefined],
+    ['ssh://git@[2001:db8::1]:2222/a/b.git', '2001:db8::1', 'git', 2222],
+    ['ssh://[::1]/a/b.git', '::1', undefined, undefined],
+  ])('parses %s', (url, host, user, port) => {
+    expect(parseGitSshUrl(url)).toEqual({
+      ok: true, host, ...(port !== undefined ? { port } : {}), ...(user !== undefined ? { user } : {}),
+    });
   });
 
   it.each([

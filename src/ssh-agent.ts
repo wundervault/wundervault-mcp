@@ -32,6 +32,7 @@ import { mkdtempSync, rmSync, chmodSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { parseGitSshUrl } from './git-op.js';
+import { pinnedSshOptions } from './ssh-options.js';
 
 // ── protocol constants (PROTOCOL.agent) ────────────────────────────────────────
 const SSH_AGENT_FAILURE = 5;
@@ -780,9 +781,19 @@ export function checkSshDestination(
  * a check for "good.example" and the key signed for evil.example. Building the command
  * here makes the check the thing that decides.
  */
-export function buildSshArgv(op: BrokeredOp, socketPath: string, publicKeyPath: string): string[] {
+export function buildSshArgv(op: BrokeredOp, socketPath: string, publicKeyPath: string, knownHostsPath?: string): string[] {
   if (op.kind === 'git') throw new Error('a git operation is run by vault_git, not as an ssh command');
   if (op.kind === 'ssh') {
+    // A pinned server (spec 1.3): only the broker-written identity is trusted, and a
+    // user@host:port destination becomes -p port + user@host.
+    if (knownHostsPath) {
+      const m = /^(.*):([0-9]{1,5})$/.exec(op.destination);
+      return [
+        'ssh', ...pinnedSshOptions(socketPath, publicKeyPath, knownHostsPath),
+        ...(m ? ['-p', m[2]] : []), m ? m[1] : op.destination, '--',
+        (op.remoteArgv as string[]).map(quoteForRemoteShell).join(' '),
+      ];
+    }
     // One quoted string, not N arguments: see quoteForRemoteShell.
     return [
       'ssh', ...hardenedSshOptions(socketPath, publicKeyPath), op.destination, '--',
@@ -809,9 +820,11 @@ export async function runSshWithAgent(opts: {
   publicKeyPath: string;
   cwd?: string;
   timeoutMs?: number;
+  /** Spec 1.3: the broker-written identity of a pinned server; strict checking against it. */
+  knownHostsPath?: string;
 }): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const { op, socketPath, publicKeyPath, cwd, timeoutMs = 120_000 } = opts;
-  const argv = buildSshArgv(op, socketPath, publicKeyPath);
+  const { op, socketPath, publicKeyPath, cwd, timeoutMs = 120_000, knownHostsPath } = opts;
+  const argv = buildSshArgv(op, socketPath, publicKeyPath, knownHostsPath);
 
   // spawn, NOT spawnSync. When this process hosts the agent listener, a synchronous
   // spawn blocks the very loop that has to answer the child's signature request. It is

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { isIP } from 'node:net';
 import { hardenedSshOptions } from './ssh-agent.js';
+import { pinnedSshOptions } from './ssh-options.js';
 
 export type GitRequest = {
   subcommand: 'push' | 'pull' | 'fetch' | 'clone' | 'ls-remote';
@@ -26,6 +27,8 @@ type UrlResult = {
   ok: true;
   host: string;
   user?: string;
+  /** ssh:// URLs may name one; scp-like ones are always 22. */
+  port?: number;
 } | {
   ok: false;
   reason: string;
@@ -225,6 +228,7 @@ export function parseGitSshUrl(url: string): UrlResult {
 
   let user: string | undefined;
   let host: string;
+  let port: number | undefined;
 
   if (url.startsWith('ssh://')) {
     const match = /^ssh:\/\/(?:([^@/:]+)@)?(\[[^\]]+\]|[^/:@]+)(?::([0-9]+))?\/(.+)$/.exec(url);
@@ -235,7 +239,7 @@ export function parseGitSshUrl(url: string): UrlResult {
     user = match[1];
     host = match[2];
     if (match[3] !== undefined) {
-      const port = Number(match[3]);
+      port = Number(match[3]);
       if (!Number.isInteger(port) || port < 1 || port > 65535) {
         return { ok: false, reason: 'invalid SSH port' };
       }
@@ -270,9 +274,8 @@ export function parseGitSshUrl(url: string): UrlResult {
     return { ok: false, reason: 'invalid SSH user' };
   }
 
-  return user === undefined
-    ? { ok: true, host: host.toLowerCase() }
-    : { ok: true, host: host.toLowerCase(), user };
+  const base = { ok: true as const, host: host.toLowerCase(), ...(port !== undefined && port !== 22 ? { port } : {}) };
+  return user === undefined ? base : { ...base, user };
 }
 
 export function gitBaseArgs(): string[] {
@@ -306,8 +309,8 @@ export function gitEnv(
   return env;
 }
 
-export function sshCommandFor(socketPath: string, publicKeyPath: string): string {
-  return ['ssh', ...hardenedSshOptions(socketPath, publicKeyPath)]
+export function sshCommandFor(socketPath: string, publicKeyPath: string, knownHostsPath?: string): string {
+  return ['ssh', ...(knownHostsPath ? pinnedSshOptions(socketPath, publicKeyPath, knownHostsPath) : hardenedSshOptions(socketPath, publicKeyPath))]
     .map((arg) => `'${arg.replace(/'/g, "'\\''")}'`)
     .join(' ');
 }

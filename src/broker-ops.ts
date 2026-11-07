@@ -51,6 +51,11 @@ import {
   loadOpenSshEd25519, startAgent, checkSshDestination, type AgentHandle, type BrokeredOp,
 } from './ssh-agent.js';
 import {
+  normalizeSshTarget, scanHostKey, isSshHostKey, sshHostRecipe, sshHostSha,
+  describeSshHost, fingerprint as hostFingerprint, knownHostsLine,
+} from './ssh-pin.js';
+import { parseGitSshUrl } from './git-op.js';
+import {
   performOperation, definitionFromAgentRequest, originString, isApprovedPrivateOrigin,
   probeCertificate, type AgentRequest,
 } from './http-broker.js';
@@ -128,6 +133,7 @@ export class BrokerOps {
   private api: AgentVaultAPI;
   /** BUILD 2: this machine's payment record, policy versions and used approvals. */
   private state: SigningState;
+  private readonly keyscan: (t: NonNullable<ReturnType<typeof normalizeSshTarget>>) => Promise<string | null>;
   private ssh = new Map<string, { handle: AgentHandle; timer: NodeJS.Timeout; entryId: string; key?: string; host: string; reason: string; tier: string }>();
   /**
    * The activity log (activity-log.ts). Set by the daemon; null in a test that does not
@@ -176,11 +182,15 @@ export class BrokerOps {
     signer: BrokerSigner | null = signerFromIdentity(),
     state: SigningState = new SigningState(),
     private readonly depsOverride: Partial<Deps> = {},
-    opts: { pinsPath?: string } = {},
+    opts: {
+      pinsPath?: string;
+      keyscan?: (t: NonNullable<ReturnType<typeof normalizeSshTarget>>) => Promise<string | null>;
+    } = {},
   ) {
     const pins = SetupPins.shared(opts.pinsPath ?? path.join(systemRoot(), 'setup-pins.json'));
     this.api = new AgentVaultAPI(apiKey, loadEncryptionKey(encKeyB64), vaultUrl, signer, pins);
     this.state = state;
+    this.keyscan = opts.keyscan ?? scanHostKey;
   }
 
   private deps(): Deps {
@@ -922,17 +932,15 @@ export class BrokerOps {
    * mount namespace — the agent would not find the socket at all. It goes under the
    * RuntimeDirectory instead, in a per-session directory with a random name.
    *
-   * WHAT THIS DOES NOT FIX. The socket has to be connectable by the agent's uid, and all
-   * seven agents share that uid, so any agent that learns the path can ask for a
-   * signature while the session is open. The random path and the short life bound that;
-   * they do not close it. It is still strictly better than the status quo, where the
-   * agent holds the private key itself and can sign with it for ever.
+   * Legacy sessions still allow any same-uid process that learns the socket path to ask
+   * for signatures. Pinned sessions additionally require a verified session-bind from
+   * the approved server; knowing their socket path is not enough to sign in elsewhere.
    */
   async sshAgentOpen(args: {
     entryId: string; purpose: string; op: BrokeredOp; ttlSeconds?: number;
   }): Promise<{
     session_id: string; socket_path: string; public_key_path: string; fingerprint: string;
-    audited_host: string;
+    audited_host: string; known_hosts_path?: string; pinned_host_key?: string;
   } | OpError> {
     const rec: ActivityRecord = {
       kind: args.op?.kind === 'git' ? 'git' : 'ssh', outcome: 'refused', agent: this.agentName, entry_id: args.entryId,
@@ -960,7 +968,7 @@ export class BrokerOps {
     entryId: string; purpose: string; op: BrokeredOp; ttlSeconds?: number;
   }, rec: ActivityRecord): Promise<{
     session_id: string; socket_path: string; public_key_path: string; fingerprint: string;
-    audited_host: string;
+    audited_host: string; known_hosts_path?: string; pinned_host_key?: string;
   } | OpError> {
     const { entryId, purpose, op } = args;
     const ttlSeconds = args.ttlSeconds ?? 300;
@@ -982,32 +990,101 @@ export class BrokerOps {
       return err(wrongModeMessage(s.entry_mode, 'ssh'), 'WRONG_MODE');
     }
 
-    // THE ALLOWLIST IS CHECKED HERE, BEFORE A SESSION EXISTS.
-    //
-    // It used to be checked in the MCP server, which is the agent's own process — so the
-    // entry's list of permitted hosts was advice the caller gave itself, and an agent
-    // that skipped the check had the private key in hand anyway. The broker refuses to
-    // OPEN a signing session for a destination the entry does not authorise, which is
-    // the first time this list has been a control rather than a convention.
-    //
-    // The honest limit is unchanged and stated in the class header: once a session is
-    // open, any same-uid process that learns the socket path can ask it to sign for some
-    // other host. Closing that needs OpenSSH's session-bind extension.
-    let allowedHosts: string[] = [];
-    const execCfg = coerceCfg(s.exec_config);
-    if (Array.isArray((execCfg as { ssh_hosts?: unknown }).ssh_hosts)) {
-      allowedHosts = ((execCfg as { ssh_hosts: unknown[] }).ssh_hosts).map(String);
+    let auditedHost: string;
+    let vaultKey: Uint8Array | undefined;
+    let pin: { target: NonNullable<ReturnType<typeof normalizeSshTarget>>; hostKey: string } | undefined;
+    const setup = s.setup as unknown as { ask?: unknown; delivery?: unknown } | undefined;
+    // This must precede the legacy allowlist check, which refuses an empty ssh_hosts.
+    // Only the sealed setup can opt an entry into first-use approval.
+    if (setup?.ask === true && setup.delivery === 'ssh') {
+      if (op?.kind !== 'ssh' && op?.kind !== 'git') {
+        return err('Refused: SSH keys set to ask on first use support SSH and git, not rsync.', 'BAD_REQUEST');
+      }
+      const target = normalizeSshTarget(op.destination);
+      if (!target) return err('Refused: give an SSH destination as user@host[:port].', 'BAD_REQUEST');
+      if (op.kind === 'git') {
+        const urls = (op as unknown as { urls?: unknown }).urls;
+        if (!Array.isArray(urls) || urls.length === 0) {
+          return err('Refused: git needs SSH URLs for the approved user, host and port.', 'HOST_NOT_ALLOWED');
+        }
+        for (const url of urls) {
+          if (typeof url !== 'string') return err('Refused: every git URL must use the approved SSH target.', 'HOST_NOT_ALLOWED');
+          const parsed = parseGitSshUrl(url);
+          const gitTarget = parsed.ok && parsed.user
+            ? normalizeSshTarget(`${parsed.user}@${parsed.host}`, parsed.port ?? 22)
+            : null;
+          if (!gitTarget || gitTarget.user !== target.user || gitTarget.host !== target.host || gitTarget.port !== target.port) {
+            return err('Refused: every git URL must use the same user, host and port as the SSH destination.', 'HOST_NOT_ALLOWED');
+          }
+        }
+      }
+      auditedHost = `${target.user}@${target.host}:${target.port}`;
+      rec.address = `ssh://${auditedHost}`;
+      vaultKey = await this.api.ensureVaultKey();
+      const sealed = s as unknown as { policy_ciphertext?: string | null; policy_nonce?: string | null };
+      const checked = readPolicy({
+        ciphertext: sealed.policy_ciphertext, nonce: sealed.policy_nonce,
+        vaultKey, entryId, kind: 'stamped',
+      });
+      if (!checked.ok) return err(`Refused: this key's settings could not be read (${checked.reason}).`, 'BAD_POLICY');
+      if (checked.policy) {
+        const problem = this.deps().state.acceptPolicy(checked.policy);
+        if (problem) return err(`Refused: this key's settings could not be accepted (${problem}).`, 'BAD_POLICY');
+      }
+      const matching = checked.policy?.stamped?.approved.filter((item) =>
+        item.ssh?.user === target.user && item.ssh.host === target.host && item.ssh.port === target.port) ?? [];
+      let scanned: string | null;
+      try { scanned = await this.keyscan(target); } catch { scanned = null; }
+      if (!scanned || !isSshHostKey(scanned)) {
+        return err('Refused: could not read this server\'s identity. No signing session was opened.', 'HOST_KEY_UNREADABLE');
+      }
+      scanned = sshHostRecipe(target, scanned).host_key;
+      // Conflicting pins fail closed: an unpinned address cannot override a pinned one.
+      const changed = matching.find((item) => item.ssh?.host_key && item.ssh.host_key !== scanned);
+      if (changed?.ssh?.host_key) {
+        return err(`Refused: this server's identity changed since you approved it. `
+          + `Approved identity ${hostFingerprint(changed.ssh.host_key)}; current identity ${hostFingerprint(scanned)}. `
+          + 'The owner must use Replace on the key page to approve the new identity. No signing session was opened.', 'HOST_KEY_CHANGED');
+      }
+      const recipeSha = sshHostSha(target, scanned);
+      const approved = matching.some((item) => item.ssh?.host_key === scanned && item.recipe_sha256 === recipeSha);
+      if (!approved) {
+        rec.approval = 'asked';
+        // approveStamp's existing lookup is origin-based. SSH approvals are checked above;
+        // call it only to ask, with the exact recipe the owner's page hashes.
+        const refused = await approveStamp(this.deps(), {
+          entryId, s, vaultKey, origin: `ssh://${auditedHost}`,
+          recipe: sshHostRecipe(target, scanned), recipeSha,
+          summary: describeSshHost(target, scanned), purpose,
+        });
+        if (refused) {
+          rec.approval = 'not_approved';
+          return refused;
+        }
+        rec.approval = 'approved';
+      } else {
+        rec.approval = 'none';
+      }
+      pin = { target, hostKey: scanned };
+    } else {
+      // Legacy entries keep their existing allowlist behaviour, without a key scan or pin.
+      let allowedHosts: string[] = [];
+      const execCfg = coerceCfg(s.exec_config);
+      if (Array.isArray((execCfg as { ssh_hosts?: unknown }).ssh_hosts)) {
+        allowedHosts = ((execCfg as { ssh_hosts: unknown[] }).ssh_hosts).map(String);
+      }
+      const check = checkSshDestination(op, allowedHosts);
+      if (!check.ok) return err(check.error, 'HOST_NOT_ALLOWED');
+      auditedHost = check.auditedHost;
+      rec.address = `ssh://${auditedHost}`;
     }
-    const check = checkSshDestination(op, allowedHosts);
-    if (!check.ok) return err(check.error, 'HOST_NOT_ALLOWED');
-    rec.address = `ssh://${check.auditedHost}`;
 
     // The agent's reason is no longer sent with the fetch, so it is kept HERE — in the
     // same local store as the web calls' destinations, on the owner's machine, written by
     // the broker's account. Without this an SSH call's purpose would exist nowhere, and
     // the owner's answer to "what was my agent doing on that server" would be a count.
-    recordDestination(entryId, `ssh://${check.auditedHost}`, undefined, purpose);
-    const vaultKey = await this.api.ensureVaultKey();
+    recordDestination(entryId, `ssh://${auditedHost}`, undefined, purpose);
+    vaultKey ??= await this.api.ensureVaultKey();
     const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
     let identity;
     try {
@@ -1041,13 +1118,26 @@ export class BrokerOps {
     // unguessable part.
     fs.chmodSync(dir, 0o755);
 
-    const handle = startAgent(identity, undefined, check.auditedHost, {
-      dir, socketMode: 0o666, publicKeyMode: 0o644,
-    });
+    let knownHostsPath: string | undefined;
+    let handle: AgentHandle;
+    try {
+      if (pin) {
+        knownHostsPath = path.join(dir, 'known_hosts');
+        fs.writeFileSync(knownHostsPath, knownHostsLine(pin.target, pin.hostKey), { mode: 0o644, flag: 'wx' });
+        fs.chmodSync(knownHostsPath, 0o644);
+      }
+      handle = startAgent(identity, undefined, auditedHost, {
+        dir, socketMode: 0o666, publicKeyMode: 0o644,
+        ...(pin ? { pinnedHostKey: pin.hostKey } : {}),
+      });
+    } catch (e) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      throw e;
+    }
 
     const timer = setTimeout(() => this.closeSsh(sessionId), ttlSeconds * 1000);
     (timer as unknown as { unref?: () => void }).unref?.();
-    this.ssh.set(sessionId, { handle, timer, entryId, key: s.name, host: check.auditedHost, reason: purpose, tier: String(s.access_tier ?? '1') });
+    this.ssh.set(sessionId, { handle, timer, entryId, key: s.name, host: auditedHost, reason: purpose, tier: String(s.access_tier ?? '1') });
     // Pairs this line with its close. A hash, not the id: the id names the signing socket's
     // directory, and a copy of the log (the viewer page) is readable by agents (round 3, B1).
     rec.extra = { ...(rec.extra ?? {}), session: sessionRef(sessionId) };
@@ -1057,7 +1147,8 @@ export class BrokerOps {
       socket_path: handle.socketPath,
       public_key_path: handle.publicKeyPath,
       fingerprint: identity.fingerprint,
-      audited_host: check.auditedHost,
+      audited_host: auditedHost,
+      ...(pin ? { known_hosts_path: knownHostsPath!, pinned_host_key: pin.hostKey } : {}),
     };
   }
 

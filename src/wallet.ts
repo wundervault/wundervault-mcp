@@ -23,6 +23,7 @@ import { decryptSecretContent } from './crypto.js';
 import { defaultStorePath } from './network-store.js';
 import { NETWORKS, UINT_STRING, isAddressFor, sameAddress, type Chain, type NetworkName } from './x402.js';
 import { normalizeOrigin, placementSha, validateSendAs, type SendAs } from './placement.js';
+import { normalizeSshTarget, isSshHostKey, sshHostRecipe, sshHostSha } from './ssh-pin.js';
 
 // ── policy ─────────────────────────────────────────────────────────────────
 
@@ -36,7 +37,8 @@ export interface WalletRules {
 
 export interface StampApproval {
   recipe_sha256: string;
-  origin: string;
+  origin?: string;
+  ssh?: { user: string; host: string; port: number; host_key?: string };
   label?: string;
   placement?: SendAs;
 }
@@ -153,9 +155,45 @@ export function readPolicy(args: {
     for (const raw of st.approved) {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'an approval is not an object' };
       const r = raw as Record<string, unknown>;
-      if (only(r, ['recipe_sha256', 'origin', 'label', 'placement']) || typeof r.recipe_sha256 !== 'string'
-          || !/^[0-9a-f]{64}$/.test(r.recipe_sha256) || typeof r.origin !== 'string'
-          || !/^https:\/\/[a-z0-9.-]{1,253}:[0-9]{1,5}$/.test(r.origin) || !LABEL(r.label)) {
+      if (only(r, ['recipe_sha256', 'origin', 'ssh', 'label', 'placement']) || typeof r.recipe_sha256 !== 'string'
+          || !/^[0-9a-f]{64}$/.test(r.recipe_sha256) || !LABEL(r.label)
+          || ('origin' in r) === ('ssh' in r)) {
+        return { ok: false, reason: 'an approved recipe is malformed' };
+      }
+      if ('ssh' in r) {
+        if (!r.ssh || typeof r.ssh !== 'object' || Array.isArray(r.ssh) || r.placement !== undefined) {
+          return { ok: false, reason: 'an approved recipe is malformed' };
+        }
+        const ssh = r.ssh as Record<string, unknown>;
+        if (only(ssh, ['user', 'host', 'port', 'host_key'])
+            || typeof ssh.user !== 'string' || typeof ssh.host !== 'string' || typeof ssh.port !== 'number') {
+          return { ok: false, reason: 'an approved recipe is malformed' };
+        }
+        const target = normalizeSshTarget(`${ssh.user}@${ssh.host}`, ssh.port);
+        if (!target || target.user !== ssh.user || target.host !== ssh.host || target.port !== ssh.port
+            || (ssh.host_key !== undefined && !isSshHostKey(ssh.host_key))) {
+          return { ok: false, reason: 'an approved recipe is malformed' };
+        }
+        const hostKey = ssh.host_key as string | undefined;
+        // sshHostSha requires a real key. An owner-added address without an identity
+        // commits to the same recipe shape with an empty host_key, never to a pin.
+        const sha = hostKey === undefined
+          ? createHash('sha256').update(canonicalJson({
+            type: 'ssh_host', v: 1, ...target, host_key: '',
+          })).digest('hex')
+          : sshHostSha(target, hostKey);
+        if (sha !== r.recipe_sha256) return { ok: false, reason: 'an approved recipe is malformed' };
+        approved.push({
+          recipe_sha256: r.recipe_sha256,
+          ssh: {
+            ...target,
+            ...(hostKey === undefined ? {} : { host_key: sshHostRecipe(target, hostKey).host_key }),
+          },
+          ...(r.label ? { label: r.label as string } : {}),
+        });
+        continue;
+      }
+      if (typeof r.origin !== 'string' || !/^https:\/\/[a-z0-9.-]{1,253}:[0-9]{1,5}$/.test(r.origin)) {
         return { ok: false, reason: 'an approved recipe is malformed' };
       }
       let placement: SendAs | undefined;
