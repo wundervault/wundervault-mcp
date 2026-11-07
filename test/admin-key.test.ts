@@ -287,7 +287,7 @@ describe.skipIf(!supported)('admin-key.sh', () => {
 describe.skipIf(!supported)('admin-key.sh SSH settings check', () => {
   function fakeSshd(fixture: Fixture, body: string): string {
     const path = join(fixture.dir, 'fake-sshd');
-    writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' "$*" > "${join(fixture.dir, 'sshd-args')}"\n${body}\n`, { mode: 0o755 });
+    writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${join(fixture.dir, 'sshd-args')}"\n${body}\n`, { mode: 0o755 });
     return path;
   }
   function runWith(fixture: Fixture, sshd: string, args: string[] = []) {
@@ -298,17 +298,21 @@ describe.skipIf(!supported)('admin-key.sh SSH settings check', () => {
 
   it('asks sshd about THIS connection (root, from the allowed address), so Match rules count', () => {
     withFixture((fixture) => {
-      const sshd = fakeSshd(fixture, "printf 'permitrootlogin prohibit-password\\npubkeyauthentication yes\\n'");
+      const sshd = fakeSshd(fixture, "printf 'permitrootlogin prohibit-password\\npubkeyauthentication yes\\nauthorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\\nauthenticationmethods any\\n'");
       const r = runWith(fixture, sshd);
       expect(r.status).toBe(0);
       expect(readFileSync(join(fixture.dir, 'sshd-args'), 'utf8')).toContain('-C user=root,host=localhost,addr=127.0.0.1');
+      expect(readFileSync(join(fixture.dir, 'sshd-args'), 'utf8')).toContain('-C user=root,host=localhost,addr=::1');
     });
   });
 
   for (const [label, settings] of [
-    ['root login off', 'permitrootlogin no\npubkeyauthentication yes'],
-    ['forced commands only', 'permitrootlogin forced-commands-only\npubkeyauthentication yes'],
-    ['key sign-in off', 'permitrootlogin prohibit-password\npubkeyauthentication no'],
+    ['root login off', 'permitrootlogin no\npubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys'],
+    ['forced commands only', 'permitrootlogin forced-commands-only\npubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys'],
+    ['key sign-in off', 'permitrootlogin prohibit-password\npubkeyauthentication no\nauthorizedkeysfile .ssh/authorized_keys'],
+    ['a second sign-in step required', 'permitrootlogin prohibit-password\npubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\nauthenticationmethods publickey,password'],
+    ['a forced command', 'permitrootlogin prohibit-password\npubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\nforcecommand internal-sftp'],
+    ['keys read from another file', 'permitrootlogin prohibit-password\npubkeyauthentication yes\nauthorizedkeysfile /etc/ssh/keys/%u'],
   ] as const) {
     it(`refuses and changes nothing when ${label}`, () => {
       withFixture((fixture) => {
@@ -320,6 +324,25 @@ describe.skipIf(!supported)('admin-key.sh SSH settings check', () => {
       });
     });
   }
+
+  it('checks EVERY allowed address: a rule that blocks ::1 alone still refuses (round 2, F1)', () => {
+    withFixture((fixture) => {
+      const sshd = fakeSshd(fixture, `case "$*" in *addr=::1*) printf 'permitrootlogin no\\npubkeyauthentication yes\\nauthorizedkeysfile .ssh/authorized_keys\\n' ;; *) printf 'permitrootlogin prohibit-password\\npubkeyauthentication yes\\nauthorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\\nauthenticationmethods any\\n' ;; esac`);
+      const r = runWith(fixture, sshd);
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain('::1');
+      expect(existsSync(fixture.keysFile)).toBe(false);
+    });
+  });
+
+  it('a --from address is checked as itself (host and address), not as localhost (round 2, F2)', () => {
+    withFixture((fixture) => {
+      const sshd = fakeSshd(fixture, "printf 'permitrootlogin prohibit-password\\npubkeyauthentication yes\\nauthorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\\nauthenticationmethods any\\n'");
+      const r = runWith(fixture, sshd, ['--from', '192.168.1.10']);
+      expect(r.status).toBe(0);
+      expect(readFileSync(join(fixture.dir, 'sshd-args'), 'utf8')).toContain('-C user=root,host=192.168.1.10,addr=192.168.1.10');
+    });
+  });
 
   it('refuses when the settings cannot be read, unless --skip-checks', () => {
     withFixture((fixture) => {

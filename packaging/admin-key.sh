@@ -245,7 +245,6 @@ cant_check() {
         fail "$1 No admin key was added. If you are sure SSH accepts root key sign-in here, run again with --skip-checks."
     fi
 }
-first_from=${from%%,*}
 if [ "$overridden" = 0 ] || [ -n "${WV_ADMIN_SSHD:-}" ]; then
     if [ "$system" = Darwin ] && [ "$overridden" = 0 ]; then
         remote_login_command=
@@ -276,20 +275,43 @@ if [ "$overridden" = 0 ] || [ -n "${WV_ADMIN_SSHD:-}" ]; then
     # -C: the settings for THIS connection (root, from the first allowed address), so a
     # "Match User root" rule that forbids it is seen (review round 1, F1).
     sshd_bin=${WV_ADMIN_SSHD:-/usr/sbin/sshd}
-    if sshd_settings=$("$sshd_bin" -T -C "user=root,host=localhost,addr=$first_from" 2>/dev/null); then
-        if ! printf '%s\n' "$sshd_settings" | awk '
-            $1 == "permitrootlogin" { root_login = $2 }
-            $1 == "pubkeyauthentication" { public_keys = $2 }
-            END {
-                # forced-commands-only would accept the key yet refuse every command it runs.
-                exit !(root_login != "" && root_login != "no" && root_login != "forced-commands-only" && public_keys == "yes")
-            }
-        '; then
-            fail "This computer does not allow admin keys to sign in as root. Enable SSH key sign-in for root, without enabling password sign-in, then try again. No admin key was added."
+    # Every allowed address, each as the connection sshd will really see (round 2, F1/F2):
+    # a Match Address or Match Host rule for any of them must not hide behind the first.
+    remaining=$from
+    while :; do
+        address=${remaining%%,*}
+        case "$address" in
+            127.0.0.1|::1) host=localhost ;;
+            *) host=$address ;;
+        esac
+        if sshd_settings=$("$sshd_bin" -T -C "user=root,host=$host,addr=$address" 2>/dev/null); then
+            if ! printf '%s\n' "$sshd_settings" | awk '
+                $1 == "permitrootlogin" { root_login = $2 }
+                $1 == "pubkeyauthentication" { public_keys = $2 }
+                # Space-separated alternatives; one of them must be the key alone.
+                $1 == "authenticationmethods" { methods_seen = 1; for (i = 2; i <= NF; i++) if ($i == "any" || $i == "publickey") methods_ok = 1 }
+                $1 == "forcecommand" { forced = $2 }
+                $1 == "authorizedkeysfile" { for (i = 2; i <= NF; i++) if ($i == ".ssh/authorized_keys" || $i == "%h/.ssh/authorized_keys") keys_file_ok = 1 }
+                END {
+                    # forced-commands-only, a forced command, or a second required sign-in step
+                    # would accept the key yet refuse the commands; a different keys file would
+                    # never read the line this script writes (round 2, B1/B2).
+                    ok = root_login != "" && root_login != "no" && root_login != "forced-commands-only" \
+                        && public_keys == "yes" && (!methods_seen || methods_ok) \
+                        && (forced == "" || forced == "none") && keys_file_ok
+                    exit !ok
+                }
+            '; then
+                fail "This computer does not let an admin key sign in as root and run commands from $address. Enable SSH key sign-in for root (no password, no extra sign-in step, no forced command, keys in .ssh/authorized_keys), then try again. No admin key was added."
+            fi
+        else
+            cant_check "This computer's SSH settings could not be checked (is SSH installed and on?)."
         fi
-    else
-        cant_check "This computer's SSH settings could not be checked (is SSH installed and on?)."
-    fi
+        case "$remaining" in
+            *,*) remaining=${remaining#*,} ;;
+            *) break ;;
+        esac
+    done
 fi
 
 # Memory-backed where there is one, so even a killed run leaves nothing on disk.
