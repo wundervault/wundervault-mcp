@@ -106,7 +106,7 @@ function shapeMatchesDelivery(shape: Shape, delivery: Delivery): boolean {
  */
 export function setupProblem(setup: {
   shape?: unknown; delivery?: unknown; value_format?: unknown; binding?: unknown;
-  ssh_hosts?: unknown; chain?: unknown;
+  ssh_hosts?: unknown; chain?: unknown; ask?: unknown;
 }, forUse: boolean): string | null {
   const { shape, delivery } = setup;
   if (!isShape(shape)) return 'unknown shape';
@@ -142,7 +142,10 @@ export function setupProblem(setup: {
   } else if (setup.binding != null) {
     return 'this shape has no web credential binding';
   }
-  if (delivery === 'ssh' && (!Array.isArray(setup.ssh_hosts) || setup.ssh_hosts.length === 0
+  if (setup.ask !== undefined && (setup.ask !== true || delivery !== 'ssh')) return 'ask is only for an SSH key, and only true';
+  // Spec 1.3: with ask, the servers are approved on first use, so an empty list is allowed.
+  if (delivery === 'ssh' && !(setup.ask === true && Array.isArray(setup.ssh_hosts) && setup.ssh_hosts.length === 0)
+      && (!Array.isArray(setup.ssh_hosts) || setup.ssh_hosts.length === 0
       || setup.ssh_hosts.some((h) => typeof h !== 'string' || !h))) {
     return 'an SSH key needs at least one server';
   }

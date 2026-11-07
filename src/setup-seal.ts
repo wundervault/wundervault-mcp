@@ -12,6 +12,8 @@ const maxT2OpJsonBytes = 80 * 1024;
 const setupKeys = new Set([
   'v', 'rev', 'value_sha256', 'value_format', 'name', 'shape', 'service', 'delivery',
   'binding', 'ssh_hosts', 'private_origins', 'known_addresses', 'approval', 'operations', 'chain',
+  // Spec 1.3: an SSH key whose servers are approved on first use (ssh_hosts may then be empty).
+  'ask',
 ]);
 
 export interface Setup extends Record<string, unknown> {
