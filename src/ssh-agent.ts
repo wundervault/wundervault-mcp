@@ -19,13 +19,13 @@
  * boundary the old paragraph was waiting for, and it arrived without the API change it
  * predicted.
  *
- * WHAT IS STILL TRUE AND MUST NOT BE DROPPED: the signing socket is world-connectable, so
- * while a session is open any process running as the owner can ask for a signature —
- * including for a host the command was never authorised for. The key is out of reach; the
- * USE of it, for the lifetime of one command, is not. Sessions are capped and short-lived
- * for exactly that reason, and that is a mitigation, not a fix.
+ * The signing socket can be world-connectable. A pinned agent therefore requires a
+ * verified OpenSSH session bind on each connection and signs only userauth requests for
+ * that session and server. Legacy callers without a pin still allow any connected
+ * process to ask for a signature while the session is open; capped, short-lived sessions
+ * mitigate that legacy behaviour but do not make it a destination restriction.
  */
-import { createPrivateKey, createPublicKey, sign as cryptoSign, createHash, KeyObject } from 'node:crypto';
+import { createPrivateKey, createPublicKey, sign as cryptoSign, verify as cryptoVerify, createHash, KeyObject } from 'node:crypto';
 import { createServer, Server, Socket } from 'node:net';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, chmodSync, writeFileSync } from 'node:fs';
@@ -35,10 +35,12 @@ import { parseGitSshUrl } from './git-op.js';
 
 // ── protocol constants (PROTOCOL.agent) ────────────────────────────────────────
 const SSH_AGENT_FAILURE = 5;
+const SSH_AGENT_SUCCESS = 6;
 const SSH_AGENTC_REQUEST_IDENTITIES = 11;
 const SSH_AGENT_IDENTITIES_ANSWER = 12;
 const SSH_AGENTC_SIGN_REQUEST = 13;
 const SSH_AGENT_SIGN_RESPONSE = 14;
+const SSH_AGENTC_EXTENSION = 27;
 
 /** A framed agent message longer than this is refused rather than buffered. */
 const MAX_MESSAGE_BYTES = 256 * 1024;
@@ -50,6 +52,7 @@ const MAX_MESSAGE_BYTES = 256 * 1024;
  * refusing to wait forever for bytes that are not coming.
  */
 const CONNECTION_IDLE_MS = 30_000;
+const MAX_SESSION_BINDS = 8;
 
 const ED25519_KEY_TYPE = 'ssh-ed25519';
 const OPENSSH_MAGIC = Buffer.from('openssh-key-v1\0', 'binary');
@@ -76,6 +79,11 @@ export interface LoadedIdentity {
 /** Reads length-prefixed fields without ever running past the end of the buffer. */
 class Reader {
   constructor(private buf: Buffer, private off = 0) {}
+
+  byte(): number {
+    if (this.off >= this.buf.length) throw new Error('truncated: expected a byte');
+    return this.buf[this.off++];
+  }
 
   u32(): number {
     if (this.off + 4 > this.buf.length) throw new Error('truncated: expected a 4-byte length');
@@ -192,14 +200,140 @@ export function loadOpenSshEd25519(pem: string): LoadedIdentity {
   return { keyBlob, publicKey, privateKey, comment, fingerprint };
 }
 
+const HOST_CURVES: Record<string, { crv: string; bytes: number; hash: string }> = {
+  nistp256: { crv: 'P-256', bytes: 32, hash: 'sha256' },
+  nistp384: { crv: 'P-384', bytes: 48, hash: 'sha384' },
+  nistp521: { crv: 'P-521', bytes: 66, hash: 'sha512' },
+};
+
+/** SSH mpints are signed; JWK and P1363 need the unsigned, positive magnitude. */
+function positiveMpint(v: Buffer): Buffer {
+  if (v.length === 0 || (v[0] & 0x80) !== 0) throw new Error('expected a positive mpint');
+  if (v[0] === 0) {
+    if (v.length < 2 || (v[1] & 0x80) === 0) throw new Error('non-canonical positive mpint');
+    return v.subarray(1);
+  }
+  return v;
+}
+
+function hostPublicKey(blob: Buffer): {
+  key: KeyObject; type: string; curve?: { crv: string; bytes: number; hash: string };
+} {
+  const r = new Reader(blob);
+  const type = r.str().toString('utf8');
+  let key: KeyObject;
+  let curve: { crv: string; bytes: number; hash: string } | undefined;
+
+  if (type === ED25519_KEY_TYPE) {
+    const pub = r.str();
+    if (pub.length !== 32) throw new Error('expected a 32-byte ed25519 host key');
+    key = createPublicKey({
+      key: { kty: 'OKP', crv: 'Ed25519', x: pub.toString('base64url') },
+      format: 'jwk',
+    });
+  } else if (type.startsWith('ecdsa-sha2-')) {
+    const name = r.str().toString('utf8');
+    if (!Object.prototype.hasOwnProperty.call(HOST_CURVES, name) || type !== `ecdsa-sha2-${name}`) {
+      throw new Error('unsupported ECDSA host curve');
+    }
+    curve = HOST_CURVES[name];
+    const q = r.str();
+    if (q.length !== 1 + 2 * curve.bytes || q[0] !== 4) {
+      throw new Error('expected an uncompressed ECDSA host point');
+    }
+    key = createPublicKey({
+      key: {
+        kty: 'EC', crv: curve.crv,
+        x: q.subarray(1, 1 + curve.bytes).toString('base64url'),
+        y: q.subarray(1 + curve.bytes).toString('base64url'),
+      },
+      format: 'jwk',
+    });
+  } else if (type === 'ssh-rsa') {
+    const e = positiveMpint(r.str());
+    const n = positiveMpint(r.str());
+    key = createPublicKey({
+      key: { kty: 'RSA', e: e.toString('base64url'), n: n.toString('base64url') },
+      format: 'jwk',
+    });
+  } else {
+    throw new Error('unsupported SSH host key type');
+  }
+
+  if (r.remaining !== 0) throw new Error('trailing bytes in SSH host key');
+  return { key, type, curve };
+}
+
+/** Accept a public key line (with an optional comment), or just its base64 wire blob. */
+export function parseOpenSshPublicKey(line: string): Buffer {
+  const fields = line.trim().split(/\s+/);
+  const encoded = fields.length === 1 ? fields[0] : fields[1];
+  if (!encoded || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+    throw new Error('Expected an OpenSSH public key line or base64 public key blob.');
+  }
+  const blob = Buffer.from(encoded, 'base64');
+  if (blob.toString('base64').replace(/=+$/, '') !== encoded.replace(/=+$/, '')) {
+    throw new Error('Malformed base64 SSH public key.');
+  }
+  const parsed = hostPublicKey(blob);
+  if (fields.length > 1 && fields[0] !== parsed.type) {
+    throw new Error('SSH public key type does not match its blob.');
+  }
+  return blob;
+}
+
+/** Verify the server's proof of possession; malformed or unsupported inputs fail closed. */
+export function verifySessionBind(hostKeyBlob: Buffer, sessionId: Buffer, signatureBlob: Buffer): boolean {
+  try {
+    if (sessionId.length === 0) return false;
+    const host = hostPublicKey(hostKeyBlob);
+    const r = new Reader(signatureBlob);
+    const algo = r.str().toString('utf8');
+    const signature = r.str();
+    if (r.remaining !== 0) return false;
+
+    if (host.type === ED25519_KEY_TYPE) {
+      return algo === ED25519_KEY_TYPE && signature.length === 64
+        && cryptoVerify(null, sessionId, host.key, signature);
+    }
+    if (host.type === 'ssh-rsa') {
+      // An RSA public blob still says ssh-rsa, but SHA-1 signatures are not accepted.
+      if (algo !== 'rsa-sha2-256' && algo !== 'rsa-sha2-512') return false;
+      return cryptoVerify(algo === 'rsa-sha2-256' ? 'sha256' : 'sha512', sessionId, host.key, signature);
+    }
+    if (host.curve && algo === host.type) {
+      const parts = new Reader(signature);
+      const rPart = positiveMpint(parts.str());
+      const sPart = positiveMpint(parts.str());
+      const width = host.curve.bytes;
+      if (parts.remaining !== 0 || rPart.length > width || sPart.length > width) return false;
+      const p1363 = Buffer.alloc(2 * width);
+      rPart.copy(p1363, width - rPart.length);
+      sPart.copy(p1363, 2 * width - sPart.length);
+      return cryptoVerify(
+        host.curve.hash, sessionId, { key: host.key, dsaEncoding: 'ieee-p1363' }, p1363,
+      );
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 // ── protocol handling ──────────────────────────────────────────────────────────
+
+export interface AgentConnectionState {
+  binds: Array<{ hostKeyBlob: Buffer; sessionId: Buffer; forwarding: boolean }>;
+}
 
 export interface SignEvent {
   fingerprint: string;
   host: string;
   at: string;
   /** "signed" or the reason it was refused. A refusal is the more interesting event. */
-  outcome: 'signed' | 'refused_unknown_key' | 'refused_malformed';
+  outcome: 'signed' | 'refused_unknown_key' | 'refused_malformed' | 'refused_binding';
+  refused?: boolean;
+  reason?: string;
 }
 
 /**
@@ -209,18 +343,43 @@ export interface SignEvent {
  */
 export function defaultSignAudit(e: SignEvent): void {
   process.stderr.write(
-    `[wundervault-ssh-agent] ${e.at} ${e.outcome} key=${e.fingerprint} host=${e.host || '-'}\n`,
+    `[wundervault-ssh-agent] ${e.at} ${e.outcome} key=${e.fingerprint} host=${e.host || '-'}`
+    + (e.reason ? ` reason=${e.reason}` : '') + '\n',
   );
 }
 
+/** A pin authorises user authentication, not an arbitrary signing oracle. */
+function isBoundUserauth(
+  data: Buffer,
+  identity: LoadedIdentity,
+  bind: AgentConnectionState['binds'][number],
+): boolean {
+  try {
+    const r = new Reader(data);
+    if (!r.str().equals(bind.sessionId) || r.byte() !== 50) return false; // SSH_MSG_USERAUTH_REQUEST
+    r.str();                                  // user name
+    if (r.str().toString('utf8') !== 'ssh-connection') return false;
+    const method = r.str().toString('utf8');
+    if (method !== 'publickey' && method !== 'publickey-hostbound-v00@openssh.com') return false;
+    if (r.byte() !== 1 || r.str().toString('utf8') !== ED25519_KEY_TYPE) return false;
+    if (!r.str().equals(identity.keyBlob)) return false;
+    if (method === 'publickey-hostbound-v00@openssh.com' && !r.str().equals(bind.hostKeyBlob)) return false;
+    return r.remaining === 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Answer one agent message. Pure — no I/O — so the protocol is testable without sockets.
+ * Answer one agent message. No I/O; only the supplied connection state is updated.
  * Returns the reply body; the caller frames it.
  */
 export function handleAgentMessage(
   msg: Buffer,
   identity: LoadedIdentity,
-  onOutcome?: (outcome: SignEvent['outcome']) => void,
+  onOutcome?: (outcome: SignEvent['outcome'], reason?: string) => void,
+  conn: AgentConnectionState = { binds: [] },
+  opts: AgentSocketOptions = {},
 ): Buffer {
   if (msg.length === 0) return Buffer.from([SSH_AGENT_FAILURE]);
   const type = msg[0];
@@ -232,6 +391,27 @@ export function handleAgentMessage(
       sshString(identity.keyBlob),
       sshString(identity.comment),
     ]);
+  }
+
+  if (type === SSH_AGENTC_EXTENSION) {
+    try {
+      const r = new Reader(msg, 1);
+      if (r.str().toString('utf8') !== 'session-bind@openssh.com') return Buffer.from([SSH_AGENT_FAILURE]);
+      const hostKeyBlob = r.str();
+      const sessionId = r.str();
+      const signature = r.str();
+      const forwarding = r.byte() !== 0;
+      if (r.remaining !== 0 || conn.binds.length >= MAX_SESSION_BINDS
+        || !verifySessionBind(hostKeyBlob, sessionId, signature)) {
+        return Buffer.from([SSH_AGENT_FAILURE]);
+      }
+      conn.binds.push({
+        hostKeyBlob: Buffer.from(hostKeyBlob), sessionId: Buffer.from(sessionId), forwarding,
+      });
+      return Buffer.from([SSH_AGENT_SUCCESS]);
+    } catch {
+      return Buffer.from([SSH_AGENT_FAILURE]);
+    }
   }
 
   if (type === SSH_AGENTC_SIGN_REQUEST) {
@@ -249,6 +429,24 @@ export function handleAgentMessage(
         // record, not just a silent refusal.
         onOutcome?.('refused_unknown_key');
         return Buffer.from([SSH_AGENT_FAILURE]);
+      }
+
+      if (opts.pinnedHostKey !== undefined) {
+        const bind = conn.binds[conn.binds.length - 1];
+        let reason: string | undefined;
+        if (!bind) {
+          reason = 'No verified server session bind on this connection.';
+        } else if (bind.forwarding) {
+          reason = 'The last server session bind is for forwarding, not authentication.';
+        } else if (!bind.hostKeyBlob.equals(parseOpenSshPublicKey(opts.pinnedHostKey))) {
+          reason = 'The bound server identity does not match the approved server.';
+        } else if (!isBoundUserauth(data, identity, bind)) {
+          reason = 'The signing data is not a userauth request for the bound session.';
+        }
+        if (reason) {
+          onOutcome?.('refused_binding', reason);
+          return Buffer.from([SSH_AGENT_FAILURE]);
+        }
       }
 
       const sig = cryptoSign(null, data, identity.privateKey);
@@ -294,16 +492,17 @@ export interface AgentHandle {
  * socket; and even if it could see the path, a 0700 directory owned by `wundervault`
  * excludes the very uid that has to connect.
  *
- * So the broker passes its own directory under /run and opens the modes. The secrecy
- * moves from the file mode to the unguessable path plus the session's short life — the
- * same trade every other broker socket makes, for the same reason, and it is recorded as
- * a limit rather than described as a control.
+ * So the broker passes its own directory under /run and opens the modes. The path and
+ * session lifetime limit exposure; pinned agents additionally enforce the server's
+ * session bind before signing. Unpinned agents retain the legacy signing behaviour.
  */
 export interface AgentSocketOptions {
   /** Pre-made directory to host the socket. Caller owns its mode and its removal. */
   dir?: string;
   socketMode?: number;
   publicKeyMode?: number;
+  /** Approved server public key: an OpenSSH public key line or a base64 wire blob. */
+  pinnedHostKey?: string;
 }
 
 export function startAgent(
@@ -315,6 +514,12 @@ export function startAgent(
   if (process.platform === 'win32') {
     throw new Error('The ssh-agent broker needs unix domain sockets and POSIX permissions; run on Linux or macOS.');
   }
+
+  // Validate before creating files, and snapshot the pin so the caller cannot change
+  // the signing policy by mutating its options while a session is open.
+  const agentOpts: AgentSocketOptions = opts.pinnedHostKey === undefined
+    ? {}
+    : { pinnedHostKey: parseOpenSshPublicKey(opts.pinnedHostKey).toString('base64') };
 
   const providedDir = typeof opts.dir === 'string' && opts.dir.length > 0;
   const dir = providedDir ? opts.dir! : mkdtempSync(path.join(os.tmpdir(), 'wv-agent-'));
@@ -347,6 +552,7 @@ export function startAgent(
   const sockets = new Set<Socket>();
 
   const server: Server = createServer((conn) => {
+    const state: AgentConnectionState = { binds: [] };
     sockets.add(conn);
     conn.setTimeout(CONNECTION_IDLE_MS, () => { try { conn.destroy(); } catch { /* ignore */ } });
     conn.on('close', () => sockets.delete(conn));
@@ -369,15 +575,16 @@ export function startAgent(
         const msg = buf.subarray(4, 4 + len);
         buf = buf.subarray(4 + len);
 
-        const reply = handleAgentMessage(msg, identity, (outcome) => {
+        const reply = handleAgentMessage(msg, identity, (outcome, reason) => {
           if (outcome === 'signed') signs += 1;
           const ev: SignEvent = {
             fingerprint: identity.fingerprint, host, at: new Date().toISOString(), outcome,
+            ...(outcome === 'signed' ? {} : { refused: true, reason: reason || outcome }),
           };
           // Always audited; the caller's sink is additional, never a replacement.
           defaultSignAudit(ev);
           onSign?.(ev);
-        });
+        }, state, agentOpts);
         try { conn.write(Buffer.concat([u32(reply.length), reply])); } catch { /* peer went away */ }
       }
     });
@@ -432,10 +639,9 @@ export interface SshBrokerResult { exitCode: number; stdout: string; stderr: str
  * as a literal argument. That is the point — the caller names a program and arguments,
  * not a string for /bin/sh to reinterpret.
  *
- * The host allowlist is enforced here, at invocation, rather than inside the agent
- * protocol. The honest limitation: while the socket is alive, a same-uid process could
- * ask this agent to sign for some other host. Closing that needs OpenSSH's
- * restrict-destination session-bind extension, and is out of scope for this build.
+ * The host allowlist is enforced at invocation. Callers that also pass an approved
+ * server pin to startAgent restrict signatures to that server's verified session.
+ * The legacy single-process path below does not supply a pin.
  */
 /** Everything after `ssh` that stops it choosing its own credentials or destination. */
 export function hardenedSshOptions(socketPath: string, publicKeyPath: string): string[] {
