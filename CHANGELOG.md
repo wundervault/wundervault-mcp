@@ -4,6 +4,32 @@ Changes to `@wundervault/mcp-server`: the MCP server, the broker (`wundervault-a
 installers. The full history, with the website's changes beside it, is at
 <https://wundervault.com/changelog>.
 
+## [2.3.0] — 2026-11-07
+
+The broker is now called the helper app on every owner-facing screen. Update from the vault:
+Computers › Update now.
+
+### Added
+
+- **`vault_2fa_code`**: the current authenticator-app code for an Authenticator code secret, or a login
+  with its setup key. The setup key never leaves the helper app; a code about to expire is replaced by
+  the next one.
+- **`vault_git`**: git push, pull, fetch, clone and ls-remote over SSH with a vaulted key. Every address
+  git would use is checked before the key signs; no submodules, no hooks. Linux and macOS.
+- **Sign-ins to routers and apps** (`vault_call` `request.sign_in`): the helper app signs in, keeps the
+  session in memory, and strips it and the password from every reply. Approved once per address; a
+  device's own certificate can be pinned (`request.trust_certificate`).
+- **Admin (sudo) access**: `packaging/admin-key.sh` makes a root key usable only from this computer; agents
+  run admin commands through `vault_ssh_exec` to `root@localhost`, never with the sudo password.
+- **How it's sent, approved on first use**: a key saved without a way is refused with `NEEDS_PLACEMENT`
+  until the agent proposes `request.send_as` and the owner approves it for that address. An SSH key saved
+  without servers asks for each new server, pins its identity, and signs only for the approved user name.
+
+### Changed
+
+- The installer says "Wundervault helper app" and tells an owner who is updating to skip pairing.
+- Tool descriptions explain first-use approval for web keys, SSH and git.
+
 ## [2.2.0] — 2026-11-06
 
 The last update installed by hand: from this version on, brokers update from the vault.

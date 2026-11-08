@@ -30,7 +30,9 @@ the installer, at [wundervault.com/verify](https://wundervault.com/verify).
 | Tool | What it does |
 |---|---|
 | `vault_call` | Calls a web service with a secret attached, and returns the answer with the secret removed. |
-| `vault_ssh_exec` | Runs a command on a server you listed, or rsyncs files to it. The broker signs the SSH login; the key never leaves it. |
+| `vault_ssh_exec` | Runs a command on a server you approved, or rsyncs files to it. The broker signs the SSH login; the key never leaves it. |
+| `vault_git` | Runs git push, pull, fetch, clone or ls-remote over SSH with a vaulted key. Linux and macOS. |
+| `vault_2fa_code` | Gives the current authenticator-app code for a sign-in. Never the setup key. |
 | `vault_pay` | Pays an x402 "402 Payment Required" in USDC on Base or Solana, inside the limits you set. |
 | `vault_sign` | Signs data with a signing key. You approve every signature. |
 | `vault_entries_list` | Lists the secrets this agent may use, and what kind each is. Never their values. |
@@ -229,6 +231,10 @@ request?: {            describe the call (or operation_id + args instead)
   origin: { scheme: "https", host, port }, method, path,
   query?, body?, headers?,   # your own headers; never the one carrying the secret
   stamp?                     # for stamped keys: how the service signs requests
+  send_as?                   # a key saved without a way: {in:"header"|"query", name, template:"…{secret}…"},
+                             # approved once per address by the owner
+  sign_in?                   # a stored login: how to sign in and carry the session; approved once
+  trust_certificate?         # a device with its own certificate; the owner approves that certificate
 }
 operation_id?, args?   run an operation the owner defined for this secret
 ```
@@ -237,13 +243,40 @@ operation_id?, args?   run an operation the owner defined for this secret
 
 ```
 entry_id: string            an ed25519 SSH key
-destination: string         [user@]host; the host must be on the key's allowed list
+destination: string         user@host[:port]; an approved server, or a new one the owner approves on first use
 purpose: string
 remote_argv?: string[]      command and arguments, run without a shell
 rsync_args?: string[]       instead of a command; every host:path is checked too
 timeout_seconds?: number    default 120
 working_dir?: string        local folder for rsync sources
 ```
+
+### `vault_git`
+
+```
+entry_id: string            an SSH key
+purpose: string
+subcommand: "push" | "pull" | "fetch" | "clone" | "ls-remote"
+repo_dir: string            the local repository (for clone: the folder to clone into)
+remote?: string             a named remote, e.g. origin (all but clone)
+url?, target_dir?           clone only
+refspecs?: string[]
+flags?: string[]            a short allowed list per subcommand; no --force
+timeout_seconds?: number    default 120, at most 870
+```
+
+Every address git would connect to, including a separate push address and config rewrites, must be
+an approved server. SSH remotes only; no submodules and no hooks while the key is in use.
+
+### `vault_2fa_code`
+
+```
+entry_id: string            an Authenticator code secret, or a login with its setup key
+purpose: string             what you are signing in to; the owner sees it
+→ the code and how many seconds it stays valid
+```
+
+Authenticator-app codes only (not text-message or email codes, not passkeys).
 
 ### `vault_pay`
 

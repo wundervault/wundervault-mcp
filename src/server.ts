@@ -130,8 +130,11 @@ export function createServer(args: { url?: string } = {}) {
           + 'secret itself, so a definition altered in transit is refused. vault_entries_list '
           + 'shows which operations an entry offers.\n\n'
           + 'Either way the entry decides how the secret is attached (a header, a query parameter, a '
-          + 'username and password, or part of the web address) — you never choose that, and never '
-          + 'see the secret.'
+          + 'username and password, or part of the web address), and you never see the secret. '
+          + 'A key the owner saved without saying how it is sent is refused with NEEDS_PLACEMENT the first '
+          + 'time at an address: follow the service\'s own docs and propose it with request.send_as '
+          + '{in:"header"|"query", name, template:"... {secret} ..."} ({secret} exactly once). The owner '
+          + 'approves it once for that address; later calls there go straight through.'
         ),
         inputSchema: {
           type: 'object',
@@ -201,8 +204,9 @@ export function createServer(args: { url?: string } = {}) {
         description: (
           'Run git push, pull, fetch, clone or ls-remote over SSH with a vaulted SSH key that never '
           + 'leaves the broker. Every address git would connect to (including a separate push address '
-          + 'and any rewrite in git config) must be in the entry\'s permitted SSH hosts, or nothing '
-          + 'connects. Only SSH remotes; no submodules, no hooks during the run. Linux and macOS only.'
+          + 'and any rewrite in git config) must be a server approved for the entry, or nothing '
+          + 'connects; for a key saved without servers, the first use of a new server asks the owner. '
+          + 'Only SSH remotes; no submodules, no hooks during the run. Linux and macOS only.'
         ),
         inputSchema: {
           type: 'object',
@@ -264,12 +268,15 @@ export function createServer(args: { url?: string } = {}) {
           + 'The key stays inside the broker, which answers signature requests over a private '
           + 'ssh-agent socket that exists only for the duration of this call. You choose the '
           + 'remote command; you do not get the key.\n\n'
-          + 'The destination is checked against the ssh_hosts allowlist on the entry, and the '
+          + 'The destination is checked against the servers approved for the entry, and the '
           + 'ssh command line is constructed here — naming a different host inside remote_argv '
-          + 'does not change where it connects. An entry with no ssh_hosts authorises nothing.\n\n'
+          + 'does not change where it connects. A key the owner saved without servers asks the owner '
+          + 'the first time it connects to a new user@host[:port] (write it exactly that way; the call '
+          + 'waits for the answer), and that server\'s identity is remembered: a different machine at the '
+          + 'same address is refused.\n\n'
           + 'Every signature is audited with the key fingerprint and the authorised host.\n\n'
-          + 'ADMIN (sudo) work on a computer: use the owner\'s admin key (an SSH key whose server is '
-          + 'localhost, or that computer\'s name) with destination root@localhost and run the command '
+          + 'ADMIN (sudo) work on a computer: use the owner\'s admin key (an SSH key made on that computer '
+          + 'with its admin-key script) with destination root@localhost and run the command '
           + 'directly — no sudo, no password. You never get the sudo password; it is not in the vault for you.'
         ),
         inputSchema: {
