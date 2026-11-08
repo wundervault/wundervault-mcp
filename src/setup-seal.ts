@@ -311,13 +311,19 @@ export function openT2OpDetail(
   return { ok: true, detail: opened.value };
 }
 
-export function t2MatchMac(vaultKey: Uint8Array, fields: T2MatchFields): string {
+/**
+ * `version` 2 (batch B, review r2 F1): the same fields under a new label. A helper app that also
+ * sends origin_mac uses it, so the owner's browser can tell the request came from a helper that
+ * asked for a service-wide window — the server cannot strip origin_mac and pass it off as an
+ * old helper's exact-address request, because it cannot make a version-1 MAC without the key.
+ */
+export function t2MatchMac(vaultKey: Uint8Array, fields: T2MatchFields, version: 1 | 2 = 1): string {
   const values = [fields.kind, fields.origin, fields.method, fields.path, fields.entry_id];
   if (values.some(value => typeof value !== 'string' || value.includes('\n'))) {
     throw new Error('Invalid tier-2 match field');
   }
   if (vaultKey.length !== 32) throw new Error('Invalid vault key');
-  const key = hkdfKey(vaultKey, zeroSalt, 'wv-t2-match-1');
+  const key = hkdfKey(vaultKey, zeroSalt, version === 2 ? 'wv-t2-match-2' : 'wv-t2-match-1');
   return createHmac('sha256', key).update(values.join('\n'), 'utf8').digest('hex');
 }
 

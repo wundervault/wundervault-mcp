@@ -483,3 +483,13 @@ describe('setup pins across processes (review cl5 r2 broker F2)', () => {
     await expect(b.record('acct', 'e', 5, true)).rejects.toThrow('older revision');
   });
 });
+
+describe('batch B: version-2 match MAC', () => {
+  it('differs from version 1 for the same fields, so the browser can tell them apart', async () => {
+    const { t2MatchMac } = await import('../src/setup-seal.js');
+    const key = new Uint8Array(32).fill(7);
+    const f = { kind: 'web', origin: 'https://a.example:443', method: 'GET', path: '/x', entry_id: 'e1' };
+    expect(t2MatchMac(key, f, 2)).not.toBe(t2MatchMac(key, f));
+    expect(t2MatchMac(key, f, 2)).toMatch(/^[0-9a-f]{64}$/);
+  });
+});

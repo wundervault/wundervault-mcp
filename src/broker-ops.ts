@@ -653,7 +653,7 @@ export class BrokerOps {
             match_mac: t2MatchMac(vaultKey, {
               kind: 'web', origin: originStr, method: def.route.method,
               path: def.route.path, entry_id: entryId,
-            }),
+            }, 2),
             origin_mac: t2OriginMac(vaultKey, { origin: originStr, entry_id: entryId }),
           };
         } catch {

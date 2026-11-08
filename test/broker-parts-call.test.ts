@@ -459,7 +459,7 @@ describe('BrokerOps.call with sealed parts', () => {
     expect(checks[1]).toEqual(first);
     expect(first.match_mac).toBe(t2MatchMac(vaultKey, {
       kind: 'web', origin: origin(), method: 'POST', path: '/approval', entry_id: e.id,
-    }));
+    }, 2));
 
     const opened = openT2Detail(
       vaultKey, agentId, String(first.request_id),

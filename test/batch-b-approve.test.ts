@@ -399,7 +399,7 @@ describe('Batch B approve', () => {
       detail_nonce: expect.any(String),
       match_mac: t2MatchMac(vaultKey, {
         kind: 'web', origin: origin(), method: 'POST', path: '/locked', entry_id: e.id,
-      }),
+      }, 2),
       origin_mac: t2OriginMac(vaultKey, { origin: origin(), entry_id: e.id }),
     });
     const opened = openT2Detail(
@@ -427,7 +427,7 @@ describe('Batch B approve', () => {
     expect(checks[1].origin_mac).not.toBe(first.origin_mac);
     expect(checks[1].match_mac).toBe(t2MatchMac(vaultKey, {
       kind: 'web', origin: otherOrigin(), method: 'POST', path: '/locked', entry_id: e.id,
-    }));
+    }, 2));
     for (const check of checks) {
       for (const field of ['origin', 'method', 'path', 'purpose', 'body_sha256']) {
         expect(check).not.toHaveProperty(field);
