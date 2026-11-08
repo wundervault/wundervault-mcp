@@ -529,7 +529,8 @@ describe('BrokerOps.call with sealed parts', () => {
     await expect(call(e.id, '/mismatch')).rejects.toThrow('Sealed setup refused');
 
     expect(wire).toEqual([]);
-    expect(checks).toEqual([]);
+    // Batch B A1: the value (and its binding to the setup) is fetched after the call check.
+    expect(checks).toHaveLength(1);
   });
 
   it('refuses an agent header colliding with any part placement before sending anything', async () => {

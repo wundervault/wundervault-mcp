@@ -545,15 +545,15 @@ describe("the agent's own headers, checked by the broker", () => {
 });
 
 describe('one getSecret per operation', () => {
-  it('does not add an access-log row for metadata', async () => {
-    // There is deliberately no metadata probe. A convenient "just tell me the mode" call
-    // would add a row to the owner's access log for every tool call and give tier 2 a
-    // second chance to fire.
+  it('reads the setup without the value, then fetches the value once (batch B A1)', async () => {
+    // Batch B: the call is approved BEFORE the value is fetched, so the setup is read first
+    // with ?meta=1 — ungated, unlogged on the server, never the value. Then one value fetch.
     await speak(sock(), {
       token: TOKEN, op: 'call', entry_id: 'http1', purpose: 'p',
       request: { origin: { scheme: 'http', host: 'api.example', port: 80 }, method: 'GET', path: '/' },
     });
-    expect(getSecretCalls).toEqual(['http1']);
+    expect(getSecretCalls).toEqual(['http1', 'http1']);
+    expect(getSecretQueries).toEqual(['?purpose=&meta=1', '?purpose=']);
   });
 
   it("sends the agent's purpose with no fetch, web or SSH", async () => {
@@ -568,7 +568,7 @@ describe('one getSecret per operation', () => {
       token: TOKEN, op: 'ssh_agent_open', entry_id: 'ssh1', purpose: secretPurpose,
       op_spec: { kind: 'ssh', destination: 'h.example', remoteArgv: ['true'] },
     });
-    expect(getSecretQueries).toEqual(['?purpose=', '?purpose=']);
+    expect(getSecretQueries).toEqual(['?purpose=&meta=1', '?purpose=', '?purpose=']);
   });
 
   it('list_entries touches no secret at all', async () => {

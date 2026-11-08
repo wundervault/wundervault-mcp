@@ -29,12 +29,11 @@
  * no path through this socket returns a key's value. `vault_ssh_exec` still runs in the
  * agent's process — it is the agent's own command — and gets signatures, not the key.
  *
- * ONE getSecret PER OPERATION, DELIBERATELY
+ * WEB CALLS ASK BEFORE FETCHING THE VALUE
  *
- * Each operation makes exactly one `getSecret` call, the same one the agent used to make.
- * That keeps the server's access log and the tier-2 gate seeing precisely what they saw
- * before. A separate "just the metadata" probe would have been convenient here and would
- * have added an access-log row per call and a second chance to trip tier 2.
+ * A web call first reads metadata, builds the destination check, and only then fetches
+ * the value with the allowed check's single-use fetch grant. Other operations keep their
+ * existing fetch gate, and an old server falls back to it.
  *
  * None of them sends the agent's `purpose` with that fetch. The reason stays in the local
  * destination log; the server hears it only for a tier-2 web call, on the approval the
@@ -78,7 +77,7 @@ import { runtimeDir, systemRoot } from './paths.js';
 import type { VaultEntry } from './types.js';
 import { BEARER, bindingFromExecConfig, looksLikePrivateKey, secretForms, validateAgentHeaders, pathBindingProblem } from './delivery.js';
 import { checkAgentHeaders, oauth1FromParts, readValue, scrub as scrubParts, secretFormsAll, validateBindingV2, type BindingV2, type Shape } from './parts.js';
-import { SetupPins, sealT2Detail, t2MatchMac, newRequestId } from './setup-seal.js';
+import { SetupPins, sealT2Detail, t2MatchMac, t2OriginMac, newRequestId } from './setup-seal.js';
 import { renderDetail } from './render.js';
 import { SigningState, readPolicy } from './wallet.js';
 import { normalizeOrigin, validateSendAs, placementRecipe, placementSha, describePlacement, isAskBinding, type SendAs } from './placement.js';
@@ -283,6 +282,14 @@ export class BrokerOps {
     return { entries: data.entries ?? [] };
   }
 
+  async done(): Promise<{ ended: number; setting: 'end' | 'keep' } | OpError> {
+    try {
+      return await this.api.agentDone();
+    } catch (e) {
+      return err((e as Error).message, (e as { code?: string }).code);
+    }
+  }
+
   // ── call ───────────────────────────────────────────────────────────────────
   /**
    * Perform a typed HTTP request with the credential, and return the response.
@@ -336,7 +343,16 @@ export class BrokerOps {
     const callArgs = args.callArgs ?? {};
     let agentReq = args.request;
 
-    const s = await this.api.getSecret(entryId);
+    let haveValue = false;
+    let grant: string | undefined;
+    let s: Awaited<ReturnType<AgentVaultAPI['getSecretMeta']>>;
+    try {
+      s = await this.api.getSecretMeta(entryId);
+    } catch (e) {
+      if ((e as { code?: string })?.code !== 'META_UNSUPPORTED') throw e;
+      s = await this.api.getSecret(entryId);
+      haveValue = true;
+    }
     rec.key = s.name;
     rec.tier = String(s.access_tier ?? '1');
     if (!modeAllowsHttpBroker(s.entry_mode)) {
@@ -568,6 +584,128 @@ export class BrokerOps {
     }
 
     const vaultKey = await this.api.ensureVaultKey();
+    let def: NonNullable<ReturnType<typeof verifyOperationDefinition>["definition"]>;
+    let label: string;
+    let operationSlot: { definition: unknown; signature?: string } | undefined;
+    if (operationId) {
+      let catalogue: Record<string, { definition: unknown; signature?: string }> = {};
+      try {
+        const raw = s.operations as unknown;
+        catalogue = (typeof raw === 'string' ? JSON.parse(raw) : (raw ?? {})) as typeof catalogue;
+      } catch { return err("This entry's operation catalogue is not readable."); }
+      operationSlot = catalogue?.[operationId];
+      if (!operationSlot) {
+        const known = Object.keys(catalogue || {});
+        return err(`Entry has no operation "${operationId}".`
+          + (known.length ? ` Available: ${known.join(', ')}.` : ' It defines none.'));
+      }
+      // Read only the proposed destination here. The signature needs the value, so it
+      // is verified after approval and before execution; its destination must not change.
+      def = operationSlot.definition as NonNullable<ReturnType<typeof verifyOperationDefinition>['definition']>;
+      if (!def?.origin || typeof def.origin.host !== 'string' || !def.origin.host
+          || typeof def.origin.scheme !== 'string' || !def.origin.scheme
+          || typeof def.origin.port !== 'number' || !def.origin.port
+          || !def.route || typeof def.route.method !== 'string' || !def.route.method
+          || typeof def.route.path !== 'string') {
+        return err("Refused: this entry's operation definition is not readable.");
+      }
+      label = operationId;
+    } else {
+      const r = agentReq!;
+      if (!r?.origin?.host || !r.origin.scheme || !r.origin.port) {
+        return err('request.origin needs scheme, host and port.');
+      }
+      def = definitionFromAgentRequest({ ...r, headers: agentHeaders }, binding);
+      label = `${def.route.method} ${originString(r.origin)}${r.path || '/'}`;
+    }
+
+    const bodyHash = agentReq?.body !== undefined
+      ? createHash('sha256').update(JSON.stringify(agentReq.body)).digest('hex')
+      : undefined;
+    const originStr = originString(def.origin);
+    const { isNew } = recordDestination(entryId, originStr, undefined, purpose);
+    const known = Array.isArray(s.setup?.known_addresses) ? s.setup.known_addresses : [];
+    const firstSighting = isNew && !known.includes(originStr);
+
+    const isTier2 = String(s.access_tier ?? '1') === '2';
+    const destination = isTier2
+      ? { origin: originStr, method: def.route.method, path: def.route.path, body_sha256: bodyHash }
+      : {};
+    let lockedCheck: {
+      entry_id: string; first_sighting: boolean; request_id?: string;
+      detail_ciphertext?: string; detail_nonce?: string; match_mac?: string; origin_mac?: string;
+    } | undefined;
+    if (s.vault_locked === true) {
+      lockedCheck = { entry_id: entryId, first_sighting: firstSighting };
+      if (isTier2) {
+        const requestId = newRequestId();
+        try {
+          const detail = sealT2Detail(vaultKey, s.agent_id ?? '', requestId, {
+            name: s.name ?? '', kind: 'web', origin: originStr,
+            method: def.route.method, path: def.route.path, reason: purpose.slice(0, 200),
+          });
+          if (!detail.ok) {
+            return err('Refused: this approval request could not be sealed. Nothing was sent.', 'BAD_REQUEST');
+          }
+          lockedCheck = {
+            ...lockedCheck, request_id: requestId,
+            detail_ciphertext: detail.ciphertext, detail_nonce: detail.nonce,
+            match_mac: t2MatchMac(vaultKey, {
+              kind: 'web', origin: originStr, method: def.route.method,
+              path: def.route.path, entry_id: entryId,
+            }),
+            origin_mac: t2OriginMac(vaultKey, { origin: originStr, entry_id: entryId }),
+          };
+        } catch {
+          return err('Refused: this approval request could not be sealed. Nothing was sent.', 'BAD_REQUEST');
+        }
+      }
+    }
+
+    // The purpose goes with the destination: tier 2 only, where the owner is approving
+    // this one call and needs to read why. Tier 1 sends neither (network-shape decision).
+    const verdict = await this.api.checkOperation((lockedCheck ?? {
+      entry_id: entryId, purpose: isTier2 ? purpose.slice(0, 200) : '', first_sighting: firstSighting,
+      ...destination,
+    }) as never);
+
+    if (!verdict.allowed) {
+      rec.approval = 'asked';
+      const outcome = verdict.request_id
+        ? await this.api.waitForTier2Outcome(verdict.request_id)
+        : null;
+      if (outcome !== 'approved') {
+        rec.approval = 'not_approved';
+        const why = outcome ? approvalNotGivenMessage(outcome, `"${s.name}"`)
+          : `${verdict.message ?? 'This call needs owner approval.'} Nothing was sent.`;
+        // The address as the agent (or the signed definition) gave it, before any part is
+        // placed in it: the value has not been fetched, so there is nothing in it to scrub.
+        return err(`${why}\n\nThe owner sees exactly: ${def.route.method} ${originStr}${def.route.path}`);
+      }
+      const second = await this.api.checkOperation((lockedCheck ?? {
+        entry_id: entryId, purpose: purpose.slice(0, 200), origin: originStr,
+        method: def.route.method, path: def.route.path, body_sha256: bodyHash,
+      }) as never);
+      if (!second.allowed) {
+        rec.approval = 'not_approved';
+        return err(`${second.message ?? 'This call needs owner approval.'}\n\n`
+          + `Nothing was sent. The owner sees exactly: ${def.route.method} ${originStr}${def.route.path}`);
+      }
+      grant = second.fetch_grant;
+      verdict.tier = second.tier;
+      rec.approval = 'approved';
+    } else {
+      grant = verdict.fetch_grant;
+    }
+
+    if (!haveValue) {
+      const full = await this.api.getSecret(entryId, grant);
+      if (String(full.rev) !== String(s.rev)) {
+        return err('Refused: this secret changed while the call was being approved. Nothing was sent. Try again.', 'CHANGED');
+      }
+      s = full;
+      haveValue = true;
+    }
     const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
     try {
       let secret = new TextDecoder().decode(bytes);
@@ -616,41 +754,26 @@ export class BrokerOps {
           + 'in the dashboard; then call again with request.stamp {"builtin": "oauth1"}.', 'WRONG_KIND');
       }
 
-      let def;
-      let label: string;
-      if (operationId) {
-        let catalogue: Record<string, { definition: unknown; signature?: string }> = {};
-        try {
-          const raw = s.operations as unknown;
-          catalogue = (typeof raw === 'string' ? JSON.parse(raw) : (raw ?? {})) as typeof catalogue;
-        } catch { return err("This entry's operation catalogue is not readable."); }
-        const slot = catalogue?.[operationId];
-        if (!slot) {
-          const known = Object.keys(catalogue || {});
-          return err(`Entry has no operation "${operationId}".`
-            + (known.length ? ` Available: ${known.join(', ')}.` : ' It defines none.'));
-        }
+      if (operationSlot) {
         const operationKey = parts ? new TextEncoder().encode(secret) : bytes;
         let verified: ReturnType<typeof verifyOperationDefinition>;
         try {
-          verified = verifyOperationDefinition(entryId, slot.definition, slot.signature, operationKey, operationId);
+          verified = verifyOperationDefinition(entryId, operationSlot.definition, operationSlot.signature, operationKey, operationId);
         } finally {
           if (operationKey !== bytes) operationKey.fill(0);
         }
         if (!verified.ok || !verified.definition) return err(`Refused: ${verified.reason}`);
+        if (originString(verified.definition.origin) !== originStr
+            || verified.definition.route.method !== def.route.method
+            || verified.definition.route.path !== def.route.path) {
+          return err('Refused: this secret changed while the call was being approved. Nothing was sent. Try again.', 'CHANGED');
+        }
         const argCheck = validateArguments(verified.definition, callArgs);
         if (!argCheck.ok) return err(`Refused: ${argCheck.reason}`);
         def = verified.definition;
-        label = operationId;
       } else {
-        const r = agentReq!;
-        if (!r?.origin?.host || !r.origin.scheme || !r.origin.port) {
-          return err('request.origin needs scheme, host and port.');
-        }
-        def = definitionFromAgentRequest({ ...r, headers: agentHeaders }, binding);
-        label = `${def.route.method} ${originString(r.origin)}${r.path || '/'}`;
-        // Before anything is recorded or approved: a key that cannot go in the address
-        // would otherwise spend a tier-2 approval on a call that was never going to be sent.
+        // These checks need the value. Approval now precedes them, but a refusal still
+        // sends nothing, and the credential placement rules are unchanged.
         if (!partsBinding) {
           const problem = pathBindingProblem(binding, secret, def.route.path);
           if (problem) return err(`Refused: ${problem} Nothing was sent.`, 'BAD_REQUEST');
@@ -672,9 +795,6 @@ export class BrokerOps {
         }
       }
 
-      const bodyHash = agentReq?.body !== undefined
-        ? createHash('sha256').update(JSON.stringify(agentReq.body)).digest('hex')
-        : undefined;
       // The address the agent asked for, before the key is added — scrubbed anyway, so a
       // key that somehow reached the path never reaches the log.
       rec.method = def.route.method;
@@ -689,86 +809,6 @@ export class BrokerOps {
         : String(scrubSecret(text, secret));
       rec.address = scrubShown(`${originString(def.origin)}${def.route.path}`);
       rec.body_sha256 = bodyHash;
-
-      // Recorded here, in the broker, which is the first time this has actually worked.
-      // The call site used to be in the MCP server — the agent's uid — writing to
-      // /var/lib/wundervault/network.json, a directory that uid cannot open. D3 of the
-      // uid-split spec calls this store an integrity control because the audited party
-      // no longer owns the evidence; until now the audited party was still the writer.
-      const originStr = originString(def.origin);
-      const { isNew } = recordDestination(entryId, originStr, undefined, purpose);
-      const known = Array.isArray(s.setup?.known_addresses) ? s.setup.known_addresses : [];
-      const firstSighting = isNew && !known.includes(originStr);
-
-      const isTier2 = String(s.access_tier ?? '1') === '2';
-      const destination = isTier2
-        ? { origin: originStr, method: def.route.method, path: def.route.path, body_sha256: bodyHash }
-        : {};
-      let lockedCheck: {
-        entry_id: string; first_sighting: boolean; request_id?: string;
-        detail_ciphertext?: string; detail_nonce?: string; match_mac?: string;
-      } | undefined;
-      if (s.vault_locked === true) {
-        lockedCheck = { entry_id: entryId, first_sighting: firstSighting };
-        if (isTier2) {
-          const requestId = newRequestId();
-          try {
-            const detail = sealT2Detail(vaultKey, s.agent_id ?? '', requestId, {
-              name: s.name ?? '', kind: 'web', origin: originStr,
-              method: def.route.method, path: def.route.path, reason: purpose.slice(0, 200),
-            });
-            if (!detail.ok) {
-              return err('Refused: this approval request could not be sealed. Nothing was sent.', 'BAD_REQUEST');
-            }
-            lockedCheck = {
-              ...lockedCheck, request_id: requestId,
-              detail_ciphertext: detail.ciphertext, detail_nonce: detail.nonce,
-              match_mac: t2MatchMac(vaultKey, {
-                kind: 'web', origin: originStr, method: def.route.method,
-                path: def.route.path, entry_id: entryId,
-              }),
-            };
-          } catch {
-            return err('Refused: this approval request could not be sealed. Nothing was sent.', 'BAD_REQUEST');
-          }
-        }
-      }
-
-      // The purpose goes with the destination: tier 2 only, where the owner is approving
-      // this one call and needs to read why. Tier 1 sends neither (network-shape decision).
-      const verdict = await this.api.checkOperation((lockedCheck ?? {
-        entry_id: entryId, purpose: isTier2 ? purpose.slice(0, 200) : '', first_sighting: firstSighting,
-        ...destination,
-      }) as never);
-
-      if (!verdict.allowed) {
-        rec.approval = 'asked';
-        const outcome = verdict.request_id
-          ? await this.api.waitForTier2Outcome(verdict.request_id)
-          : null;
-        if (outcome !== 'approved') {
-          rec.approval = 'not_approved';
-          // The same words as every other tool (2.0.1, B4); a server that could not ask at all
-          // still says why, in its own words.
-          const why = outcome ? approvalNotGivenMessage(outcome, `"${s.name}"`)
-            : `${verdict.message ?? 'This call needs owner approval.'} Nothing was sent.`;
-          // Scrubbed like rec.address: a path may carry a part (review cl5 r2 broker F1).
-          return err(`${why}\n\nThe owner sees exactly: ${def.route.method} `
-            + scrubShown(`${originString(def.origin)}${def.route.path}`));
-        }
-        const second = await this.api.checkOperation((lockedCheck ?? {
-          entry_id: entryId, purpose: purpose.slice(0, 200), origin: originStr,
-          method: def.route.method, path: def.route.path, body_sha256: bodyHash,
-        }) as never);
-        if (!second.allowed) {
-          rec.approval = 'not_approved';
-          return err(`${second.message ?? 'This call needs owner approval.'}\n\n`
-            + `Nothing was sent. The owner sees exactly: ${def.route.method} `
-            + scrubShown(`${originString(def.origin)}${def.route.path}`));
-        }
-        verdict.tier = second.tier;
-        rec.approval = 'approved';
-      }
 
       let approvedOrigins: string[] = [];
       try {

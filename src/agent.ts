@@ -985,6 +985,10 @@ class AgentDaemon {
       case 'list_entries':
         return await ops.listEntries() as unknown as Record<string, unknown>;
 
+      // Batch B A3: the agent says it has finished. It can only END this agent's approvals.
+      case 'done':
+        return await ops.done() as unknown as Record<string, unknown>;
+
       // `get_entry` (a key's value, for the hand-over tools) and `profile_flags` (whether
       // the account let agents write keys into files) were answered here until 1.0. Both
       // served hand-over, which is retired; they now fall through to "unknown operation",

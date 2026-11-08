@@ -65,7 +65,7 @@ describe('demo mode holds no lock (2.0.2: Glama listed one tool)', () => {
     expect(existsSync(ENTRY)).toBe(true);
     const all = await Promise.all([listTools(), listTools(), listTools()]);
     for (const tools of all) {
-      expect(tools.sort()).toEqual(['vault_2fa_code', 'vault_call', 'vault_entries_list', 'vault_git', 'vault_pay', 'vault_sign', 'vault_ssh_exec']);
+      expect(tools.sort()).toEqual(['vault_2fa_code', 'vault_call', 'vault_done', 'vault_entries_list', 'vault_git', 'vault_pay', 'vault_sign', 'vault_ssh_exec']);
     }
   }, 60_000);
 

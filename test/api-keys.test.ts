@@ -272,14 +272,16 @@ describe('B. a key in the web address', () => {
     expect(r.raw).not.toContain(SLACK_KEY);
   });
 
-  it('refuses a key that cannot go in an address, sends nothing, and asks no approval', async () => {
+  it('refuses a key that cannot go in an address and sends nothing', async () => {
+    // Batch B A1: this check reads the VALUE, which is fetched only after the call check, so
+    // the check now comes first (a tier-2 key asks once, then refuses). Nothing is ever sent.
     for (const id of ['spacey', 'query', 'dots', 'slashy']) {
       const r = await call(id, 'GET', '/x');
       expect(r.json.code, id).toBe('BAD_REQUEST');
       expect(r.json.error, id).toMatch(/can't go in a web address/);
     }
     expect(wire).toHaveLength(0);
-    expect(opChecks).toHaveLength(0);
+    expect(opChecks).toHaveLength(4);
   });
 
   it('refuses an agent path that walks out from under the key', async () => {

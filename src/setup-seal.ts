@@ -321,6 +321,21 @@ export function t2MatchMac(vaultKey: Uint8Array, fields: T2MatchFields): string 
   return createHmac('sha256', key).update(values.join('\n'), 'utf8').digest('hex');
 }
 
+/**
+ * Batch B A2: what a 15/60-minute window covers on a locked account — this key, this agent's
+ * copy, this service (origin), any method and path. The owner's browser recomputes it from the
+ * sealed detail before offering a window, so the server cannot widen what was approved.
+ */
+export function t2OriginMac(vaultKey: Uint8Array, fields: { origin: string; entry_id: string }): string {
+  const values = ['web', fields.origin, fields.entry_id];
+  if (values.some(value => typeof value !== 'string' || value.includes('\n'))) {
+    throw new Error('Invalid tier-2 match field');
+  }
+  if (vaultKey.length !== 32) throw new Error('Invalid vault key');
+  const key = hkdfKey(vaultKey, zeroSalt, 'wv-t2-origin-1');
+  return createHmac('sha256', key).update(values.join('\n'), 'utf8').digest('hex');
+}
+
 export function newRequestId(): string {
   return randomBytes(16).toString('hex');
 }

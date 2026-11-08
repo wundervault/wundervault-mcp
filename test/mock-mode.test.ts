@@ -10,6 +10,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 const ARGS: Record<string, Record<string, unknown>> = {
   vault_entries_list: {},
+  vault_done: {},
   vault_call: { entry_id: 'demo-0001', purpose: 'demo', request: { origin: { scheme: 'https', host: 'api.example.com', port: 443 }, method: 'GET', path: '/' } },
   vault_ssh_exec: { entry_id: 'demo-0002', destination: 'demo@host', purpose: 'demo', remote_argv: ['true'] },
   vault_pay: { entry_id: 'demo-0003', payment_required: 'e30=', purpose: 'demo' },

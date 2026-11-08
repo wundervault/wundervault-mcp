@@ -102,7 +102,9 @@ export class AgentVaultAPI {
     return { ...base, ...this.signer.sign(method, u.pathname, u.search.replace(/^\?/, ''), body) };
   }
 
-  private async fetchJson<T>(path: string, params?: Record<string, string>): Promise<T> {
+  private async fetchJson<T>(
+    path: string, params?: Record<string, string>, extraHeaders?: Record<string, string>,
+  ): Promise<T> {
     let url = `${this.baseUrl}${path}`;
     // Built once and signed as built. Re-serialising the params for the signature would
     // mean signing a string that is merely equivalent to the one sent, and the server
@@ -111,7 +113,7 @@ export class AgentVaultAPI {
     if (query) url += `?${query}`;
     const resp = await fetch(url, {
       method: 'GET',
-      headers: this.signedHeaders('GET', url),
+      headers: { ...this.signedHeaders('GET', url), ...extraHeaders },
       signal: AbortSignal.timeout(TIMEOUT),
     });
     if (!resp.ok) {
@@ -175,8 +177,9 @@ export class AgentVaultAPI {
     request_id?: string;
     detail_ciphertext?: string;
     detail_nonce?: string;
+    origin_mac?: string;
   }): Promise<{ allowed: boolean; tier: string; request_id?: string; message?: string;
-                emailed?: boolean }> {
+                emailed?: boolean; fetch_grant?: string }> {
     // Serialised once. The bytes that are hashed for the signature must be the bytes
     // that are sent, and JSON.stringify called twice is two chances to differ.
     const payload = JSON.stringify(body);
@@ -187,6 +190,7 @@ export class AgentVaultAPI {
         // Node send "application/json, application/json", which FastAPI does not read as
         // JSON: every operation check answered 422 (1.0 rehearsal, 2026-10-20).
         ...this.signedHeaders('POST', `${this.baseUrl}/agent/vault/operation-check`, payload),
+        'X-WV-Want-Fetch-Grant': '1',
       },
       body: payload,
       signal: AbortSignal.timeout(TIMEOUT),
@@ -198,7 +202,7 @@ export class AgentVaultAPI {
       throw err;
     }
     return resp.json() as Promise<{ allowed: boolean; tier: string; request_id?: string;
-                                    message?: string; emailed?: boolean }>;
+                                    message?: string; emailed?: boolean; fetch_grant?: string }>;
   }
 
   /** POST a JSON body, signed. A refusal throws with `status` and the parsed `body`. */
@@ -220,6 +224,11 @@ export class AgentVaultAPI {
       throw err;
     }
     return resp.json() as Promise<T>;
+  }
+
+  /** End this agent's approvals according to the owner's setting. */
+  async agentDone(): Promise<{ ended: number; setting: 'end' | 'keep' }> {
+    return this.postJson('/agent/vault/done', {});
   }
 
   /**
@@ -269,19 +278,41 @@ export class AgentVaultAPI {
     return { entries: result.entries };
   }
 
-  private async resolveSecret(resp: SecretResponse, id: string): Promise<SecretResponse> {
+  private async resolveSecret(resp: SecretResponse, id: string, withValue = true): Promise<SecretResponse> {
+    // withValue=false here means the META view (full setup, no value): see getSecretMeta.
     if (!this.pins) return resp;
     const result = await resolveEntry(resp, {
       requestedId: id,
       vaultKey: () => this.ensureVaultKey(),
       pins: this.pins,
       account: pinAccountFor(this.apiKey),
-      withValue: true,
+      withValue,
+      metaView: !withValue,
     });
     if (!result.ok) {
       throw Object.assign(new Error(result.message), { code: result.code });
     }
     return result.entry;
+  }
+
+  /** Read setup and configuration without spending an approval or resolving the value. */
+  async getSecretMeta(id: string): Promise<SecretResponse> {
+    try {
+      return await this.resolveSecret(
+        await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, { purpose: '', meta: '1' }),
+        id, false,
+      );
+    } catch (err: any) {
+      const requestId = err?.status === 403
+        ? String(err.message).match(/tier2-requests\/([A-Za-z0-9_-]+)/)?.[1]
+        : undefined;
+      if (requestId) {
+        throw Object.assign(new Error('This server does not support ungated secret metadata.'), {
+          code: 'META_UNSUPPORTED',
+        });
+      }
+      throw err;
+    }
   }
 
   /**
@@ -294,10 +325,13 @@ export class AgentVaultAPI {
    * A tier-2 web call's reason reaches the owner through `checkOperation`, beside the
    * destination they are being asked to approve — never on this path.
    */
-  async getSecret(id: string): Promise<SecretResponse> {
+  async getSecret(id: string, grant?: string): Promise<SecretResponse> {
     try {
       return await this.resolveSecret(
-        await this.fetchJson<SecretResponse>(`/agent/vault/secrets/${id}`, { purpose: '' }), id,
+        await this.fetchJson<SecretResponse>(
+          `/agent/vault/secrets/${id}`, { purpose: '' },
+          grant === undefined ? undefined : { 'X-WV-Fetch-Grant': grant },
+        ), id,
       );
     } catch (err: any) {
       // Tier-2 gate: the 403 detail carries a pending approval-request id.

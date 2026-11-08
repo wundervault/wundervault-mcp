@@ -10,6 +10,10 @@ export interface EntryContext {
   pins: SetupPins;
   account: string;
   withValue: boolean;
+  /** Batch B A1: the full use view (setup, config) of an entry fetched WITHOUT its value, so the
+   * call can be approved before the value is fetched. The value commitment is checked on the
+   * value fetch that follows. Ignored when withValue is true. */
+  metaView?: boolean;
 }
 
 type EntryResponse = Omit<Partial<SecretResponse>, 'operations'> & {
@@ -103,7 +107,7 @@ export async function resolveEntry<T extends EntryResponse>(
 
     // The same rules the vault page saves by (review cl5 broker F1): a sealed setup that breaks
     // them is refused here, so nothing downstream ever sees an impossible combination.
-    const problem = setupProblem(setup, ctx.withValue);
+    const problem = setupProblem(setup, ctx.withValue || ctx.metaView === true);
     if (problem) return refused(problem);
     if (ctx.withValue && !checkValueCommitment(setup, resp.encrypted_content ?? '')) {
       return refused("the key and its setup don't match");
@@ -143,7 +147,7 @@ export async function resolveEntry<T extends EntryResponse>(
 
     // Persist before returning anything usable. Errors must not expose an unpinned view.
     await ctx.pins.record(ctx.account, entryId, setup.rev, resp.vault_locked === true);
-    if (!ctx.withValue) {
+    if (!ctx.withValue && ctx.metaView !== true) {
       // A list entry keeps the exact shape the server listed before L — an older agent app
       // reads `operations` as an array of ids (server.ts list rendering) — and carries no setup.
       const listed: Record<string, unknown> = {

@@ -69,6 +69,9 @@ function mockToolResult(name: string, args: Record<string, any>) {
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ Paid 0.01 USDC on base-sepolia inside the owner's rules. Send this header when you retry: `
         + `PAYMENT-SIGNATURE: demo-payment-header. The wallet key never left the broker.${MOCK_NOTE}` }] });
+    case 'vault_done':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `Done. The owner's approvals for this agent were ended.${MOCK_NOTE}` }] });
     case 'vault_sign':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ Signed after the owner approved. signature: ZGVtby1zaWduYXR1cmU=  public_key: ZGVtby1wdWJsaWMta2V5  `
@@ -109,6 +112,15 @@ export function createServer(args: { url?: string } = {}) {
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
+      {
+        name: 'vault_done',
+        description: (
+          'Call this when you have finished the task your owner gave you. It tells the vault you are done, '
+          + 'which (by your owner\'s setting) ends the time-limited approvals they gave you, so nothing stays '
+          + 'open after the work. It can only end approvals, never extend them. Takes no arguments.'
+        ),
+        inputSchema: { type: 'object', properties: {} },
+      },
       {
         name: 'vault_entries_list',
         description: (
@@ -320,6 +332,16 @@ export function createServer(args: { url?: string } = {}) {
     }
 
     try {
+      if (request.params.name === 'vault_done') {
+        const data = await broker.sendOrThrow('done');
+        const n = Number(data.ended ?? 0);
+        const text = data.setting === 'keep'
+          ? 'Noted. Your owner keeps approvals until their timers run out, so nothing was ended.'
+          : `Done. ${n} approval${n === 1 ? '' : 's'} the owner gave you ${n === 1 ? 'was' : 'were'} ended; `
+            + 'the next use of an "ask me first" secret will ask again.';
+        return CallToolResultSchema.parse({ content: [{ type: 'text', text }] });
+      }
+
       if (request.params.name === 'vault_entries_list') {
         const data = await broker.sendOrThrow('list_entries');
         const entries: VaultEntry[] = (data.entries as VaultEntry[]) ?? [];
