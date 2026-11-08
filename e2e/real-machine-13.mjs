@@ -243,6 +243,7 @@ async function main() {
   let changedEntryId;
   let opened;
   let secondAgent;
+  let thirdAgent;
   const entries = new Map();
   const activities = [];
   const approvals = [];
@@ -610,10 +611,48 @@ async function main() {
       ));
       assert(refused, 'the agent onSign callback did not report a refusal');
     });
+
+    await check('socket refuses another user name', 0, async () => {
+      ready();
+      // The real server, approved for a DIFFERENT name: a sign-in as this account must be refused at the
+      // socket (3bd544c). OpenSSH asks for a signature only after the server accepts the key, so the
+      // refusal is driven with this account's real key and a pin that names someone else.
+      const signEvents = [];
+      const agentDir = fs.mkdtempSync(path.join(root, 'a3-'));
+      fs.chmodSync(agentDir, 0o755);
+      const otherName = user === 'root' ? 'nobody' : 'root';
+      thirdAgent = modules.startAgent(
+        modules.loadOpenSshEd25519(privateKey),
+        (event) => { signEvents.push([event]); },
+        '127.0.0.1',
+        { dir: agentDir, socketMode: 0o666, publicKeyMode: 0o644, pinnedHostKey: realKey, pinnedUser: otherName },
+      );
+      const publicOnlyPath = path.join(root, 'public-only-3');
+      fs.writeFileSync(publicOnlyPath, `${publicKey}\n`, { mode: 0o600 });
+      const result = await runSsh([
+        '-F', '/dev/null', '-p', '22', '-l', user,
+        '-o', `IdentityAgent=${thirdAgent.socketPath}`, '-o', `IdentityFile=${publicOnlyPath}`, '-o', 'IdentitiesOnly=no',
+        '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'GlobalKnownHostsFile=/dev/null',
+        '-o', 'BatchMode=yes', '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
+        '-o', 'KbdInteractiveAuthentication=no', '-o', 'GSSAPIAuthentication=no', '-o', 'HostbasedAuthentication=no',
+        '-o', 'ForwardAgent=no', '-o', 'AddKeysToAgent=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
+        '-o', 'ConnectTimeout=10', '-o', 'ConnectionAttempts=1',
+        '127.0.0.1', 'id', '-un',
+      ]);
+      noSecrets(result);
+      assert(result.code !== null && result.code !== 0 && result.code !== 124, 'SSH did not fail promptly for a different approved name');
+      assert(result.stdout.trim() === '', 'a session approved for another name ran the remote command');
+      const refused = signEvents.some((args) => args.some((event) =>
+        event === false || (event && typeof event === 'object' &&
+          (event.refused === true || event.allowed === false || event.ok === false)),
+      ));
+      assert(refused, 'the agent did not report refusing the sign-in for another name');
+    });
   } finally {
     const cleanupErrors = [];
     const cleanups = [
       async () => { if (secondAgent) await secondAgent.close(); },
+      async () => { if (thirdAgent) await thirdAgent.close(); },
       ...[...sessions].map((sessionId) => async () => { await ops.closeSsh(sessionId); }),
       async () => { if (ops) await ops.reset(); },
       async () => closeServer(vaultServer),
