@@ -65,7 +65,11 @@ expect "report: new key with its comment" '[[ $rep == *"NEW	key	opc	"*"sneaky"* 
 expect "report: new sudo member" '[[ $rep == *"NEW	group	sudo	helper2"* ]]'
 expect "report: new cron job" '[[ $rep == *"crontabs/opc"* ]]'
 expect "report: process left running" '[[ $rep == *"NEW	process	opc	sleep"* ]]'
+expect "report: /etc/passwd changed" '[[ $rep == *"NEW	file	/etc/passwd"* ]]'
 expect "report never prints a whole key" '[[ $rep != *AAAAC3Nza* ]]'
+podman exec wv-admin-test sh -c 'useradd -m -s /bin/bash maint1; /usr/local/lib/wundervault/wv-check baseline >/dev/null; usermod -o -u 0 maint1' >/dev/null 2>&1
+rep=$(daily "sudo -n /usr/local/lib/wundervault/wv-check report")
+expect "report: an account moved to uid 0" '[[ $rep == *"NEW	account	maint1	0:"* ]]'
 cert 8; t0=$(date +%s); admin "sleep 120" >/dev/null 2>&1; took=$(( $(date +%s) - t0 ))
 expect "server ends a running admin command at the end ($took s for 8 s)" '[[ $took -le 10 ]]'
 expect "certificate refused after its end" '! admin true >/dev/null 2>&1'
@@ -74,6 +78,9 @@ out=$(admin "sudo sh -s -- prepare opc wv-bad '$CA' '$D' '$E'" < "$B"); expect "
 out=$(admin "sudo sh -s -- prepare 'opc;id' wv-agent x y z" < "$B"); expect "refuses a bad name before using it" '[[ $out == "FAIL admin account name" ]]'
 podman exec wv-admin-test sh -c "useradd -m adm2; install -d -o adm2 -m 700 /home/adm2/.ssh; echo 'cert-authority,principals=\"wv-admin\" $CA' > /home/adm2/.ssh/authorized_keys"
 out=$(admin "sudo sh -s -- finalize adm2 '$CA'" < "$B"); expect "finalize refuses without the emergency key" '[[ $out == *"emergency key is missing"* ]]'
+end=$(( $(date +%s) + 60 ))
+out=$(podman exec -u opc -e TMPDIR=/nonexistent -e SSH_ORIGINAL_COMMAND="echo SHOULD-NOT" wv-admin-test sh /usr/local/lib/wundervault/wv-admin-session $end 2>&1)
+expect "session check timer cannot start -> refused (fails closed)" '[[ $out != *SHOULD-NOT* && $out == *refused* ]]'
 podman exec wv-admin-test mv /usr/local/lib/wundervault/wv-admin-session /tmp/x; cert 60
 expect "session check missing -> admin refused (fails closed)" '! admin "echo SHOULD-NOT" 2>/dev/null | grep -q SHOULD-NOT'
 expect "...while the everyday key still works" '[[ $(daily "id -un") == wv-agent ]]'

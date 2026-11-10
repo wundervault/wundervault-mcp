@@ -134,7 +134,7 @@ export class BrokerOps {
   /** BUILD 2: this machine's payment record, policy versions and used approvals. */
   private state: SigningState;
   private readonly keyscan: (t: NonNullable<ReturnType<typeof normalizeSshTarget>>) => Promise<string | null>;
-  private ssh = new Map<string, { handle: AgentHandle; timer: NodeJS.Timeout; entryId: string; key?: string; host: string; reason: string; tier: string; adminPoll?: NodeJS.Timeout; adminUntil?: string; endedBy?: string }>();
+  private ssh = new Map<string, { handle: AgentHandle; timer: NodeJS.Timeout; entryId: string; key?: string; host: string; reason: string; tier: string; adminPoll?: NodeJS.Timeout; adminUntil?: string; endedBy?: string; endRemote?: () => Promise<number> }>();
 
   /**
    * A server's identity, scanned at most once per two minutes per address. Each scan is a
@@ -1190,12 +1190,16 @@ export class BrokerOps {
     vaultKey ??= await this.api.ensureVaultKey();
     const bytes = decryptSecretContent(vaultKey, s.encrypted_content, s.content_nonce);
     let identity;
+    // Names this session's server-side sessions, so an EARLY end (End now, done, a revoke) can
+    // end them on the server too, not only at the certificate's end (whole-build review F1).
+    let certTag: string | undefined;
     try {
       identity = loadOpenSshEd25519(new TextDecoder().decode(bytes));
       if (adminUntilMs !== undefined && args.offer !== 'plain') {
         // D13: a certificate for this key, valid until admin access ends, whose forced
         // command makes the server end the session then too.
-        identity.certBlob = adminCertificate(identity, { end: Math.floor(adminUntilMs / 1000) });
+        certTag = randomBytes(8).toString('hex');
+        identity.certBlob = adminCertificate(identity, { end: Math.floor(adminUntilMs / 1000), tag: certTag });
         if (args.offer === 'cert') identity.certOnly = true;
       } else if (args.offer === 'cert') {
         throw new Error('only an admin key in admin access has a certificate');
@@ -1266,9 +1270,40 @@ export class BrokerOps {
       }, BrokerOps.ADMIN_POLL_MS);
       (adminPoll as unknown as { unref?: () => void }).unref?.();
     }
+    let endRemote: (() => Promise<number>) | undefined;
+    if (certTag !== undefined && (op?.kind === 'ssh' || op?.kind === 'git') && typeof op.destination === 'string') {
+      // One last sign-in whose certificate can do one thing: end this session's server sessions
+      // now. It carries the same pin, so it signs only for the same server.
+      const tag = certTag, base = identity, destination = op.destination;
+      const pinned = pin ? { hostKey: pin.hostKey, user: pin.target.user, line: knownHostsLine(pin.target, pin.hostKey) } : undefined;
+      endRemote = async () => {
+        const d = fs.mkdtempSync(path.join(sshRoot, 'end-'));
+        let h: AgentHandle | undefined;
+        try {
+          const kh = pinned ? path.join(d, 'known_hosts') : undefined;
+          if (kh) fs.writeFileSync(kh, pinned!.line, { mode: 0o600 });
+          const id2 = { ...base, certOnly: true,
+            certBlob: adminCertificate(base, { end: Math.floor(Date.now() / 1000) + 120, tag, endNow: true }) };
+          h = startAgent(id2, undefined, auditedHost, {
+            dir: d, socketMode: 0o600, publicKeyMode: 0o600,
+            ...(pinned ? { pinnedHostKey: pinned.hostKey, pinnedUser: pinned.user } : {}),
+          });
+          const r = await runSshWithAgent({
+            op: { kind: 'ssh', destination, remoteArgv: ['true'] } as BrokeredOp,
+            socketPath: h.socketPath, publicKeyPath: h.publicKeyPath,
+            ...(kh ? { knownHostsPath: kh } : {}), timeoutMs: 20_000,
+          });
+          return r.exitCode;
+        } finally {
+          try { h?.close(); } catch { /* gone */ }
+          fs.rmSync(d, { recursive: true, force: true });
+        }
+      };
+    }
     this.ssh.set(sessionId, {
       handle, timer, entryId, key: s.name, host: auditedHost, reason: purpose, tier: String(s.access_tier ?? '1'),
       ...(adminPoll ? { adminPoll, adminUntil: new Date(adminUntilMs!).toISOString() } : {}),
+      ...(endRemote ? { endRemote } : {}),
     });
     // Pairs this line with its close. A hash, not the id: the id names the signing socket's
     // directory, and a copy of the log (the viewer page) is readable by agents (round 3, B1).
@@ -1328,6 +1363,9 @@ export class BrokerOps {
     return ended ? { open: false, ended_by: ended } : { open: false };
   }
 
+  /** Sessions whose early server-side end was started (tests read this). */
+  readonly endingRemote = new Set<string>();
+
   /** Why recent sessions ended, so the agent can be told "admin access ended" (bounded). */
   private endedSessions = new Map<string, string>();
 
@@ -1343,6 +1381,22 @@ export class BrokerOps {
     }
     try { rec.handle.close(); } catch { /* already gone */ }
     this.ssh.delete(sessionId);
+    // Ended EARLY by the owner (End now, done, a revoke) or unconfirmed: the server would keep
+    // a session the agent opened with its own ssh until the certificate's end, so end it there
+    // now (whole-build review F1). At the natural end the server's own timer does it.
+    if (endedBy && rec.endRemote && rec.adminUntil && Date.now() < Date.parse(rec.adminUntil) - 2000) {
+      const ref = sessionRef(sessionId);
+      rec.endRemote().then(
+        (code) => this.record({ kind: 'ssh_closed', outcome: code === 0 ? 'closed' : 'refused', agent: this.agentName, entry_id: rec.entryId,
+          key: rec.key, address: `ssh://${rec.host}`, reason: 'Ended the server sessions early', tier: rec.tier,
+          extra: { session: ref, server_end: code === 0 ? 'done' : `failed (${code})` } }),
+        () => this.record({ kind: 'ssh_closed', outcome: 'refused', agent: this.agentName, entry_id: rec.entryId,
+          key: rec.key, address: `ssh://${rec.host}`, reason: 'Ended the server sessions early', tier: rec.tier,
+          extra: { session: ref, server_end: 'failed' } }),
+      );
+      this.endingRemote.add(ref);
+      if (this.endingRemote.size > 64) this.endingRemote.delete(this.endingRemote.values().next().value as string);
+    }
     this.record({
       kind: 'ssh_closed', outcome: 'closed', agent: this.agentName, entry_id: rec.entryId,
       key: rec.key, address: `ssh://${rec.host}`, reason: rec.reason, tier: rec.tier,

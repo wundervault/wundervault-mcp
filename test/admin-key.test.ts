@@ -51,6 +51,7 @@ function withFixture(run: (fixture: Fixture) => void): void {
       env: {
         ...process.env,
         WV_ADMIN_ROOT_SSH_DIR: sshDir,
+        WV_ADMIN_LIB_DIR: join(dir, 'lib'),
         WV_ADMIN_NO_WAIT: '1',
         TMPDIR: tempDir,
       },
@@ -95,10 +96,15 @@ describe.skipIf(!supported)('admin-key.sh', () => {
       const lines = contents.trimEnd().split('\n');
       expect(lines).toHaveLength(1);
       expect(lines[0].startsWith(
-        'from="127.0.0.1,::1",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 ',
+        'cert-authority,principals="wv-admin",from="127.0.0.1,::1",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 ',
       )).toBe(true);
       expect(lines[0]).toContain(' wundervault-admin ');
       expect(contents.endsWith('\n')).toBe(true);
+      // The cut-off script is installed next to it (whole-build review F2), executable, same file.
+      const lib = join(fixture.dir, 'lib', 'wv-admin-session');
+      expect(statSync(lib).mode & 0o777).toBe(0o755);
+      expect(readFileSync(lib, 'utf8')).toBe(readFileSync(resolve('packaging/server/wv-admin-session'), 'utf8'));
+      expect(readdirSync(join(fixture.dir, 'lib'))).toEqual(['wv-admin-session']);
     });
   });
 
@@ -121,6 +127,17 @@ describe.skipIf(!supported)('admin-key.sh', () => {
         expect(r.status).not.toBe(0);
         expect(`${r.stdout}${r.stderr}`).not.toMatch(/PRIVATE KEY/);
       }
+      expect(existsSync(fixture.keysFile)).toBe(false);
+    });
+  });
+
+  it('a redirected keys folder without a redirected session check folder is refused (never the live one)', () => {
+    withFixture((fixture) => {
+      const env = { ...fixture.env };
+      delete env.WV_ADMIN_LIB_DIR;
+      const r = spawnSync('sh', [script, ...withPublic([])], { env, encoding: 'utf8' });
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain('WV_ADMIN_LIB_DIR');
       expect(existsSync(fixture.keysFile)).toBe(false);
     });
   });
@@ -159,7 +176,7 @@ describe.skipIf(!supported)('admin-key.sh', () => {
     withFixture((fixture) => {
       run(fixture, ['--from', '192.168.1.10,10.0.0.5']);
       const before = readFileSync(fixture.keysFile, 'utf8');
-      expect(before.startsWith('from="192.168.1.10,10.0.0.5",')).toBe(true);
+      expect(before.startsWith('cert-authority,principals="wv-admin",from="192.168.1.10,10.0.0.5",')).toBe(true);
 
       for (const value of ['a b', 'x;rm', '"', '', 'host,', ',host', 'a'.repeat(254)]) {
         const result = spawnSync('sh', [script, ...withPublic(['--from', value])], {

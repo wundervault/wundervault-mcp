@@ -27,12 +27,14 @@ snapshot() {
       printf 'key\t%s\t%s\t%s\n' "$name" "$(printf '%s' "$line" | fp)" "$comment"
     done
   done
-  getent passwd | awk -F: '$3 >= 1000 || $3 == 0 { print "account\t" $1 "\t" $7 }'
+  # uid and primary group too (whole-build review F4): an account moved to uid 0, or to a
+  # privileged primary group, keeps its name and shell. Any account at uid 0 is listed.
+  getent passwd | awk -F: '$3 >= 1000 || $3 == 0 { print "account\t" $1 "\t" $3 ":" $4 "\t" $7 }'
   for g in sudo wheel docker adm root; do
     members=$(getent group "$g" | cut -d: -f4)
     [ -n "$members" ] && printf '%s\n' "$members" | tr ',' '\n' | sed "s/^/group\t$g\t/"
   done
-  for f in /etc/sudoers /etc/sudoers.d/* /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* /etc/crontab /etc/cron.d/* \
+  for f in /etc/passwd /etc/group /etc/sudoers /etc/sudoers.d/* /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* /etc/crontab /etc/cron.d/* \
            /var/spool/cron/crontabs/* /var/spool/cron/*; do
     [ -f "$f" ] && printf 'file\t%s\t%s\n' "$f" "$(fp_file "$f")"
   done

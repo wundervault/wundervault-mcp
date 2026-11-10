@@ -48,17 +48,35 @@ install_programs() {
 # Wundervault admin access: the server's half of the cut-off (SPEC-admin-access D13).
 #
 # Admin sign-ins use a short-lived SSH certificate signed by the helper app. The certificate
-# carries "force-command=/usr/local/lib/wundervault/wv-admin-session <end>", where <end> is when
-# the owner's admin access ends (Unix seconds). The signature covers it, so the agent cannot
-# change it. sshd itself refuses the certificate after its valid-before; this script ends the
-# session that is already open at the same moment, including one the agent opened with its own
-# ssh client and multiplexed sessions started later on that connection.
+# carries "force-command=/usr/local/lib/wundervault/wv-admin-session <end> [<tag>]", where <end>
+# is when the owner's admin access ends (Unix seconds) and <tag> names the helper's signing
+# session. The signature covers both, so the agent cannot change them. sshd itself refuses the
+# certificate after its valid-before; this script ends the session that is already open at the
+# same moment, including one the agent opened with its own ssh client and multiplexed sessions
+# started later on that connection.
+#
+# "end-now <tag>" (whole-build review F1): when the owner ends admin access EARLY (End now, done,
+# a revoke), the helper signs one last certificate whose forced command is this mode, and every
+# session opened under that tag is ended now instead of at <end>.
 #
 # Fails closed: if this file is missing or broken, the forced command fails and the admin
-# session does not start. The everyday account and the emergency key do not pass through here.
+# session does not start; if its timer cannot start, the session does not start either.
+# The everyday account and the emergency key do not pass through here.
 set -u
+tag_ok() { case ${1:-} in ''|*[!0-9a-f]*) return 1;; esac; [ ${#1} -le 32 ]; }
+
+if [ "${1:-}" = end-now ]; then
+  tag_ok "${2:-}" || { echo "wundervault: no session to end." >&2; exit 2; }
+  # The timers of that tag end their sessions on this signal (same account, so allowed).
+  pkill -USR1 -f "wv-cutoff-$2 " 2>/dev/null
+  echo "ended"
+  exit 0
+fi
+
 end=${1:-}
 case $end in ''|*[!0-9]*) echo "wundervault: admin access has no valid end time; refused." >&2; exit 126;; esac
+tag=${2:-none}
+tag_ok "$tag" || tag=none
 now=$(date +%s)
 left=$((end - now))
 if [ "$left" -le 0 ]; then
@@ -68,21 +86,46 @@ fi
 # sshd made this process the leader of a new session (setsid) for this channel. At the end
 # time, kill every process still in that session: the command, an interactive shell and
 # whatever they started without detaching. Detached daemons are outside it (spec §6 limits;
-# the change check reports new services and scheduled jobs).
-sid=$(ps -o sid= -p $$ | tr -d ' ')
+# the change check reports new services and scheduled jobs). macOS has no session ids in ps:
+# there the timer kills this process and everything descended from it instead.
+sid=$(ps -o sid= -p $$ 2>/dev/null | tr -d ' ')
+case $sid in ''|*[!0-9]*) sid=;; esac
+f=
+if [ -n "$sid" ]; then
+  # Made HERE, not in the timer: a full or read-only /tmp refuses the session instead of
+  # leaving it without a cut-off (whole-build review F3).
+  f=$(mktemp 2>/dev/null) || { echo "wundervault: the admin session check could not start; refused." >&2; exit 126; }
+fi
 # The timer is its own small process. It stops early once nothing else is left in this
-# session, so a finished command leaves nothing behind; at the end time it kills the rest.
+# session, so a finished command leaves nothing behind; at the end time (or on end-now) it
+# kills the rest.
 # shellcheck disable=SC2016
 sh -c '
-  end=$1; sid=$2; f=$(mktemp) || exit 1
-  trap "rm -f \"$f\"" EXIT
+  end=$1; sid=$2; root=$3; f=$4
+  [ -n "$f" ] && trap "rm -f \"$f\"" EXIT
+  kill_all() {
+    if [ -n "$sid" ]; then pkill -KILL -s "$sid"; return; fi
+    set -- "$root"; all=$(ps -A -o pid= -o ppid=); grew=1
+    while [ "$grew" = 1 ]; do
+      grew=0
+      for p in $(printf "%s\n" "$all" | awk -v s=" $* " "index(s, \" \" \$2 \" \") && !index(s, \" \" \$1 \" \") {print \$1}"); do
+        set -- "$@" "$p"; grew=1
+      done
+    done
+    for p in "$@"; do [ "$p" = "$$" ] || kill -KILL "$p" 2>/dev/null; done
+  }
+  trap "kill_all; exit 0" USR1
   while [ "$(date +%s)" -lt "$end" ]; do
-    pgrep -s "$sid" > "$f" 2>/dev/null || true
-    grep -qvx "$$" "$f" || exit 0
+    if [ -n "$sid" ]; then
+      # A failed write (a full disk) is not "empty": keep watching and cut off at the end.
+      if pgrep -s "$sid" > "$f" 2>/dev/null && [ -s "$f" ]; then grep -qvx "$$" "$f" || exit 0; fi
+    else
+      kill -0 "$root" 2>/dev/null || exit 0
+    fi
     sleep 1
   done
-  pkill -KILL -s "$sid"
-' wv-cutoff "$end" "$sid" </dev/null >/dev/null 2>&1 &
+  kill_all
+' "wv-cutoff-$tag " "$end" "$sid" "$$" "$f" </dev/null >/dev/null 2>&1 &
 if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
   exec "${SHELL:-/bin/sh}" -c "$SSH_ORIGINAL_COMMAND"
 fi
@@ -118,12 +161,14 @@ snapshot() {
       printf 'key\t%s\t%s\t%s\n' "$name" "$(printf '%s' "$line" | fp)" "$comment"
     done
   done
-  getent passwd | awk -F: '$3 >= 1000 || $3 == 0 { print "account\t" $1 "\t" $7 }'
+  # uid and primary group too (whole-build review F4): an account moved to uid 0, or to a
+  # privileged primary group, keeps its name and shell. Any account at uid 0 is listed.
+  getent passwd | awk -F: '$3 >= 1000 || $3 == 0 { print "account\t" $1 "\t" $3 ":" $4 "\t" $7 }'
   for g in sudo wheel docker adm root; do
     members=$(getent group "$g" | cut -d: -f4)
     [ -n "$members" ] && printf '%s\n' "$members" | tr ',' '\n' | sed "s/^/group\t$g\t/"
   done
-  for f in /etc/sudoers /etc/sudoers.d/* /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* /etc/crontab /etc/cron.d/* \
+  for f in /etc/passwd /etc/group /etc/sudoers /etc/sudoers.d/* /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* /etc/crontab /etc/cron.d/* \
            /var/spool/cron/crontabs/* /var/spool/cron/*; do
     [ -f "$f" ] && printf 'file\t%s\t%s\n' "$f" "$(fp_file "$f")"
   done

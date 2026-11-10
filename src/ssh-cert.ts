@@ -40,6 +40,11 @@ export interface AdminCertOptions {
   /** Not before, Unix seconds. Defaults to one minute ago (clock skew between computer and server). */
   start?: number;
   keyId?: string;
+  /** Names the helper's signing session, so the server can end exactly its sessions early
+   *  (`wv-admin-session end-now <tag>`, whole-build review F1). Lowercase hex, ≤32. */
+  tag?: string;
+  /** Instead of a session: a certificate whose only command ends the sessions of `tag` now. */
+  endNow?: boolean;
 }
 
 /**
@@ -52,7 +57,12 @@ export function adminCertificate(identity: LoadedIdentity, o: AdminCertOptions):
   if (start >= o.end) throw new Error('admin certificate would never be valid');
   const pub = rawPublic(identity.keyBlob);
   // Critical options and extensions are each sorted by name, values wrapped in a string.
-  const critical = Buffer.concat([str('force-command'), str(str(`${ADMIN_SESSION_CHECK} ${o.end}`))]);
+  if (o.tag !== undefined && !/^[0-9a-f]{1,32}$/.test(o.tag)) throw new Error('admin certificate tag must be short lowercase hex');
+  if (o.endNow && o.tag === undefined) throw new Error('an end-now certificate needs the tag it ends');
+  const command = o.endNow
+    ? `${ADMIN_SESSION_CHECK} end-now ${o.tag}`
+    : `${ADMIN_SESSION_CHECK} ${o.end}${o.tag !== undefined ? ` ${o.tag}` : ''}`;
+  const critical = Buffer.concat([str('force-command'), str(str(command))]);
   const extensions = Buffer.concat([str('permit-pty'), str('')]);
   const body = Buffer.concat([
     str(CERT_TYPE),

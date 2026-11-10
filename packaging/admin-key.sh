@@ -13,9 +13,11 @@ Usage: sudo sh admin-key.sh --public 'ssh-ed25519 AAAA...' [--from ADDR[,ADDR...
        sudo sh admin-key.sh --help
 
 Add an admin key so your broker can run admin commands without your password.
-Make the key in your vault first (this computer's card > Add this computer's admin key):
-the vault keeps the private half and shows this command with the public half filled in.
-Nothing secret is printed here. By default, the key works only from this computer.
+Make the key in your vault first (Add a key > "Let agents do admin (sudo) work on a
+computer?" > Make this computer's admin key): the vault keeps the private half and shows
+this command with the public half filled in. Nothing secret is printed here. By default,
+the key works only from this computer, and only while you allow admin access: sign-ins
+use a short-lived certificate from the helper app, and the session ends when it does.
 
   --public KEY          The public key the vault showed (one ssh-ed25519 key).
   --from ADDR[,ADDR...]  Allow connections from these addresses instead.
@@ -103,6 +105,9 @@ case "$ssh_dir" in
 esac
 
 keys_file=$ssh_dir/authorized_keys
+# The server half of the admin-access cut-off (same file guided setup installs on servers).
+session_src=$(cd "$(dirname "$0")" && pwd)/server/wv-admin-session
+lib_dir=${WV_ADMIN_LIB_DIR:-/usr/local/lib/wundervault}
 
 remaining=$from
 while :; do
@@ -123,9 +128,13 @@ done
 
 key_tmp=
 write_tmp=
+session_tmp=
 lock_dir=
 
 cleanup() {
+    if [ -n "$session_tmp" ]; then
+        rm -f -- "$session_tmp"
+    fi
     if [ -n "$write_tmp" ]; then
         rm -f -- "$write_tmp"
     fi
@@ -331,6 +340,25 @@ key_body=${key_rest%% *}
 printf '%s' "$key_body" | grep -Eq '^[A-Za-z0-9+/]{68}$' && [ "$key_type" = ssh-ed25519 ] \
     || fail "Give the public key the vault showed: sudo sh admin-key.sh --public 'ssh-ed25519 AAAA...'. No admin key was added."
 
+# Admin access ends on this computer too (whole-build review F2): the key is trusted only as a
+# certificate authority, and the certificate's forced command ends the session at its end.
+[ -f "$session_src" ] || fail "The admin session check ($session_src) is missing; reinstall the helper app. No admin key was added."
+sh -n "$session_src" || fail "The admin session check is damaged; reinstall the helper app. No admin key was added."
+# A test that redirects the keys folder must redirect this too, or it would write the live one.
+if [ "$overridden" = 1 ] && [ -z "${WV_ADMIN_LIB_DIR:-}" ]; then
+    fail "Choose a separate folder for the test session check (WV_ADMIN_LIB_DIR)."
+fi
+mkdir -p "$lib_dir"
+session_tmp=$(mktemp "$lib_dir/.wv-admin-session.XXXXXX")
+cat "$session_src" > "$session_tmp"
+chmod 755 "$session_tmp"
+if [ "$overridden" = 0 ]; then
+    chown "root:$root_group" "$session_tmp" "$lib_dir"
+    chmod 755 "$lib_dir"
+fi
+mv -f "$session_tmp" "$lib_dir/wv-admin-session"
+session_tmp=
+
 prepare_directory
 write_tmp=$(mktemp "$ssh_dir/.wundervault-admin.XXXXXX")
 {
@@ -340,7 +368,7 @@ write_tmp=$(mktemp "$ssh_dir/.wundervault-admin.XXXXXX")
             printf '\n'
         fi
     fi
-    printf 'from="%s",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 %s %s\n' \
+    printf 'cert-authority,principals="wv-admin",from="%s",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 %s %s\n' \
         "$from" "$key_body" "wundervault-admin $(hostname | tr -cd 'A-Za-z0-9._-') $(date +%Y-%m-%d)"
 } > "$write_tmp"
 finish_write

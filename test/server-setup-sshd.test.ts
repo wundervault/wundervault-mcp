@@ -73,9 +73,10 @@ runIt('guided setup against a real sshd', () => {
     new SigningState(path.join(base, 'ledger.json')), {}, { pinsPath: path.join(base, 'pins.json') });
   (ops as unknown as { api: unknown }).api = {
     getSecret: async (id: string) => entries[id],
-    adminAccessStatus: async () => ({ admin: true, open: true, until: null }),
+    adminAccessStatus: async () => ({ admin: true, open: adminOpen, until: null }),
     ensureVaultKey: async () => VAULT_KEY,
   };
+  let adminOpen = true;
   const records = new SetupRecords(path.join(base, 'state', 'server-setups.json'));
   const now = Date.now();
   const v = validateServerOrder({ v: 1, type: 'setup', broker: 'fp', order_id: 'order-real-0001', issued_at: new Date(now).toISOString(),
@@ -154,4 +155,39 @@ runIt('guided setup against a real sshd', () => {
     }
     expect(plainSsh('opc', 'emerg')).toBe(true);
   }, 120_000);
+
+  it('End now ends the agent\'s OWN ssh session on the server within seconds (whole-build F1)', async () => {
+    adminOpen = true;
+    const o = await ops.sshAgentOpen({ entryId: 'entry-admin-1', purpose: 'agent work',
+      op: { kind: 'ssh', destination: `opc@127.0.0.1:${PORT}`, remoteArgv: ['true'] } as never });
+    if ('error' in o) throw new Error(o.error);
+    // Two of the agent's own connections on the signing socket, and one other session (another
+    // agent) whose tag differs: only this session's are ended.
+    const own = (cmd: string, sock: string, pubp: string, kh: string) => new Promise<{ out: string; at: number }>((res) => {
+      const c = spawn('ssh', ['-F', '/dev/null', '-o', `IdentityFile=${pubp}`, '-o', 'IdentitiesOnly=yes', '-o', `IdentityAgent=${sock}`,
+        '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', `UserKnownHostsFile=${kh}`, '-p', String(PORT), 'opc@127.0.0.1', cmd],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+      let b = ''; c.stdout.on('data', (d) => { b += d; }); c.stderr.on('data', (d) => { b += d; });
+      const t = setTimeout(() => c.kill('SIGKILL'), 60_000);
+      c.on('close', () => { clearTimeout(t); res({ out: b, at: Date.now() }); });
+    });
+    const other = await ops.sshAgentOpen({ entryId: 'entry-admin-1', purpose: 'other agent',
+      op: { kind: 'ssh', destination: `opc@127.0.0.1:${PORT}`, remoteArgv: ['true'] } as never });
+    if ('error' in other) throw new Error(other.error);
+    const a = own('echo in-$(id -un); sleep 120', o.socket_path, o.public_key_path, o.known_hosts_path!);
+    const b = own('echo in2; sleep 120', o.socket_path, o.public_key_path, o.known_hosts_path!);
+    const keep = own('echo kept; sleep 25; echo still-here', other.socket_path, other.public_key_path, other.known_hosts_path!);
+    await new Promise((r) => setTimeout(r, 4_000));
+    // End now for THIS session only (the poll answers closed for it).
+    const flip = Date.now();
+    ops.closeSsh(o.session_id, 'admin_access_ended');
+    const [ra, rb] = await Promise.all([a, b]);
+    expect(ra.out).toContain('in-opc');
+    expect(rb.out).toContain('in2');
+    expect(ra.at - flip).toBeLessThan(8_000);
+    expect(rb.at - flip).toBeLessThan(8_000);
+    const rk = await keep;
+    expect(rk.out).toContain('still-here');           // the other session was not touched
+    ops.closeSsh(other.session_id);
+  }, 90_000);
 });
