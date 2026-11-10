@@ -90,6 +90,13 @@ crosses the socket is the result, not the secret.
 
 All your config has to say is which agent this is.
 
+## Admin keys
+
+- Use `vault_entries_list` to identify admin keys, which can change the server; it marks them.
+- Use the everyday key by default to look at code, check health and read logs.
+- Ask for admin access only when you need to make changes.
+- Call `vault_done` when finished.
+
 ## What the server checks
 
 Every request a broker makes to Wundervault is signed with a private key that lives in the

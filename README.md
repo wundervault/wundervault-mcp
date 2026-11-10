@@ -199,6 +199,43 @@ If something on Windows or macOS fails, tell us what it printed:
 - **HTTPS only**, with real certificate checks; redirects are not followed; private network
   addresses are refused unless you allowed one for that secret.
 
+### Admin access and everyday access for servers
+
+For Linux servers, start guided setup from the admin key's page. It makes a separate everyday
+account, named `wv-agent` by default, that can look but not change. It cannot use `sudo` to run
+commands as administrator or open the admin account's home folder. You can also let it read
+system logs. Setup includes a health check and a change check.
+
+Keys are made in your browser and saved straight into the vault. Only their public halves go
+to the server. The helper app runs a fixed setup script over SSH and shows each step as pass
+or fail. Nothing that works is removed until a test sign-in proves the new way works. Running
+setup again is safe.
+
+After each admin access ends, the helper app uses the everyday key to check the server for
+new sign-in keys, accounts, admin-group members, sudo rules (who may run commands as
+administrator), SSH sign-in settings, scheduled jobs and system services. If something
+changed, you get an email saying "something changed on one of your servers", with no details.
+The key's page shows what changed. Use **Remove** for a new sign-in key, or **These are fine**
+to accept the changes. The server's administrator, root, can change the checker too. It catches
+mistakes and careless agents, not a determined one.
+
+Setup also makes an **emergency key**. It is never given to an agent: no copy, no share and no
+admin access. Open it with your passkey. Keep a copy off the site and test it once. You need
+it because admin access cannot be turned on if the server is down.
+
+For this computer's own admin key, which lets you run commands as administrator, make it in
+the vault. The vault shows one command to paste:
+
+```bash
+sudo sh admin-key.sh --public 'ssh-ed25519 AAAA…'
+```
+
+No private key is ever printed in the terminal.
+
+While admin access is on, the agent can read every secret on that server. Short admin access
+reduces that time; it does not remove that risk. An agent with its own key file to the server
+can get round all of this.
+
 ### Honest limitations
 
 - A "run without asking" secret goes where your agent sends it. A tricked agent could send it to
@@ -250,6 +287,18 @@ rsync_args?: string[]       instead of a command; every host:path is checked too
 timeout_seconds?: number    default 120
 working_dir?: string        local folder for rsync sources
 ```
+
+An SSH key can be marked an **admin key**: a key that can change the server, such as running
+commands as administrator, deploying code or managing containers. It always asks the owner
+first. An agent can use it only while the owner allows admin access for that agent, for
+5 minutes, 15 minutes or 1 hour, approved with the owner's passkey. The agent's request returns
+`ADMIN_ACCESS_REQUIRED` with a request id; the agent polls for approval. The owner can also
+start from **Allow admin access…** on the key's page, and can require typing the key's name
+before approving. Admin access ends when time runs out, the owner presses **End now**, or the
+agent calls `vault_done` if its setting says to end admin access then. Agents should call
+`vault_done` when finished. The SSH connections close when admin access ends. On a server set
+up for it, the server closes them too: admin sign-ins use a short-lived certificate that
+allows sign-in only until admin access ends.
 
 ### `vault_git`
 
