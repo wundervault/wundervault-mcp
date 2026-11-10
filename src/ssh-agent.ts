@@ -73,6 +73,12 @@ export interface LoadedIdentity {
   comment: string;
   /** OpenSSH-style `SHA256:base64(sha256(keyBlob))`, unpadded. */
   fingerprint: string;
+  /**
+   * Admin access (site SPEC-admin-access D13): a short-lived certificate for this same key
+   * (ssh-cert.ts). Offered first, signed with the same private key; the server it was made for
+   * trusts the key only as a certificate authority.
+   */
+  certBlob?: Buffer;
 }
 
 // ── SSH wire primitives ────────────────────────────────────────────────────────
@@ -364,8 +370,12 @@ function isBoundUserauth(
     if (r.str().toString('utf8') !== 'ssh-connection') return false;
     const method = r.str().toString('utf8');
     if (method !== 'publickey' && method !== 'publickey-hostbound-v00@openssh.com') return false;
-    if (r.byte() !== 1 || r.str().toString('utf8') !== ED25519_KEY_TYPE) return false;
-    if (!r.str().equals(identity.keyBlob)) return false;
+    if (r.byte() !== 1) return false;
+    const alg = r.str().toString('utf8');
+    const blob = r.str();
+    const plain = alg === ED25519_KEY_TYPE && blob.equals(identity.keyBlob);
+    const cert = !!identity.certBlob && alg === 'ssh-ed25519-cert-v01@openssh.com' && blob.equals(identity.certBlob);
+    if (!plain && !cert) return false;
     if (method === 'publickey-hostbound-v00@openssh.com' && !r.str().equals(bind.hostKeyBlob)) return false;
     return r.remaining === 0;
   } catch {
@@ -388,9 +398,11 @@ export function handleAgentMessage(
   const type = msg[0];
 
   if (type === SSH_AGENTC_REQUEST_IDENTITIES) {
+    // The certificate first, when there is one: a server set up for admin access accepts only it.
     return Buffer.concat([
       Buffer.from([SSH_AGENT_IDENTITIES_ANSWER]),
-      u32(1),
+      u32(identity.certBlob ? 2 : 1),
+      ...(identity.certBlob ? [sshString(identity.certBlob), sshString(identity.comment)] : []),
       sshString(identity.keyBlob),
       sshString(identity.comment),
     ]);
@@ -427,7 +439,7 @@ export function handleAgentMessage(
 
       // A sign request naming a key this agent does not hold is refused rather than
       // signed with whatever it does hold.
-      if (!wantBlob.equals(identity.keyBlob)) {
+      if (!wantBlob.equals(identity.keyBlob) && !(identity.certBlob && wantBlob.equals(identity.certBlob))) {
         // Someone asking this agent to sign with a key it does not hold is worth a
         // record, not just a silent refusal.
         onOutcome?.('refused_unknown_key');
@@ -557,6 +569,13 @@ export function startAgent(
   // 0644 asked for under umask 0077 arrives as 0600 — which fails silently as "ssh did
   // not offer the key" rather than as a permission error.
   try { chmodSync(publicKeyPath, publicKeyMode); } catch { /* best effort */ }
+  // ssh loads "<IdentityFile>-cert.pub" by itself, so the admin certificate needs no new option.
+  if (identity.certBlob) {
+    const certPath = publicKeyPath + '-cert.pub';
+    writeFileSync(certPath, `ssh-ed25519-cert-v01@openssh.com ${identity.certBlob.toString('base64')} wundervault-admin-access\n`,
+      { mode: publicKeyMode });
+    try { chmodSync(certPath, publicKeyMode); } catch { /* best effort */ }
+  }
 
   let signs = 0;
   const sockets = new Set<Socket>();

@@ -1,0 +1,31 @@
+#!/bin/sh
+# Wundervault admin access: the server's half of the cut-off (SPEC-admin-access D13).
+#
+# Admin sign-ins use a short-lived SSH certificate signed by the helper app. The certificate
+# carries "force-command=/usr/local/lib/wundervault/wv-admin-session <end>", where <end> is when
+# the owner's admin access ends (Unix seconds). The signature covers it, so the agent cannot
+# change it. sshd itself refuses the certificate after its valid-before; this script ends the
+# session that is already open at the same moment, including one the agent opened with its own
+# ssh client and multiplexed sessions started later on that connection.
+#
+# Fails closed: if this file is missing or broken, the forced command fails and the admin
+# session does not start. The everyday account and the emergency key do not pass through here.
+set -u
+end=${1:-}
+case $end in ''|*[!0-9]*) echo "wundervault: admin access has no valid end time; refused." >&2; exit 126;; esac
+now=$(date +%s)
+left=$((end - now))
+if [ "$left" -le 0 ]; then
+  echo "wundervault: admin access has ended; ask your owner to allow it again." >&2
+  exit 126
+fi
+# sshd made this process the leader of a new session (setsid) for this channel. At the end
+# time, kill every process still in that session: the command, an interactive shell and
+# whatever they started without detaching. Detached daemons are outside it (spec §6 limits;
+# the change check reports new services and scheduled jobs).
+sid=$(ps -o sid= -p $$ | tr -d ' ')
+( sleep "$left"; pkill -KILL -s "$sid" ) </dev/null >/dev/null 2>&1 &
+if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+  exec "${SHELL:-/bin/sh}" -c "$SSH_ORIGINAL_COMMAND"
+fi
+exec "${SHELL:-/bin/sh}" -l

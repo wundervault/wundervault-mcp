@@ -43,6 +43,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { AgentVaultAPI, approvalNotGivenMessage, ADMIN_ACCESS_REQUIRED, adminAccessRequiredMessage } from './api-client.js';
+import { adminCertificate } from './ssh-cert.js';
 import { signerFromIdentity, type BrokerSigner } from './broker-sign.js';
 import { decryptSecretContent, loadEncryptionKey } from './crypto.js';
 import {
@@ -1162,6 +1163,11 @@ export class BrokerOps {
     let identity;
     try {
       identity = loadOpenSshEd25519(new TextDecoder().decode(bytes));
+      if (adminUntilMs !== undefined) {
+        // D13: a certificate for this key, valid until admin access ends, whose forced
+        // command makes the server end the session then too.
+        identity.certBlob = adminCertificate(identity, { end: Math.floor(adminUntilMs / 1000) });
+      }
     } catch (e) {
       return err(`That entry is not an unencrypted OpenSSH ed25519 private key: ${(e as Error).message}`);
     } finally {
