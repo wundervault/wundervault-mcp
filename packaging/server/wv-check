@@ -1,0 +1,80 @@
+#!/bin/sh
+# Wundervault change check (site SPEC-admin-access D14). Root-owned, installed by setup.
+#
+#   wv-check baseline   record the server as it is now (root only; setup and finalize run it)
+#   wv-check report     what is NEW or GONE since the baseline (the everyday account may run
+#                       this through sudo, and nothing else; it never prints a key or a secret,
+#                       only short fingerprints, names and comments)
+#   wv-check health     up time, load, disk and memory (everyday account, through sudo)
+#
+# Honest limit: whoever has root can change this program and its baseline too. It catches
+# mistakes and careless agents, not a determined one.
+set -eu
+umask 077
+STATE=/var/lib/wundervault
+LIB=/usr/local/lib/wundervault
+
+fp() { sha256sum | cut -c1-16; }
+fp_file() { [ -f "$1" ] && sha256sum "$1" | cut -c1-16 || echo none; }
+
+snapshot() {
+  # Every account that can hold SSH keys: a fingerprint and comment per authorized key line.
+  getent passwd | while IFS=: read -r name _ uid _ _ home _; do
+    f="$home/.ssh/authorized_keys"
+    [ -f "$f" ] || continue
+    grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null | while IFS= read -r line; do
+      comment=$(printf '%s' "$line" | awk '{print $NF}' | tr -cd 'A-Za-z0-9@._:-' | cut -c1-60)
+      printf 'key\t%s\t%s\t%s\n' "$name" "$(printf '%s' "$line" | fp)" "$comment"
+    done
+  done
+  getent passwd | awk -F: '$3 >= 1000 || $3 == 0 { print "account\t" $1 "\t" $7 }'
+  for g in sudo wheel docker adm root; do
+    members=$(getent group "$g" | cut -d: -f4)
+    [ -n "$members" ] && printf '%s\n' "$members" | tr ',' '\n' | sed "s/^/group\t$g\t/"
+  done
+  for f in /etc/sudoers /etc/sudoers.d/* /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* /etc/crontab /etc/cron.d/* \
+           /var/spool/cron/crontabs/* /var/spool/cron/*; do
+    [ -f "$f" ] && printf 'file\t%s\t%s\n' "$f" "$(fp_file "$f")"
+  done
+  for d in /etc/systemd/system; do
+    [ -d "$d" ] && find "$d" -maxdepth 2 \( -name '*.service' -o -name '*.timer' \) -type f 2>/dev/null |
+      while read -r f; do printf 'unit\t%s\t%s\n' "$f" "$(fp_file "$f")"; done
+  done
+  for f in "$LIB/wv-admin-session" "$LIB/wv-check"; do printf 'program\t%s\t%s\n' "$f" "$(fp_file "$f")"; done
+  admin=$(cat "$STATE/admin_user" 2>/dev/null || true)
+  if [ -n "$admin" ]; then
+    # Programs the admin account left running on their own (parent is init: a daemon or an
+    # orphan). Names only; a new one shows as NEW after admin access.
+    # On systemd servers orphans are adopted by the user's own "systemd --user", not PID 1.
+    ps -e -o pid=,comm= 2>/dev/null > "$STATE/.ps.$$" || true
+    ps -u "$admin" -o ppid=,comm= 2>/dev/null | awk -v psf="$STATE/.ps.$$" '
+      BEGIN { while ((getline l < psf) > 0) { split(l, a, " "); name[a[1]] = a[2] } }
+      $1 == 1 || name[$1] == "systemd" { print $2 }' | sort -u | sed "s/^/process\t$admin\t/"
+    rm -f "$STATE/.ps.$$"
+  fi
+}
+
+case ${1:-} in
+baseline)
+  [ "$(id -u)" = 0 ] || { echo "baseline needs root" >&2; exit 2; }
+  install -d -o root -g root -m 700 "$STATE"
+  snapshot | sort -u > "$STATE/baseline.new"
+  mv -f "$STATE/baseline.new" "$STATE/baseline"
+  echo "baseline recorded ($(wc -l < "$STATE/baseline") items)"
+  ;;
+report)
+  [ -f "$STATE/baseline" ] || { echo "NO-BASELINE run setup again"; exit 0; }
+  now=$(mktemp); trap 'rm -f "$now"' EXIT
+  snapshot | sort -u > "$now"
+  comm -13 "$STATE/baseline" "$now" | sed 's/^/NEW\t/'
+  comm -23 "$STATE/baseline" "$now" | grep -v '^process' | sed 's/^/GONE\t/' || true
+  echo "END"
+  ;;
+health)
+  printf 'uptime\t%s\n' "$(cut -d' ' -f1 /proc/uptime)"
+  printf 'load\t%s\n' "$(cut -d' ' -f1-3 /proc/loadavg)"
+  df -P / | awk 'NR == 2 { print "disk\t" $5 }'
+  awk '/MemTotal/ { t = $2 } /MemAvailable/ { a = $2 } END { printf "memory\t%d%%\n", (t - a) * 100 / t }' /proc/meminfo
+  ;;
+*) echo "usage: wv-check baseline | report | health" >&2; exit 2;;
+esac

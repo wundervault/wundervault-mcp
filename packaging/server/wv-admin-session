@@ -24,7 +24,19 @@ fi
 # whatever they started without detaching. Detached daemons are outside it (spec §6 limits;
 # the change check reports new services and scheduled jobs).
 sid=$(ps -o sid= -p $$ | tr -d ' ')
-( sleep "$left"; pkill -KILL -s "$sid" ) </dev/null >/dev/null 2>&1 &
+# The timer is its own small process. It stops early once nothing else is left in this
+# session, so a finished command leaves nothing behind; at the end time it kills the rest.
+# shellcheck disable=SC2016
+sh -c '
+  end=$1; sid=$2; f=$(mktemp) || exit 1
+  trap "rm -f \"$f\"" EXIT
+  while [ "$(date +%s)" -lt "$end" ]; do
+    pgrep -s "$sid" > "$f" 2>/dev/null || true
+    grep -qvx "$$" "$f" || exit 0
+    sleep 1
+  done
+  pkill -KILL -s "$sid"
+' wv-cutoff "$end" "$sid" </dev/null >/dev/null 2>&1 &
 if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
   exec "${SHELL:-/bin/sh}" -c "$SSH_ORIGINAL_COMMAND"
 fi
