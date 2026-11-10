@@ -16,6 +16,13 @@
 #       reported. The baseline is recorded again.
 #   status ADMIN_USER EVERYDAY_USER
 #       Read-only self-test lines (PASS/FAIL ...).
+#   remove-key USER FINGERPRINT
+#       D14 "Remove": take out exactly the authorized_keys line of USER whose change-check
+#       fingerprint (first 16 hex of its sha256) is FINGERPRINT. Never the certificate-authority
+#       line or the emergency key (that would lock the owner out). The baseline is NOT recorded
+#       again, so any other change still shows on the next check.
+#   accept
+#       D14 "Accept as normal": record the baseline again.
 set -eu
 umask 077
 LIB=/usr/local/lib/wundervault
@@ -126,5 +133,31 @@ status)
   grep -q 'cert-authority,principals="wv-admin"' "$ak" && ok "admin key trusted as certificate authority only" || echo "FAIL no certificate trust"
   grep -q wundervault-emergency "$ak" && ok "emergency key installed" || echo "FAIL emergency key missing"
   ;;
-*) die "unknown step (prepare | finalize | status)";;
+remove-key)
+  user=${1:-}; want=${2:-}
+  user_ok "$user" || die "account name"
+  printf '%s' "$want" | grep -Eq '^[0-9a-f]{16}$' || die "fingerprint"
+  getent passwd "$user" >/dev/null || die "no such account"
+  file=$(ak_file "$user"); [ -f "$file" ] || die "no authorized_keys for that account"
+  tmp=$(mktemp "$(dirname "$file")/.wv-ak.XXXXXX")
+  found=0; kept=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$(printf '%s' "$line" | sha256sum | cut -c1-16)" = "$want" ]; then
+      case $line in
+        *wundervault-admin-ca*|*wundervault-emergency*) rm -f "$tmp"; die "that is the admin certificate or emergency key line; refusing";;
+      esac
+      found=$((found + 1)); continue
+    fi
+    printf '%s\n' "$line" >> "$tmp"; kept=$((kept + 1))
+  done < "$file"
+  [ "$found" -gt 0 ] || { rm -f "$tmp"; die "no key with that fingerprint (already removed?)"; }
+  chown "$user":"$(id -gn "$user")" "$tmp"; chmod 600 "$tmp"; mv -f "$tmp" "$file"
+  ok "removed $found key line(s) from $user"
+  ;;
+accept)
+  [ -x "$LIB/wv-check" ] || die "change check not installed; run setup first"
+  "$LIB/wv-check" baseline >/dev/null
+  ok "the server as it is now is the new normal"
+  ;;
+*) die "unknown step (prepare | finalize | status | remove-key | accept)";;
 esac

@@ -2,13 +2,14 @@ import { createDecipheriv, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { open, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { SERVER_ORDER_TYPES, validateServerOrder, type ServerOrder } from './server-setup.js';
 
 export type OrderState = 'received' | 'refused' | 'working' | 'installed' |
   'rolled back' | 'rollback failed' | 'failed';
 
 export interface OrderClient {
   getOrders(brokerVersion: string): Promise<{
-    orders: { id: string; agent_id: string; ciphertext: string; nonce: string }[];
+    orders: { id: string; agent_id: string; ciphertext: string; nonce: string; kind?: string }[];
   }>;
   postState(id: string, state: OrderState, detail: string): Promise<void>;
 }
@@ -23,6 +24,13 @@ export interface BrokerUpdateDeps {
   statusPath: string;
   now(): number;
   log(msg: string): void;
+  /**
+   * Guided setup (SPEC-admin-access §13): run an opened setup-family order. Called once per
+   * order, not awaited by the poll; it posts its own states. Absent = such orders are refused.
+   */
+  serverOrder?(agentId: string, order: ServerOrder): void;
+  /** After each poll (D14 change checks). Errors are its own business. */
+  afterPoll?(): Promise<void>;
 }
 
 type OpenResult =
@@ -67,14 +75,10 @@ function isoTime(value: unknown): number {
   return Date.parse(value);
 }
 
-export function openOrder(
-  ciphertextB64: string,
-  nonceB64: string,
-  key: Uint8Array,
-  fingerprint: string,
-  nowMs: number,
-  ownVersion: string,
-): OpenResult {
+/** Decrypt and parse a sealed order of any type; the type's own check comes after. */
+function openSealed(
+  ciphertextB64: string, nonceB64: string, key: Uint8Array, fingerprint: string,
+): { ok: true; value: Record<string, unknown> } | { ok: false; reason: string } {
   let plaintext: string;
   try {
     const sealed = decodeBase64(ciphertextB64);
@@ -92,9 +96,37 @@ export function openOrder(
   } catch {
     return { ok: false, reason: 'bad seal' };
   }
-
   try {
-    const order = JSON.parse(plaintext) as Record<string, unknown>;
+    const value = JSON.parse(plaintext) as unknown;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return { ok: false, reason: 'malformed' };
+    return { ok: true, value: value as Record<string, unknown> };
+  } catch {
+    return { ok: false, reason: 'malformed' };
+  }
+}
+
+/** A setup-family order: sealed type must be the kind the server filed it under. */
+export function openServerOrder(
+  ciphertextB64: string, nonceB64: string, key: Uint8Array, fingerprint: string, nowMs: number, kind: string,
+): { ok: true; order: ServerOrder } | { ok: false; reason: string } {
+  const sealed = openSealed(ciphertextB64, nonceB64, key, fingerprint);
+  if (!sealed.ok) return sealed;
+  if (sealed.value.type !== kind) return { ok: false, reason: 'kind mismatch' };
+  return validateServerOrder(sealed.value, fingerprint, nowMs);
+}
+
+export function openOrder(
+  ciphertextB64: string,
+  nonceB64: string,
+  key: Uint8Array,
+  fingerprint: string,
+  nowMs: number,
+  ownVersion: string,
+): OpenResult {
+  const sealed = openSealed(ciphertextB64, nonceB64, key, fingerprint);
+  if (!sealed.ok) return sealed;
+  try {
+    const order = sealed.value;
     const keys = ['v', 'type', 'broker', 'version', 'order_id', 'issued_at', 'expires_at'];
     if (!order || typeof order !== 'object' || Array.isArray(order) ||
         Object.keys(order).length !== keys.length ||
@@ -253,6 +285,15 @@ export async function pollOnce(d: BrokerUpdateDeps): Promise<void> {
       const response = await d.client.getOrders(d.version);
       for (const envelope of response.orders) {
         if (state.seen!.includes(envelope.id)) continue;
+        const kind = envelope.kind ?? 'update';
+        if (kind !== 'update') {
+          try {
+            await serverEnvelope(d, state, envelope, kind);
+          } catch {
+            log(d, 'Server order processing failed');
+          }
+          continue;
+        }
         try {
           const key = await d.vaultKeyFor(envelope.agent_id);
           const opened = key
@@ -298,11 +339,35 @@ export async function pollOnce(d: BrokerUpdateDeps): Promise<void> {
       log(d, 'Update order poll failed');
     }
     await relay(d, state);
+    if (d.afterPoll) {
+      try { await d.afterPoll(); } catch { log(d, 'Change check round failed'); }
+    }
   } catch {
     log(d, 'Update polling failed');
   } finally {
     state.running = false;
   }
+}
+
+async function serverEnvelope(
+  d: BrokerUpdateDeps, state: PollState,
+  envelope: { id: string; agent_id: string; ciphertext: string; nonce: string }, kind: string,
+): Promise<void> {
+  const refuse = async (reason: string) => {
+    if (await post(d, envelope.id, 'refused', reason)) await remember(d, state, [envelope.id]);
+  };
+  if (!d.serverOrder || !(SERVER_ORDER_TYPES as readonly string[]).includes(kind)) return refuse('not supported');
+  const key = await d.vaultKeyFor(envelope.agent_id);
+  const opened = key
+    ? openServerOrder(envelope.ciphertext, envelope.nonce, key, d.fingerprint, d.now(), kind)
+    : { ok: false as const, reason: 'no key' };
+  if (!opened.ok) return refuse(opened.reason);
+  if (opened.order.order_id !== envelope.id) return refuse('id mismatch');
+  if (state.seen!.includes(opened.order.order_id)) return refuse('replay');
+  // Remembered BEFORE it runs: a crash mid-setup must not run it a second time on restart.
+  await remember(d, state, [envelope.id]);
+  await post(d, envelope.id, 'received', '');
+  d.serverOrder(envelope.agent_id, opened.order);
 }
 
 /** Where the root updater's spool lives (SPEC-update-now U1). Fixed: never read from the environment. */

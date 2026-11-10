@@ -48,7 +48,7 @@ import { signerFromIdentity, type BrokerSigner } from './broker-sign.js';
 import { decryptSecretContent, loadEncryptionKey } from './crypto.js';
 import {
   modeAllowsSshBroker, modeAllowsHttpBroker, wrongModeMessage,
-  loadOpenSshEd25519, startAgent, checkSshDestination, type AgentHandle, type BrokeredOp,
+  loadOpenSshEd25519, startAgent, checkSshDestination, runSshWithAgent, type AgentHandle, type BrokeredOp,
 } from './ssh-agent.js';
 import {
   normalizeSshTarget, scanHostKey, isSshHostKey, sshHostRecipe, sshHostSha,
@@ -136,6 +136,24 @@ export class BrokerOps {
   private readonly keyscan: (t: NonNullable<ReturnType<typeof normalizeSshTarget>>) => Promise<string | null>;
   private ssh = new Map<string, { handle: AgentHandle; timer: NodeJS.Timeout; entryId: string; key?: string; host: string; reason: string; tier: string; adminPoll?: NodeJS.Timeout; adminUntil?: string; endedBy?: string }>();
 
+  /**
+   * A server's identity, scanned at most once per two minutes per address. Each scan is a
+   * connection that never signs in, and OpenSSH 9.8+ (PerSourcePenalties) blocks an address
+   * that makes many: guided setup's seven sessions in a row were dropped by the server. Safe
+   * to reuse: the connection itself is still checked against the pinned identity
+   * (StrictHostKeyChecking=yes), so a stale answer can only fail, never let another server in.
+   */
+  private scanCache = new Map<string, { at: number; key: string }>();
+  private async scanCached(target: NonNullable<ReturnType<typeof normalizeSshTarget>>): Promise<string | null> {
+    const id = `${target.host}:${target.port}`;
+    const hit = this.scanCache.get(id);
+    if (hit && Date.now() - hit.at < 120_000) return hit.key;
+    const key = await this.keyscan(target);
+    if (key) this.scanCache.set(id, { at: Date.now(), key });
+    else this.scanCache.delete(id);
+    return key;
+  }
+
   /** How often an admin session asks whether its admin access is still on (End now, done). */
   static ADMIN_POLL_MS = 3_000;
   /**
@@ -154,11 +172,20 @@ export class BrokerOps {
     get(brokerVersion: string): ReturnType<AgentVaultAPI['getBrokerOrders']>;
     post(id: string, state: string, detail: string): Promise<void>;
     key(): Promise<Uint8Array>;
+    /** Guided setup + change check (SPEC-admin-access §13). */
+    result(id: string, ciphertext: string, nonce: string): Promise<void>;
+    due(): ReturnType<AgentVaultAPI['getServerChecksDue']>;
+    check(requestId: string, changed: boolean, ciphertext: string, nonce: string): Promise<void>;
+    ops: BrokerOps;
   } {
     return {
       get: (v) => this.api.getBrokerOrders(v),
       post: (id, state, detail) => this.api.postBrokerOrderState(id, state, detail),
       key: () => this.api.ensureVaultKey(),
+      result: (id, c, n) => this.api.postBrokerOrderResult(id, c, n),
+      due: () => this.api.getServerChecksDue(),
+      check: (r, ch, c, n) => this.api.postServerCheck(r, ch, c, n),
+      ops: this,
     };
   }
 
@@ -988,6 +1015,8 @@ export class BrokerOps {
    */
   async sshAgentOpen(args: {
     entryId: string; purpose: string; op: BrokeredOp; ttlSeconds?: number;
+    /** Guided setup only (never from an agent): which half of an admin key to offer. */
+    offer?: 'cert' | 'plain';
   }): Promise<{
     session_id: string; socket_path: string; public_key_path: string; fingerprint: string;
     audited_host: string; known_hosts_path?: string; pinned_host_key?: string;
@@ -1015,7 +1044,7 @@ export class BrokerOps {
   }
 
   private async sshAgentOpenInner(args: {
-    entryId: string; purpose: string; op: BrokeredOp; ttlSeconds?: number;
+    entryId: string; purpose: string; op: BrokeredOp; ttlSeconds?: number; offer?: 'cert' | 'plain';
   }, rec: ActivityRecord): Promise<{
     session_id: string; socket_path: string; public_key_path: string; fingerprint: string;
     audited_host: string; known_hosts_path?: string; pinned_host_key?: string;
@@ -1108,7 +1137,7 @@ export class BrokerOps {
       const matching = checked.policy?.stamped?.approved.filter((item) =>
         item.ssh?.user === target.user && item.ssh.host === target.host && item.ssh.port === target.port) ?? [];
       let scanned: string | null;
-      try { scanned = await this.keyscan(target); } catch { scanned = null; }
+      try { scanned = await this.scanCached(target); } catch { scanned = null; }
       if (!scanned || !isSshHostKey(scanned)) {
         return err('Refused: could not read this server\'s identity. No signing session was opened.', 'HOST_KEY_UNREADABLE');
       }
@@ -1163,10 +1192,13 @@ export class BrokerOps {
     let identity;
     try {
       identity = loadOpenSshEd25519(new TextDecoder().decode(bytes));
-      if (adminUntilMs !== undefined) {
+      if (adminUntilMs !== undefined && args.offer !== 'plain') {
         // D13: a certificate for this key, valid until admin access ends, whose forced
         // command makes the server end the session then too.
         identity.certBlob = adminCertificate(identity, { end: Math.floor(adminUntilMs / 1000) });
+        if (args.offer === 'cert') identity.certOnly = true;
+      } else if (args.offer === 'cert') {
+        throw new Error('only an admin key in admin access has a certificate');
       }
     } catch (e) {
       return err(`That entry is not an unencrypted OpenSSH ed25519 private key: ${(e as Error).message}`);
@@ -1251,6 +1283,42 @@ export class BrokerOps {
       ...(pin ? { known_hosts_path: knownHostsPath!, pinned_host_key: pin.hostKey } : {}),
       ...(adminUntilMs !== undefined ? { admin_until: new Date(adminUntilMs).toISOString() } : {}),
     };
+  }
+
+  /**
+   * Guided setup and the change check (SPEC-admin-access §13): open a session through the SAME
+   * path an agent's command takes (host pin, admin-access gate, certificate, activity line),
+   * run ONE fixed command from this broker, close. `argv` gets the key's public line, which
+   * setup needs (the admin key is trusted as a certificate authority). Never reachable from an
+   * agent's request: the callers are the owner's sealed orders and the server's due list.
+   */
+  async serverRun(args: {
+    entryId: string; destination: string; purpose: string;
+    argv: (publicKey: string) => string[]; input?: string; offer?: 'cert' | 'plain'; timeoutMs?: number;
+  }): Promise<{ exitCode: number; stdout: string; stderr: string } | OpError> {
+    const op = { kind: 'ssh', destination: args.destination, remoteArgv: ['true'] } as BrokeredOp;
+    const opened = await this.sshAgentOpen({
+      entryId: args.entryId, purpose: args.purpose, op, ttlSeconds: 600, ...(args.offer ? { offer: args.offer } : {}),
+    });
+    if ('error' in opened) return opened;
+    const stop = new AbortController();
+    const watch = setInterval(() => {
+      if (!this.ssh.has(opened.session_id)) stop.abort(this.endedSessions.get(opened.session_id) ?? 'session closed');
+    }, 1000);
+    (watch as unknown as { unref?: () => void }).unref?.();
+    try {
+      const pub = fs.readFileSync(opened.public_key_path, 'utf8').trim().split(/\s+/).slice(0, 2).join(' ');
+      return await runSshWithAgent({
+        op: { ...op, remoteArgv: args.argv(pub) } as BrokeredOp,
+        socketPath: opened.socket_path, publicKeyPath: opened.public_key_path,
+        ...(opened.known_hosts_path ? { knownHostsPath: opened.known_hosts_path } : {}),
+        ...(args.input !== undefined ? { input: args.input } : {}),
+        timeoutMs: args.timeoutMs ?? 180_000, signal: stop.signal,
+      });
+    } finally {
+      clearInterval(watch);
+      this.closeSsh(opened.session_id);
+    }
   }
 
   /** Is this signing session still open? The agent's process asks, to stop its command when not. */

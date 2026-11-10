@@ -258,12 +258,26 @@ export class AgentVaultAPI {
    * Update now (SPEC-update-now U5/U7): the orders the owner sealed for THIS broker with THIS
    * agent's vault key. Reporting the broker's version here is how the vault knows it is behind.
    */
-  async getBrokerOrders(brokerVersion: string): Promise<{ orders: { id: string; agent_id: string; ciphertext: string; nonce: string }[] }> {
+  async getBrokerOrders(brokerVersion: string): Promise<{ orders: { id: string; agent_id: string; ciphertext: string; nonce: string; kind?: string }[] }> {
     return this.fetchJson('/agent/broker/orders', { broker_version: brokerVersion });
   }
 
   async postBrokerOrderState(id: string, state: string, detail: string): Promise<void> {
     await this.postJson(`/agent/broker/orders/${encodeURIComponent(id)}/state`, { state, detail });
+  }
+
+  /** Guided setup (SPEC-admin-access §13): the sealed PASS/FAIL lines of a setup-family order. */
+  async postBrokerOrderResult(id: string, ciphertext: string, nonce: string): Promise<void> {
+    await this.postJson(`/agent/broker/orders/${encodeURIComponent(id)}/result`, { ciphertext, nonce });
+  }
+
+  /** D14: this agent's admin accesses that have ended and still need a change check. */
+  async getServerChecksDue(): Promise<{ due: { request_id: string; entry_id: string; ended_at: string }[] }> {
+    return this.fetchJson('/agent/server-checks/due');
+  }
+
+  async postServerCheck(requestId: string, changed: boolean, ciphertext: string, nonce: string): Promise<void> {
+    await this.postJson(`/agent/server-checks/${encodeURIComponent(requestId)}`, { changed, ciphertext, nonce });
   }
 
   /** Tell the owner, through the server, that this machine's log no longer matches. */

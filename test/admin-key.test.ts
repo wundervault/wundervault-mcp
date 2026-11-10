@@ -60,7 +60,18 @@ function withFixture(run: (fixture: Fixture) => void): void {
   }
 }
 
+/** A public key as the vault makes it (5b: the vault keeps the private half). */
+function freshPublic(): string {
+  return `ssh-ed25519 ${Buffer.concat([Buffer.from([0, 0, 0, 11]), Buffer.from('ssh-ed25519'), Buffer.from([0, 0, 0, 32]), randomBytes(32)]).toString('base64')}`;
+}
+
+/** Adding needs --public now; the other modes do not. */
+function withPublic(args: string[]): string[] {
+  return args.some((a) => ['--remove', '--list', '--help', '--public'].includes(a)) ? args : ['--public', freshPublic(), ...args];
+}
+
 function run(fixture: Fixture, args: string[] = []): string {
+  args = withPublic(args);
   return execFileSync('sh', [script, ...args], {
     env: fixture.env,
     encoding: 'utf8',
@@ -91,25 +102,26 @@ describe.skipIf(!supported)('admin-key.sh', () => {
     });
   });
 
-  it('prints the private key once and it matches the installed public key', () => {
+  it('installs the public key the vault made and never prints a private key (check 16, 29)', () => {
     withFixture((fixture) => {
-      const output = run(fixture);
-      const match = output.match(
-        /-----BEGIN OPENSSH PRIVATE KEY-----\r?\n[\s\S]*?-----END OPENSSH PRIVATE KEY-----/,
-      );
-      expect(match).not.toBeNull();
-      expect(output.match(/-----BEGIN OPENSSH PRIVATE KEY-----/g)).toHaveLength(1);
-      expect(output).toContain('Add a secret > SSH key');
-      expect(output).toContain('For its server, type localhost');
-
-      const privateKeyFile = join(fixture.dir, 'printed-key');
-      writeFileSync(privateKeyFile, `${match![0]}\n`, { mode: 0o600 });
-      const publicKey = execFileSync('ssh-keygen', ['-y', '-f', privateKeyFile], {
-        env: fixture.env,
-        encoding: 'utf8',
-      });
+      const pub = freshPublic();
+      const output = run(fixture, ['--public', `${pub} whatever-comment`]);
+      expect(output).not.toMatch(/PRIVATE KEY/);
+      expect(output).toContain('already saved there');
       const installed = readFileSync(fixture.keysFile, 'utf8').trim().split(/\s+/);
-      expect(publicKey.trim().split(/\s+/)[1]).toBe(installed[2]);
+      expect(installed[2]).toBe(pub.split(' ')[1]);
+      expect(installed[3]).toBe('wundervault-admin');
+    });
+  });
+
+  it('refuses to add without a valid --public and changes nothing', () => {
+    withFixture((fixture) => {
+      for (const bad of [[], ['--public', 'ssh-rsa AAAA'], ['--public', 'ssh-ed25519 AAAA;rm']]) {
+        const r = spawnSync('sh', [script, ...bad], { env: fixture.env, encoding: 'utf8' });
+        expect(r.status).not.toBe(0);
+        expect(`${r.stdout}${r.stderr}`).not.toMatch(/PRIVATE KEY/);
+      }
+      expect(existsSync(fixture.keysFile)).toBe(false);
     });
   });
 
@@ -150,7 +162,7 @@ describe.skipIf(!supported)('admin-key.sh', () => {
       expect(before.startsWith('from="192.168.1.10,10.0.0.5",')).toBe(true);
 
       for (const value of ['a b', 'x;rm', '"', '', 'host,', ',host', 'a'.repeat(254)]) {
-        const result = spawnSync('sh', [script, '--from', value], {
+        const result = spawnSync('sh', [script, ...withPublic(['--from', value])], {
           env: fixture.env,
           encoding: 'utf8',
         });
@@ -219,7 +231,7 @@ describe.skipIf(!supported)('admin-key.sh', () => {
       symlinkSync(targetDir, fixture.sshDir, 'dir');
 
       for (const args of [[], ['--remove'], ['--list']]) {
-        const result = spawnSync('sh', [script, ...args], {
+        const result = spawnSync('sh', [script, ...withPublic(args)], {
           env: fixture.env,
           encoding: 'utf8',
         });
@@ -236,7 +248,7 @@ describe.skipIf(!supported)('admin-key.sh', () => {
       symlinkSync(targetFile, fixture.keysFile);
 
       for (const args of [[], ['--remove'], ['--list']]) {
-        const result = spawnSync('sh', [script, ...args], {
+        const result = spawnSync('sh', [script, ...withPublic(args)], {
           env: fixture.env,
           encoding: 'utf8',
         });
@@ -255,7 +267,7 @@ describe.skipIf(!supported)('admin-key.sh', () => {
       const env = { ...fixture.env };
       delete env.WV_ADMIN_ROOT_SSH_DIR;
 
-      const result = spawnSync('sh', [script], {
+      const result = spawnSync('sh', [script, ...withPublic([])], {
         env,
         encoding: 'utf8',
       });
@@ -291,7 +303,7 @@ describe.skipIf(!supported)('admin-key.sh SSH settings check', () => {
     return path;
   }
   function runWith(fixture: Fixture, sshd: string, args: string[] = []) {
-    return spawnSync('sh', [script, ...args], {
+    return spawnSync('sh', [script, ...withPublic(args)], {
       env: { ...fixture.env, WV_ADMIN_SSHD: sshd }, encoding: 'utf8',
     });
   }

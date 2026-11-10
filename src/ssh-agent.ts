@@ -79,6 +79,11 @@ export interface LoadedIdentity {
    * trusts the key only as a certificate authority.
    */
   certBlob?: Buffer;
+  /**
+   * Guided setup (SPEC-admin-access §13): prove the certificate alone signs in before the plain
+   * line is removed. true = sign only with the certificate. Unset = both, cert first.
+   */
+  certOnly?: boolean;
 }
 
 // ── SSH wire primitives ────────────────────────────────────────────────────────
@@ -383,6 +388,23 @@ function isBoundUserauth(
   }
 }
 
+/** Is `data` a userauth request that offers exactly this identity's certificate? */
+function userauthNamesCert(data: Buffer, identity: LoadedIdentity): boolean {
+  if (!identity.certBlob) return false;
+  try {
+    const r = new Reader(data);
+    r.str();                                              // session id
+    if (r.byte() !== 50) return false;                    // SSH_MSG_USERAUTH_REQUEST
+    r.str(); r.str();                                     // user, service
+    const method = r.str().toString('utf8');
+    if (method !== 'publickey' && method !== 'publickey-hostbound-v00@openssh.com') return false;
+    if (r.byte() !== 1) return false;
+    return r.str().toString('utf8') === 'ssh-ed25519-cert-v01@openssh.com' && r.str().equals(identity.certBlob);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Answer one agent message. No I/O; only the supplied connection state is updated.
  * Returns the reply body; the caller frames it.
@@ -399,6 +421,9 @@ export function handleAgentMessage(
 
   if (type === SSH_AGENTC_REQUEST_IDENTITIES) {
     // The certificate first, when there is one: a server set up for admin access accepts only it.
+    // Both are listed even when only the certificate may sign (certOnly): ssh pairs an
+    // IdentityFile with the agent's keys by the plain public key, and drops the certificate
+    // without it. The sign request below is what refuses the plain key.
     return Buffer.concat([
       Buffer.from([SSH_AGENT_IDENTITIES_ANSWER]),
       u32(identity.certBlob ? 2 : 1),
@@ -462,6 +487,14 @@ export function handleAgentMessage(
           onOutcome?.('refused_binding', reason);
           return Buffer.from([SSH_AGENT_FAILURE]);
         }
+      }
+
+      // certOnly: ssh asks for a certificate login by the PLAIN key's blob ("private key from
+      // agent for certificate"), so what decides is the login request being signed: it must
+      // name this certificate.
+      if (identity.certOnly === true && !userauthNamesCert(data, identity)) {
+        onOutcome?.('refused_binding', 'Only the admin certificate may sign in here.');
+        return Buffer.from([SSH_AGENT_FAILURE]);
       }
 
       const sig = cryptoSign(null, data, identity.privateKey);
@@ -852,8 +885,10 @@ export async function runSshWithAgent(opts: {
   knownHostsPath?: string;
   /** Admin access ended: kill the connection now (site SPEC-admin-access D7). */
   signal?: AbortSignal;
+  /** Written to the command's stdin, then closed (guided setup sends its fixed script). */
+  input?: string;
 }): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const { op, socketPath, publicKeyPath, cwd, timeoutMs = 120_000, knownHostsPath, signal } = opts;
+  const { op, socketPath, publicKeyPath, cwd, timeoutMs = 120_000, knownHostsPath, signal, input } = opts;
   const argv = buildSshArgv(op, socketPath, publicKeyPath, knownHostsPath);
 
   // spawn, NOT spawnSync. When this process hosts the agent listener, a synchronous
@@ -911,6 +946,10 @@ export async function runSshWithAgent(opts: {
     if (signal?.aborted) onAbort();
     else signal?.addEventListener('abort', onAbort, { once: true });
 
+    if (input !== undefined) {
+      child.stdin?.on('error', () => { /* the remote closed early; its exit code says why */ });
+      child.stdin?.end(input);
+    }
     child.stdout?.on('data', (d) => { stdout = append(stdout, d.toString()); });
     child.stderr?.on('data', (d) => { stderr = append(stderr, d.toString()); });
     child.on('error', (e) => finish(1, `\nFailed to run ${argv[0]}: ${e.message}`));

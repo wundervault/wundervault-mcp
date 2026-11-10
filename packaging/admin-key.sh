@@ -7,14 +7,17 @@ export LC_ALL
 
 usage() {
     cat <<'EOF'
-Usage: sudo sh admin-key.sh [--from ADDR[,ADDR...]] [--skip-checks]
+Usage: sudo sh admin-key.sh --public 'ssh-ed25519 AAAA...' [--from ADDR[,ADDR...]] [--skip-checks]
        sudo sh admin-key.sh --remove
        sudo sh admin-key.sh --list
        sudo sh admin-key.sh --help
 
 Add an admin key so your broker can run admin commands without your password.
-By default, the key works only from this computer.
+Make the key in your vault first (this computer's card > Add this computer's admin key):
+the vault keeps the private half and shows this command with the public half filled in.
+Nothing secret is printed here. By default, the key works only from this computer.
 
+  --public KEY          The public key the vault showed (one ssh-ed25519 key).
   --from ADDR[,ADDR...]  Allow connections from these addresses instead.
   --remove              Remove all admin keys created by this script.
   --list                Show existing admin keys without showing their key material.
@@ -33,6 +36,7 @@ fail() {
 
 mode=add
 from=127.0.0.1,::1
+public_key=
 skip_checks=0
 
 while [ $# -gt 0 ]; do
@@ -40,6 +44,11 @@ while [ $# -gt 0 ]; do
         --remove) mode=remove ;;
         --list) mode=list ;;
         --skip-checks) skip_checks=1 ;;
+        --public)
+            [ $# -ge 2 ] || { usage >&2; exit 1; }
+            public_key=$2
+            shift
+            ;;
         --from)
             [ $# -ge 2 ] || { usage >&2; exit 1; }
             from=$2
@@ -314,15 +323,13 @@ if [ "$overridden" = 0 ] || [ -n "${WV_ADMIN_SSHD:-}" ]; then
     done
 fi
 
-# Memory-backed where there is one, so even a killed run leaves nothing on disk.
-key_base=${TMPDIR:-/tmp}
-if [ -z "${TMPDIR:-}" ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
-    key_base=/dev/shm
-fi
-key_tmp=$(mktemp -d "$key_base/wundervault-admin.XXXXXX")
-ssh-keygen -q -t ed25519 -N '' \
-    -C "wundervault-admin $(hostname) $(date +%Y-%m-%d)" \
-    -f "$key_tmp/key"
+# The key is made in the vault (SPEC-admin-access §13, 5b): only its public half comes here.
+# Exactly "ssh-ed25519 <68 base64 characters>", whatever comment followed it is replaced.
+key_type=${public_key%% *}
+key_rest=${public_key#* }
+key_body=${key_rest%% *}
+printf '%s' "$key_body" | grep -Eq '^[A-Za-z0-9+/]{68}$' && [ "$key_type" = ssh-ed25519 ] \
+    || fail "Give the public key the vault showed: sudo sh admin-key.sh --public 'ssh-ed25519 AAAA...'. No admin key was added."
 
 prepare_directory
 write_tmp=$(mktemp "$ssh_dir/.wundervault-admin.XXXXXX")
@@ -333,21 +340,9 @@ write_tmp=$(mktemp "$ssh_dir/.wundervault-admin.XXXXXX")
             printf '\n'
         fi
     fi
-    printf 'from="%s",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc %s\n' \
-        "$from" "$(cat "$key_tmp/key.pub")"
+    printf 'from="%s",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 %s %s\n' \
+        "$from" "$key_body" "wundervault-admin $(hostname | tr -cd 'A-Za-z0-9._-') $(date +%Y-%m-%d)"
 } > "$write_tmp"
 finish_write
 
-cat <<'EOF'
-Admin key added.
-
-Copy everything between the lines into the vault: Add a secret > SSH key. For its server, type localhost (or this computer's name if your broker runs on another computer). Then come back here and press Enter.
-
----------- Private key starts below ----------
-EOF
-cat "$key_tmp/key"
-printf '%s\n' '---------- Private key ends above ----------'
-
-if [ "${WV_ADMIN_NO_WAIT:-0}" != 1 ]; then
-    IFS= read -r _ || :
-fi
+printf '%s\n' "Admin key added. Go back to your vault: it is already saved there as this computer's admin key, and agents can use it only while you allow admin access."

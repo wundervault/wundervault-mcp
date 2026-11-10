@@ -51,6 +51,7 @@ import {
 } from './endpoint.js';
 import { loadOrCreateIdentity, logSignerFromIdentity, brokerPublicKeyObject } from './broker-key.js';
 import { startPolling, updateSpoolDir } from './broker-update.js';
+import { SetupRecords, bundledScript, runSetup, runRemoveOrAccept, runChangeCheck, sealForOwner, resultAad, checkAad } from './server-setup.js';
 import type { OrderClient } from './broker-update.js';
 import { load as loadNetworkShape } from './network-store.js';
 import { BrokerOps, type ActivitySink } from './broker-ops.js';
@@ -728,8 +729,9 @@ class AgentDaemon {
    * order is one whose key this broker holds.
    */
   private startUpdateOrders(): void {
-    const spool = updateSpoolDir();
-    if (!spool || !fs.existsSync(path.join(spool, 'request.json'))) return;
+    // Setup orders and change checks (SPEC-admin-access §13) need no updater, so polling runs
+    // without the spool too; an update order then fails "no spool" (nothing here creates it).
+    const spool = updateSpoolDir() ?? path.join(systemRoot(), 'no-update-spool');
     let fingerprint: string;
     try { fingerprint = loadOrCreateIdentity().fingerprint; } catch { return; }
     type Route = ReturnType<BrokerOps['orderRoute']>;
@@ -759,6 +761,10 @@ class AgentDaemon {
         throw new Error('status not delivered');
       },
     };
+    const records = new SetupRecords(path.join(systemRoot(), 'server-setups.json'));
+    const running = new Set<string>();
+    const checkFailures = new Map<string, number>();
+    const log = (m: string) => console.error(`[wundervault-agent] ${m}`);
     this.updatePoller = startPolling({
       fingerprint, version: VERSION, client,
       vaultKeyFor: async (agentId) => { const r = byAgent.get(agentId); return r ? r.key() : null; },
@@ -766,8 +772,62 @@ class AgentDaemon {
       requestPath: path.join(spool, 'request.json'),
       statusPath: path.join(spool, 'status.json'),
       now: () => Date.now(),
-      log: (m) => console.error(`[wundervault-agent] ${m}`),
-    });
+      log,
+      serverOrder: (agentId, order) => {
+        const route = byAgent.get(agentId);
+        if (!route || running.has(order.order_id)) return;
+        running.add(order.order_id);
+        void (async () => {
+          let outcome: { ok: boolean; lines: string[] };
+          try {
+            await route.post(order.order_id, 'working', '');
+            const script = bundledScript();
+            outcome = order.type === 'setup'
+              ? await runSetup(route.ops, order, script, records)
+              : await runRemoveOrAccept(route.ops, order, script);
+          } catch (e) {
+            outcome = { ok: false, lines: [`FAIL the helper app stopped: ${String((e as Error).message ?? e).split('\n')[0]!.slice(0, 160)}`] };
+          }
+          const passed = outcome.lines.filter((l) => l.startsWith('PASS ')).length;
+          const counted = outcome.lines.filter((l) => /^(PASS|FAIL) /.test(l)).length;
+          try {
+            const sealed = sealForOwner(await route.key(), resultAad(fingerprint, order.order_id),
+              { v: 1, order_id: order.order_id, type: order.type, ok: outcome.ok, lines: outcome.lines });
+            await route.result(order.order_id, sealed.ciphertext, sealed.nonce);
+          } catch { log('Server order result not delivered'); }
+          try {
+            await route.post(order.order_id, outcome.ok ? 'done' : 'failed', `${passed} of ${counted} passed`);
+          } catch { log('Server order state not delivered'); }
+          running.delete(order.order_id);
+        })();
+      },
+      afterPoll: async () => {
+        for (const route of routes()) {
+          let due;
+          try { due = (await route.due()).due ?? []; } catch { continue; }
+          for (const item of due) {
+            const rec = records.get(item.entry_id);
+            if (!rec || running.has(item.request_id)) continue;
+            running.add(item.request_id);
+            try {
+              const r = await runChangeCheck(route.ops, rec);
+              let changed: boolean; let lines: string[];
+              if (r.ok) { changed = r.changed; lines = r.lines; } else {
+                // Three tries (one per poll) before the owner hears the check could not run.
+                const n = (checkFailures.get(item.request_id) ?? 0) + 1;
+                checkFailures.set(item.request_id, n);
+                if (n < 3) continue;
+                changed = true; lines = [`FAIL the change check could not run: ${r.error}`];
+              }
+              const sealed = sealForOwner(await route.key(), checkAad(item.request_id),
+                { v: 1, request_id: item.request_id, lines });
+              await route.check(item.request_id, changed, sealed.ciphertext, sealed.nonce);
+              checkFailures.delete(item.request_id);
+            } catch { log('Change check not delivered'); } finally { running.delete(item.request_id); }
+          }
+        }
+      },
+    }, 60_000);
   }
 
   /** Every servable agent's route to the server, so each account's chain has one. */
