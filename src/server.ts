@@ -53,6 +53,36 @@ export { DIRECTIVE } from './directive.js';
 const MOCK_MODE = process.env.WUNDERVAULT_MOCK === '1' || process.env.WUNDERVAULT_MOCK === 'true';
 const MOCK_NOTE = '\n\n[DEMO MODE — WUNDERVAULT_MOCK is set; no real vault was contacted and no real secret was used.]';
 
+/** An admin session's command may run only until its admin access ends (site SPEC-admin-access D7). */
+export function adminTimeoutMs(opened: Record<string, unknown>, timeoutMs: number): number {
+  const until = Date.parse(String(opened.admin_until ?? ''));
+  if (!Number.isFinite(until)) return timeoutMs;
+  return Math.max(1, Math.min(timeoutMs, until - Date.now()));
+}
+
+export const ADMIN_ENDED = 'Admin access ended, so the connection was closed. Ask your owner to allow admin access again if you need more time.';
+
+/**
+ * While an admin command runs, ask the helper app every 3 s whether its signing session is
+ * still open; when it is not (End now, done, the time is up), abort, which kills the command
+ * and its connection. A plain session gets a no-op watcher.
+ */
+export function watchAdminSession(
+  broker: { send(op: string, payload?: Record<string, unknown>): Promise<Record<string, unknown>> },
+  opened: Record<string, unknown>, sessionId: string, everyMs = 3_000,
+): { signal?: AbortSignal; stop(): void } {
+  if (typeof opened.admin_until !== 'string') return { stop() { /* not an admin session */ } };
+  const ac = new AbortController();
+  const until = Date.parse(opened.admin_until);
+  const end = setTimeout(() => ac.abort(ADMIN_ENDED), Math.max(1, until - Date.now()));
+  const poll = setInterval(() => {
+    broker.send('ssh_agent_status', { session_id: sessionId }).then((st) => {
+      if (st && st.open === false) ac.abort(ADMIN_ENDED);
+    }, () => { /* the end timer still bounds it */ });
+  }, everyMs);
+  return { signal: ac.signal, stop() { clearTimeout(end); clearInterval(poll); } };
+}
+
 function mockToolResult(name: string, args: Record<string, any>) {
   switch (name) {
     case 'vault_entries_list':
@@ -453,6 +483,7 @@ export function createServer(args: { url?: string } = {}) {
         });
         if (opened.error) return fail(String(opened.error));
         const sessionId = String(opened.session_id ?? '');
+        const watch = watchAdminSession(broker, opened, sessionId);
         let r: { code: number; stdout: string; stderr: string };
         let signs = 0;
         try {
@@ -460,9 +491,11 @@ export function createServer(args: { url?: string } = {}) {
             buildGitArgv(v.req), repoDir,
             gitEnv(process.env, sshCommandFor(String(opened.socket_path ?? ''), String(opened.public_key_path ?? ''),
               typeof opened.known_hosts_path === 'string' ? opened.known_hosts_path : undefined)),
-            timeoutSeconds * 1000,
+            adminTimeoutMs(opened, timeoutSeconds * 1000),
+            watch.signal,
           );
         } finally {
+          watch.stop();
           const closed = await broker.send('ssh_agent_close', { session_id: sessionId }).catch(() => ({ signs: 0 }));
           signs = Number((closed as { signs?: unknown }).signs ?? 0);
         }
@@ -536,18 +569,21 @@ export function createServer(args: { url?: string } = {}) {
         if (opened.error) return fail(String(opened.error));
 
         const sessionId = String(opened.session_id ?? '');
+        const watch = watchAdminSession(broker, opened, sessionId);
         let r: { exitCode: number; stdout: string; stderr: string };
         let signs = 0;
         try {
           r = await runSshWithAgent({
+            signal: watch.signal,
             op,
             socketPath: String(opened.socket_path ?? ''),
             publicKeyPath: String(opened.public_key_path ?? ''),
             ...(typeof opened.known_hosts_path === 'string' ? { knownHostsPath: opened.known_hosts_path } : {}),
             cwd: workingDir,
-            timeoutMs: Math.max(1, Math.min(timeoutSeconds, 900)) * 1000,
+            timeoutMs: adminTimeoutMs(opened, Math.max(1, Math.min(timeoutSeconds, 900)) * 1000),
           });
         } finally {
+          watch.stop();
           // Always closed, including on a throw and on a timeout. The broker also expires
           // the session on its own timer, because a client that dies between opening and
           // closing must not leave an ambient signing socket behind — a close that only

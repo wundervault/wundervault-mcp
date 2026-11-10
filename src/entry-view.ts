@@ -41,6 +41,9 @@ const responseFields = [
   // withhold them but not forge or roll them back. Dropping them made every payment and every
   // stamped call ask the owner again once a setup was sealed (found by broker-stamp-parts).
   'policy_ciphertext', 'policy_nonce',
+  // Admin access: the server gates the value on it; the broker uses the end time only to close
+  // its own signing sessions sooner, so a server that withheld it would gain nothing.
+  'admin_access', 'admin_until',
 ] as const;
 
 function refused(reason: string): EntryResult<never> {

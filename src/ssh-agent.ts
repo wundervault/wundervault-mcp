@@ -831,8 +831,10 @@ export async function runSshWithAgent(opts: {
   timeoutMs?: number;
   /** Spec 1.3: the broker-written identity of a pinned server; strict checking against it. */
   knownHostsPath?: string;
+  /** Admin access ended: kill the connection now (site SPEC-admin-access D7). */
+  signal?: AbortSignal;
 }): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const { op, socketPath, publicKeyPath, cwd, timeoutMs = 120_000, knownHostsPath } = opts;
+  const { op, socketPath, publicKeyPath, cwd, timeoutMs = 120_000, knownHostsPath, signal } = opts;
   const argv = buildSshArgv(op, socketPath, publicKeyPath, knownHostsPath);
 
   // spawn, NOT spawnSync. When this process hosts the agent listener, a synchronous
@@ -871,6 +873,13 @@ export async function runSshWithAgent(opts: {
       try { child.kill('SIGKILL'); } catch { /* already gone */ }
       finish(124, `\nCommand timed out after ${Math.round(timeoutMs / 1000)}s.`);
     }, timeoutMs);
+
+    const onAbort = () => {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      finish(125, `\n${String(signal?.reason ?? 'Stopped.')}`);
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
 
     child.stdout?.on('data', (d) => { stdout = append(stdout, d.toString()); });
     child.stderr?.on('data', (d) => { stderr = append(stderr, d.toString()); });

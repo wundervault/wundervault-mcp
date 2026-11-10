@@ -444,6 +444,7 @@ export async function runGit(
   cwd: string,
   env: NodeJS.ProcessEnv,
   timeoutMs = 120000,
+  signal?: AbortSignal,
 ): Promise<GitResult> {
   if (
     !Number.isInteger(timeoutMs) ||
@@ -471,6 +472,17 @@ export async function runGit(
       child.stderr.destroy();
       child.stdin.destroy();
     }, timeoutMs);
+
+    const kill = (code: number, note: string) => {
+      finish(code, note);
+      try {
+        if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGKILL');
+        else child.kill('SIGKILL');
+      } catch { child.kill('SIGKILL'); }
+    };
+    // Admin access ended (site SPEC-admin-access D7): the whole group, ssh included.
+    if (signal?.aborted) kill(125, `\n[${String(signal.reason ?? 'stopped')}]\n`);
+    else signal?.addEventListener('abort', () => kill(125, `\n[${String(signal.reason ?? 'stopped')}]\n`), { once: true });
 
     function finish(code: number, note = ''): void {
       if (finished) {

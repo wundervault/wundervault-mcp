@@ -55,6 +55,13 @@ export interface SecretResponse {
   directive_signature?: string;
   access_tier?: string;
   /**
+   * Admin access (site SPEC-admin-access-2026-11-10): an admin key is served only inside an
+   * approval the owner gave for 5, 15 or 60 minutes, and admin_until says when it ends. The
+   * broker closes every signing session for it then.
+   */
+  admin_access?: boolean;
+  admin_until?: string | null;
+  /**
    * How the key is used, as JSON: {delivery:"http", credential_binding:{…}} or
    * {delivery:"ssh", ssh_hosts:[…]}. The broker re-validates it (delivery.ts); it is
    * never trusted as given.

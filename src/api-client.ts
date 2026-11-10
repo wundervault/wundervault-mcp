@@ -29,6 +29,16 @@ export function approvalNotGivenMessage(outcome: Exclude<ApprovalOutcome, 'appro
     + 'same call again.';
 }
 
+export const ADMIN_ACCESS_REQUIRED = 'ADMIN_ACCESS_REQUIRED';
+
+/** The agent's words when an admin key is used without admin access (spec §4). Never "window". */
+export function adminAccessRequiredMessage(what?: string, requestId?: string): string {
+  return `${ADMIN_ACCESS_REQUIRED}: ${what ? what + ' ' : 'this key '}needs admin access, which your owner must allow. `
+    + (requestId ? `A request was sent (${requestId}); ask again once your owner has allowed it, ` : 'Ask ')
+    + 'or ask your owner to allow admin access from the vault. Use the everyday key for anything that only reads, '
+    + 'and call vault_done when you have finished.';
+}
+
 export class ApprovalNotGiven extends Error {
   constructor(public readonly outcome: Exclude<ApprovalOutcome, 'approved'>, what?: string) {
     super(approvalNotGivenMessage(outcome, what));
@@ -296,6 +306,11 @@ export class AgentVaultAPI {
   }
 
   /** Read setup and configuration without spending an approval or resolving the value. */
+  /** Is this agent's admin access to one key still on? Never returns a value. */
+  async adminAccessStatus(id: string): Promise<{ admin: boolean; open: boolean; until: string | null }> {
+    return await this.fetchJson(`/agent/vault/admin-access/${id}`);
+  }
+
   async getSecretMeta(id: string): Promise<SecretResponse> {
     try {
       return await this.resolveSecret(
@@ -341,7 +356,13 @@ export class AgentVaultAPI {
         ? String(err.message).match(/tier2-requests\/([A-Za-z0-9_-]+)/)?.[1]
         : undefined;
       if (!requestId) throw err;
+      const adminKey = String(err?.message ?? '').includes(ADMIN_ACCESS_REQUIRED);
       const outcome = await this.waitForTier2Outcome(requestId);
+      if (outcome !== 'approved' && adminKey) {
+        throw Object.assign(new Error(adminAccessRequiredMessage(await this.quotedNameOf(id), requestId)), {
+          code: ADMIN_ACCESS_REQUIRED, request_id: requestId,
+        });
+      }
       // Not the server's 403 (2.0.1, B4): it named an endpoint the agent cannot use and read as
       // a refusal even when the owner simply had not looked yet. The same words as every tool,
       // with the secret's name (review round 1, F2), which this refused fetch never returned.

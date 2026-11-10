@@ -42,7 +42,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { AgentVaultAPI, approvalNotGivenMessage } from './api-client.js';
+import { AgentVaultAPI, approvalNotGivenMessage, ADMIN_ACCESS_REQUIRED, adminAccessRequiredMessage } from './api-client.js';
 import { signerFromIdentity, type BrokerSigner } from './broker-sign.js';
 import { decryptSecretContent, loadEncryptionKey } from './crypto.js';
 import {
@@ -133,7 +133,10 @@ export class BrokerOps {
   /** BUILD 2: this machine's payment record, policy versions and used approvals. */
   private state: SigningState;
   private readonly keyscan: (t: NonNullable<ReturnType<typeof normalizeSshTarget>>) => Promise<string | null>;
-  private ssh = new Map<string, { handle: AgentHandle; timer: NodeJS.Timeout; entryId: string; key?: string; host: string; reason: string; tier: string }>();
+  private ssh = new Map<string, { handle: AgentHandle; timer: NodeJS.Timeout; entryId: string; key?: string; host: string; reason: string; tier: string; adminPoll?: NodeJS.Timeout; adminUntil?: string; endedBy?: string }>();
+
+  /** How often an admin session asks whether its admin access is still on (End now, done). */
+  static ADMIN_POLL_MS = 3_000;
   /**
    * The activity log (activity-log.ts). Set by the daemon; null in a test that does not
    * care. Writing a line never changes what an operation returns, and never throws into it.
@@ -282,9 +285,15 @@ export class BrokerOps {
     return { entries: data.entries ?? [] };
   }
 
-  async done(): Promise<{ ended: number; setting: 'end' | 'keep' } | OpError> {
+  async done(): Promise<{ ended: number; setting: 'end' | 'keep'; ssh_closed?: number } | OpError> {
     try {
-      return await this.api.agentDone();
+      const r = await this.api.agentDone();
+      if (r.setting !== 'end') return r;
+      // D6: "end" also closes this agent's signing sessions here, not only its approvals on
+      // the server. "keep" leaves both running.
+      let closed = 0;
+      for (const id of [...this.ssh.keys()]) { if (this.closeSsh(id, 'done').closed) closed++; }
+      return { ...r, ssh_closed: closed };
     } catch (e) {
       return err((e as Error).message, (e as { code?: string }).code);
     }
@@ -1023,11 +1032,29 @@ export class BrokerOps {
       );
     }
 
-    const s = await this.api.getSecret(entryId);
+    let s;
+    try {
+      s = await this.api.getSecret(entryId);
+    } catch (e) {
+      if ((e as { code?: string }).code === ADMIN_ACCESS_REQUIRED) {
+        rec.approval = 'not_approved';
+        return err((e as Error).message, ADMIN_ACCESS_REQUIRED);
+      }
+      throw e;
+    }
     rec.key = s.name;
     rec.tier = String(s.access_tier ?? '1');
     if (!modeAllowsSshBroker(s.entry_mode)) {
       return err(wrongModeMessage(s.entry_mode, 'ssh'), 'WRONG_MODE');
+    }
+    // Admin access (D7): the session may not outlive the owner's approval. No end time from a
+    // server that says this is an admin key = no session.
+    let adminUntilMs: number | undefined;
+    if (s.admin_access === true) {
+      adminUntilMs = Date.parse(String(s.admin_until ?? ''));
+      if (!Number.isFinite(adminUntilMs) || adminUntilMs <= Date.now()) {
+        return err(adminAccessRequiredMessage(s.name ? `"${s.name}"` : undefined), ADMIN_ACCESS_REQUIRED);
+      }
     }
 
     let auditedHost: string;
@@ -1181,9 +1208,30 @@ export class BrokerOps {
       throw e;
     }
 
-    const timer = setTimeout(() => this.closeSsh(sessionId), ttlSeconds * 1000);
+    const lifeMs = adminUntilMs === undefined
+      ? ttlSeconds * 1000
+      : Math.max(1, Math.min(ttlSeconds * 1000, adminUntilMs - Date.now()));
+    const timer = setTimeout(() => this.closeSsh(sessionId, adminUntilMs === undefined ? undefined : 'admin_access_ended'), lifeMs);
     (timer as unknown as { unref?: () => void }).unref?.();
-    this.ssh.set(sessionId, { handle, timer, entryId, key: s.name, host: auditedHost, reason: purpose, tier: String(s.access_tier ?? '1') });
+    let adminPoll: NodeJS.Timeout | undefined;
+    if (adminUntilMs !== undefined) {
+      // End now / done / a revoke on the server closes the session within one poll. A failed
+      // poll is not "still on": two in a row close it (fail closed, but not on one blip).
+      let misses = 0;
+      adminPoll = setInterval(() => {
+        this.api.adminAccessStatus(entryId).then((st) => {
+          misses = 0;
+          if (!st.open) this.closeSsh(sessionId, 'admin_access_ended');
+        }, () => {
+          if (++misses >= 2) this.closeSsh(sessionId, 'admin_access_unconfirmed');
+        });
+      }, BrokerOps.ADMIN_POLL_MS);
+      (adminPoll as unknown as { unref?: () => void }).unref?.();
+    }
+    this.ssh.set(sessionId, {
+      handle, timer, entryId, key: s.name, host: auditedHost, reason: purpose, tier: String(s.access_tier ?? '1'),
+      ...(adminPoll ? { adminPoll, adminUntil: new Date(adminUntilMs!).toISOString() } : {}),
+    });
     // Pairs this line with its close. A hash, not the id: the id names the signing socket's
     // directory, and a copy of the log (the viewer page) is readable by agents (round 3, B1).
     rec.extra = { ...(rec.extra ?? {}), session: sessionRef(sessionId) };
@@ -1195,20 +1243,36 @@ export class BrokerOps {
       fingerprint: identity.fingerprint,
       audited_host: auditedHost,
       ...(pin ? { known_hosts_path: knownHostsPath!, pinned_host_key: pin.hostKey } : {}),
+      ...(adminUntilMs !== undefined ? { admin_until: new Date(adminUntilMs).toISOString() } : {}),
     };
   }
 
-  closeSsh(sessionId: string): { closed: boolean; signs: number } {
+  /** Is this signing session still open? The agent's process asks, to stop its command when not. */
+  sshSessionOpen(sessionId: string): { open: boolean; ended_by?: string } {
+    if (this.ssh.has(sessionId)) return { open: true };
+    const ended = this.endedSessions.get(sessionId);
+    return ended ? { open: false, ended_by: ended } : { open: false };
+  }
+
+  /** Why recent sessions ended, so the agent can be told "admin access ended" (bounded). */
+  private endedSessions = new Map<string, string>();
+
+  closeSsh(sessionId: string, endedBy?: string): { closed: boolean; signs: number } {
     const rec = this.ssh.get(sessionId);
     if (!rec) return { closed: false, signs: 0 };
     const signs = rec.handle.signCount();
     clearTimeout(rec.timer);
+    if (rec.adminPoll) clearInterval(rec.adminPoll);
+    if (endedBy) {
+      this.endedSessions.set(sessionId, endedBy);
+      if (this.endedSessions.size > 64) this.endedSessions.delete(this.endedSessions.keys().next().value as string);
+    }
     try { rec.handle.close(); } catch { /* already gone */ }
     this.ssh.delete(sessionId);
     this.record({
       kind: 'ssh_closed', outcome: 'closed', agent: this.agentName, entry_id: rec.entryId,
       key: rec.key, address: `ssh://${rec.host}`, reason: rec.reason, tier: rec.tier,
-      extra: { signs, session: sessionRef(sessionId) },
+      extra: { signs, session: sessionRef(sessionId), ...(endedBy ? { ended_by: endedBy } : {}) },
     });
     return { closed: true, signs };
   }

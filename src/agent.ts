@@ -1053,6 +1053,9 @@ class AgentDaemon {
       case 'ssh_agent_close':
         return ops.closeSsh(String(msg.session_id ?? '')) as unknown as Record<string, unknown>;
 
+      case 'ssh_agent_status':
+        return ops.sshSessionOpen(String(msg.session_id ?? '')) as unknown as Record<string, unknown>;
+
       default:
         return { error: `Unknown operation "${op}".`, code: 'UNKNOWN_OP' };
     }
