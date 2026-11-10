@@ -592,6 +592,7 @@ export function createServer(args: { url?: string } = {}) {
         const watch = watchAdminSession(broker, opened, sessionId);
         let r: { exitCode: number; stdout: string; stderr: string };
         let signs = 0;
+        let endedNote = '';
         try {
           r = await runSshWithAgent({
             signal: watch.signal,
@@ -604,6 +605,13 @@ export function createServer(args: { url?: string } = {}) {
           });
         } finally {
           watch.stop();
+          // iamwyse real run: End now cuts the server side first, so ssh exits 255 before the
+          // watch's next poll and the agent saw only "exit 255". Ask once, before closing, so a
+          // session the owner ended says so.
+          if (typeof opened.admin_until === 'string' && !watch.signal.aborted) {
+            const st = await broker.send('ssh_agent_status', { session_id: sessionId }).catch(() => null);
+            if (st && st.open === false && st.ended_by) endedNote = `\n${ADMIN_ENDED}`;
+          }
           // Always closed, including on a throw and on a timeout. The broker also expires
           // the session on its own timer, because a client that dies between opening and
           // closing must not leave an ambient signing socket behind — a close that only
@@ -615,7 +623,7 @@ export function createServer(args: { url?: string } = {}) {
 
         const head = r.exitCode === 0
           ? `✅ ${op.kind} on ${destination} completed (exit 0).`
-          : `❌ ${op.kind} on ${destination} failed (exit ${r.exitCode}).`;
+          : `❌ ${op.kind} on ${destination} failed (exit ${r.exitCode}).${r.exitCode !== 0 ? endedNote : ''}`;
         return CallToolResultSchema.parse({
           content: [{ type: 'text', text:
             `${head}\n${signs} signature(s); the key never left the broker.\n`
