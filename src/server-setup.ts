@@ -66,7 +66,7 @@ export function validateServerOrder(
   if (o.broker !== fingerprint) return { ok: false, reason: 'wrong broker' };
   const issued = isoMs(o.issued_at);
   const expires = isoMs(o.expires_at);
-  if (!Number.isFinite(issued) || !Number.isFinite(expires) || expires <= issued || expires - issued > 30 * 60_000) {
+  if (!Number.isFinite(issued) || !Number.isFinite(expires) || expires <= issued || expires - issued > 16 * 60_000) {
     return { ok: false, reason: 'malformed' };
   }
   if (issued > nowMs + 2 * 60_000 || expires <= nowMs) return { ok: false, reason: 'expired' };
@@ -118,6 +118,8 @@ export class SetupRecords {
       return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, SetupRecord> : {};
     } catch { return {}; }
   }
+  /** Admin entries this computer can check (F5: the server offers only these as due). */
+  entries(): string[] { return Object.keys(this.read()).filter((id) => this.get(id) !== undefined); }
   get(adminEntryId: string): SetupRecord | undefined {
     const r = this.read()[adminEntryId];
     return r && typeof r.everyday_entry_id === 'string' && canonicalDestination(r.everyday_destination) ? r : undefined;
@@ -148,7 +150,7 @@ export interface ServerRunner {
 /** PASS/FAIL/NOTE lines a script printed, bounded; anything else is dropped. */
 function verdictLines(out: string): string[] {
   return out.split('\n').map((l) => l.replace(/[^\x20-\x7e]/g, '').trim())
-    .filter((l) => /^(PASS|FAIL|NOTE) /.test(l)).slice(0, 40).map((l) => l.slice(0, 200));
+    .filter((l) => /^(PASS|FAIL|NOTE) /.test(l)).slice(0, 40).map((l) => l.slice(0, 160));
 }
 
 function failOf(r: Run, what: string): string {
@@ -207,9 +209,12 @@ export async function runSetup(ops: ServerRunner, o: Extract<ServerOrder, { type
   else lines.push(...verdictLines(status.stdout));
 
   const plain = await step('plain', () => ['true'], { offer: 'plain' });
-  lines.push(!('error' in plain) && plain.exitCode === 255
+  const refused = !('error' in plain) && plain.exitCode === 255 && /Permission denied \(publickey/.test(plain.stderr);
+  lines.push(refused
     ? 'PASS the admin key alone is refused (it works only inside admin access)'
-    : 'FAIL the admin key still signs in without admin access');
+    : !('error' in plain) && plain.exitCode === 0
+      ? 'FAIL the admin key still signs in without admin access'
+      : failOf(plain, 'could not confirm the admin key alone is refused'));
 
   const everyday = `${o.everyday_user}@${dest.host}${dest.port === 22 ? '' : ':' + dest.port}`;
   const selftest = [
@@ -230,7 +235,10 @@ export async function runSetup(ops: ServerRunner, o: Extract<ServerOrder, { type
     try {
       records.put(o.entry_id, { everyday_entry_id: o.everyday_entry_id, everyday_destination: everyday,
         admin_user: admin, at: new Date().toISOString() });
-    } catch { lines.push('NOTE this computer could not save the setup record; the change check will not run from here'); }
+    } catch {
+      lines.push('FAIL this computer could not save the setup record, so the change check would not run; run the setup again');
+      return { ok: false, lines };
+    }
   }
   return { ok, lines };
 }
@@ -247,11 +255,26 @@ export async function runRemoveOrAccept(ops: ServerRunner, o: Exclude<ServerOrde
   return { ok: true, lines: verdictLines(r.stdout) };
 }
 
+/**
+ * Keep a sealed answer under the server's 16 KB ciphertext limit: at most `budget` bytes of
+ * lines (JSON-escaped), then one line saying how many more there were.
+ */
+export function fitLines(lines: string[], budget = 9_000): string[] {
+  const out: string[] = [];
+  let used = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const n = JSON.stringify(lines[i]).length + 1;
+    if (used + n > budget) { out.push(`NOTE and ${lines.length - i} more not shown; the server's own report has them all`); break; }
+    out.push(lines[i]!); used += n;
+  }
+  return out;
+}
+
 /** NEW/GONE lines of `wv-check report`, or null when the report did not finish (no END). */
 export function parseReport(out: string): string[] | null {
   const lines = out.split('\n').map((l) => l.replace(/[^\x09\x20-\x7e]/g, '').trimEnd());
   if (!lines.includes('END') && !lines.some((l) => l.startsWith('NO-BASELINE'))) return null;
-  return lines.filter((l) => /^(NEW|GONE)\t/.test(l) || l.startsWith('NO-BASELINE')).slice(0, 200).map((l) => l.slice(0, 300));
+  return fitLines(lines.filter((l) => /^(NEW|GONE)\t/.test(l) || l.startsWith('NO-BASELINE')).map((l) => l.slice(0, 200)));
 }
 
 /** D14: run the read-only report with the everyday key. */

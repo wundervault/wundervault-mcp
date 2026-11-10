@@ -272,8 +272,9 @@ export class AgentVaultAPI {
   }
 
   /** D14: this agent's admin accesses that have ended and still need a change check. */
-  async getServerChecksDue(): Promise<{ due: { request_id: string; entry_id: string; ended_at: string }[] }> {
-    return this.fetchJson('/agent/server-checks/due');
+  /** Only for the admin entries this computer set up (it can check nothing else). */
+  async getServerChecksDue(entries: string[]): Promise<{ due: { request_id: string; entry_id: string; ended_at: string }[] }> {
+    return this.fetchJson('/agent/server-checks/due', { entries: entries.join(',') });
   }
 
   async postServerCheck(requestId: string, changed: boolean, ciphertext: string, nonce: string): Promise<void> {

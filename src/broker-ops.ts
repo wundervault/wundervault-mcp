@@ -174,7 +174,7 @@ export class BrokerOps {
     key(): Promise<Uint8Array>;
     /** Guided setup + change check (SPEC-admin-access §13). */
     result(id: string, ciphertext: string, nonce: string): Promise<void>;
-    due(): ReturnType<AgentVaultAPI['getServerChecksDue']>;
+    due(entries: string[]): ReturnType<AgentVaultAPI['getServerChecksDue']>;
     check(requestId: string, changed: boolean, ciphertext: string, nonce: string): Promise<void>;
     ops: BrokerOps;
   } {
@@ -183,7 +183,7 @@ export class BrokerOps {
       post: (id, state, detail) => this.api.postBrokerOrderState(id, state, detail),
       key: () => this.api.ensureVaultKey(),
       result: (id, c, n) => this.api.postBrokerOrderResult(id, c, n),
-      due: () => this.api.getServerChecksDue(),
+      due: (entries) => this.api.getServerChecksDue(entries),
       check: (r, ch, c, n) => this.api.postServerCheck(r, ch, c, n),
       ops: this,
     };

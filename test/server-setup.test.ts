@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import crypto from 'node:crypto';
-import { validateServerOrder, runSetup, parseReport, sealForOwner, resultAad, type ServerRunner } from '../src/server-setup.js';
+import { validateServerOrder, runSetup, parseReport, fitLines, sealForOwner, resultAad, type ServerRunner } from '../src/server-setup.js';
 import { openServerOrder, openOrder, pollOnce, type BrokerUpdateDeps } from '../src/broker-update.js';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -44,7 +44,7 @@ describe('setup orders are checked before anything runs (check 24)', () => {
     ['a destination with options', { destination: '-oProxyCommand=x@h' }, 'bad destination'],
     ['logs as text', { logs: 'yes' }, 'malformed'],
     ['expired', { expires_at: new Date(Date.now() - 1000).toISOString(), issued_at: new Date(Date.now() - 60_000).toISOString() }, 'expired'],
-    ['too long', { expires_at: new Date(Date.now() + 31 * 60_000).toISOString() }, 'malformed'],
+    ['longer than 15 minutes', { expires_at: new Date(Date.now() + 17 * 60_000).toISOString() }, 'malformed'],
   ])('refuses %s', (_n, over, reason) => {
     const r = validateServerOrder(setup(over as Record<string, unknown>), FP, Date.now());
     expect(r).toEqual({ ok: false, reason });
@@ -59,7 +59,7 @@ describe('setup orders are checked before anything runs (check 24)', () => {
   });
 });
 
-function fakeRunner(script: (call: { argv: string[]; offer?: string; entryId: string; input?: string }) => { exitCode: number; stdout: string } ) {
+function fakeRunner(script: (call: { argv: string[]; offer?: string; entryId: string; input?: string }) => { exitCode: number; stdout: string; stderr?: string } ) {
   const calls: { argv: string[]; offer?: string; entryId: string; destination: string; input?: string }[] = [];
   const ops: ServerRunner = {
     async serverRun(a) {
@@ -67,10 +67,15 @@ function fakeRunner(script: (call: { argv: string[]; offer?: string; entryId: st
       const call = { argv, offer: a.offer, entryId: a.entryId, destination: a.destination, input: a.input };
       calls.push(call);
       const r = script(call);
-      return { ...r, stderr: '' };
+      return { stderr: c255(call, r), ...r };
     },
   };
   return { ops, calls };
+}
+
+// A plain-key refusal from sshd says so on stderr.
+function c255(call: { offer?: string }, r: { exitCode: number }): string {
+  return call.offer === 'plain' && r.exitCode === 255 ? 'opc@h: Permission denied (publickey).' : '';
 }
 
 describe('setup runs in the order that cannot lock the owner out (check 25)', () => {
@@ -121,6 +126,35 @@ describe('setup runs in the order that cannot lock the owner out (check 25)', ()
     await runSetup(ops, root.order, 'S');
     expect(calls[0]!.argv.slice(0, 2)).toEqual(['sh', '-s']);
     expect(calls[5]!.destination).toBe('wv-agent@203.0.113.7:2222');
+  });
+});
+
+describe('round 1 fixes', () => {
+  const v = validateServerOrder(setup(), FP, Date.now());
+  if (!v.ok || v.order.type !== 'setup') throw new Error('fixture');
+  const o = v.order;
+  it('B4: a dropped connection is not proof the plain key is refused', async () => {
+    const { ops } = fakeRunner((c) => c.argv[0] === 'echo' ? { exitCode: 0, stdout: 'wv-cert-ok' }
+      : c.offer === 'plain' ? { exitCode: 255, stdout: '', stderr: 'Connection reset by peer' } : { exitCode: 0, stdout: 'PASS a\n' });
+    const r = await runSetup(ops, o, 'S');
+    expect(r.ok).toBe(false);
+    expect(r.lines.join('\n')).toMatch(/could not confirm the admin key alone is refused/);
+  });
+  it('F6: a setup record that cannot be saved fails the setup', async () => {
+    const { ops } = fakeRunner((c) => c.argv[0] === 'echo' ? { exitCode: 0, stdout: 'wv-cert-ok' }
+      : c.offer === 'plain' ? { exitCode: 255, stdout: '' } : { exitCode: 0, stdout: 'PASS a\n' });
+    const broken = { put() { throw new Error('read-only'); } } as unknown as import('../src/server-setup.js').SetupRecords;
+    const r = await runSetup(ops, o, 'S', broken);
+    expect(r.ok).toBe(false);
+    expect(r.lines[r.lines.length - 1]).toMatch(/could not save the setup record/);
+  });
+  it('F3: a huge report still fits the server limit once sealed', () => {
+    const many = Array.from({ length: 500 }, (_, i) => `NEW\tkey\topc\t${'a'.repeat(16)}\t${'c'.repeat(150)}${i}`);
+    const lines = parseReport(many.join('\n') + '\nEND\n')!;
+    expect(lines[lines.length - 1]).toMatch(/more not shown/);
+    const sealed = sealForOwner(KEY, 'x', { v: 1, request_id: 'r'.repeat(43), lines });
+    expect(sealed.ciphertext.length).toBeLessThan(16_384);
+    expect(fitLines(['a', 'b'])).toEqual(['a', 'b']);
   });
 });
 

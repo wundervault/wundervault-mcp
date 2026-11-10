@@ -51,7 +51,7 @@ import {
 } from './endpoint.js';
 import { loadOrCreateIdentity, logSignerFromIdentity, brokerPublicKeyObject } from './broker-key.js';
 import { startPolling, updateSpoolDir } from './broker-update.js';
-import { SetupRecords, bundledScript, runSetup, runRemoveOrAccept, runChangeCheck, sealForOwner, resultAad, checkAad } from './server-setup.js';
+import { SetupRecords, bundledScript, runSetup, runRemoveOrAccept, runChangeCheck, sealForOwner, resultAad, checkAad, fitLines } from './server-setup.js';
 import type { OrderClient } from './broker-update.js';
 import { load as loadNetworkShape } from './network-store.js';
 import { BrokerOps, type ActivitySink } from './broker-ops.js';
@@ -790,21 +790,31 @@ class AgentDaemon {
           }
           const passed = outcome.lines.filter((l) => l.startsWith('PASS ')).length;
           const counted = outcome.lines.filter((l) => /^(PASS|FAIL) /.test(l)).length;
+          // F2: the lines first, retried; a state is never posted as if the lines had arrived.
+          let delivered = false;
           try {
             const sealed = sealForOwner(await route.key(), resultAad(fingerprint, order.order_id),
-              { v: 1, order_id: order.order_id, type: order.type, ok: outcome.ok, lines: outcome.lines });
-            await route.result(order.order_id, sealed.ciphertext, sealed.nonce);
-          } catch { log('Server order result not delivered'); }
-          try {
-            await route.post(order.order_id, outcome.ok ? 'done' : 'failed', `${passed} of ${counted} passed`);
-          } catch { log('Server order state not delivered'); }
+              { v: 1, order_id: order.order_id, type: order.type, ok: outcome.ok, lines: fitLines(outcome.lines) });
+            for (const wait of [0, 2_000, 10_000, 30_000]) {
+              if (wait) await new Promise((r) => setTimeout(r, wait));
+              try { await route.result(order.order_id, sealed.ciphertext, sealed.nonce); delivered = true; break; } catch { /* again */ }
+            }
+          } catch { /* sealing failed: say so in the state */ }
+          if (!delivered) log('Server order result not delivered');
+          const detail = `${passed} of ${counted} passed${delivered ? '' : ' (details not delivered)'}`;
+          for (const wait of [0, 2_000, 10_000, 30_000]) {
+            if (wait) await new Promise((r) => setTimeout(r, wait));
+            try { await route.post(order.order_id, outcome.ok ? 'done' : 'failed', detail); break; } catch { log('Server order state not delivered'); }
+          }
           running.delete(order.order_id);
         })();
       },
       afterPoll: async () => {
         for (const route of routes()) {
           let due;
-          try { due = (await route.due()).due ?? []; } catch { continue; }
+          const mine = records.entries();
+          if (!mine.length) return;
+          try { due = (await route.due(mine)).due ?? []; } catch { continue; }
           for (const item of due) {
             const rec = records.get(item.entry_id);
             if (!rec || running.has(item.request_id)) continue;
