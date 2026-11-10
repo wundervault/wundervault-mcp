@@ -1363,6 +1363,9 @@ export class BrokerOps {
     return ended ? { open: false, ended_by: ended } : { open: false };
   }
 
+  /** Waits between early-end attempts (tests shorten them). */
+  static END_RETRY_MS = [3_000, 10_000, 30_000, 60_000];
+
   /** Sessions whose early server-side end was started (tests read this). */
   readonly endingRemote = new Set<string>();
 
@@ -1386,14 +1389,25 @@ export class BrokerOps {
     // now (whole-build review F1). At the natural end the server's own timer does it.
     if (endedBy && rec.endRemote && rec.adminUntil && Date.now() < Date.parse(rec.adminUntil) - 2000) {
       const ref = sessionRef(sessionId);
-      rec.endRemote().then(
-        (code) => this.record({ kind: 'ssh_closed', outcome: code === 0 ? 'closed' : 'refused', agent: this.agentName, entry_id: rec.entryId,
-          key: rec.key, address: `ssh://${rec.host}`, reason: 'Ended the server sessions early', tier: rec.tier,
-          extra: { session: ref, server_end: code === 0 ? 'done' : `failed (${code})` } }),
-        () => this.record({ kind: 'ssh_closed', outcome: 'refused', agent: this.agentName, entry_id: rec.entryId,
-          key: rec.key, address: `ssh://${rec.host}`, reason: 'Ended the server sessions early', tier: rec.tier,
-          extra: { session: ref, server_end: 'failed' } }),
-      );
+      const until = Date.parse(rec.adminUntil);
+      const endRemote = rec.endRemote;
+      const note = (ok: boolean, detail: string) => this.record({
+        kind: 'ssh_closed', outcome: ok ? 'closed' : 'refused', agent: this.agentName, entry_id: rec.entryId,
+        key: rec.key, address: `ssh://${rec.host}`, reason: 'Ended the server sessions early', tier: rec.tier,
+        extra: { session: ref, server_end: detail },
+      });
+      // Tried again until it works or the certificate's own end makes it moot (whole-build
+      // review r2 F3: a busy server refusing one sign-in must not leave the session running).
+      const attempt = (n: number): void => {
+        endRemote().then((code) => ({ code }), () => ({ code: -1 })).then(({ code }) => {
+          if (code === 0) { note(true, n ? `done (try ${n + 1})` : 'done'); return; }
+          const wait = BrokerOps.END_RETRY_MS[Math.min(n, BrokerOps.END_RETRY_MS.length - 1)]!;
+          if (Date.now() + wait >= until) { note(false, `failed (${code}); the server ends it at the certificate's end`); return; }
+          const t = setTimeout(() => attempt(n + 1), wait);
+          (t as unknown as { unref?: () => void }).unref?.();
+        });
+      };
+      attempt(0);
       this.endingRemote.add(ref);
       if (this.endingRemote.size > 64) this.endingRemote.delete(this.endingRemote.values().next().value as string);
     }

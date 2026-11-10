@@ -174,6 +174,20 @@ runIt('guided setup against a real sshd', () => {
     const other = await ops.sshAgentOpen({ entryId: 'entry-admin-1', purpose: 'other agent',
       op: { kind: 'ssh', destination: `opc@127.0.0.1:${PORT}`, remoteArgv: ['true'] } as never });
     if ('error' in other) throw new Error(other.error);
+    // A connection held open with no command yet (ControlMaster), to start commands after End now.
+    const cp = path.join(base, 'cm-end');
+    const sshBase = ['-F', '/dev/null', '-o', `IdentityFile=${o.public_key_path}`, '-o', 'IdentitiesOnly=yes', '-o', `IdentityAgent=${o.socket_path}`,
+      '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', `UserKnownHostsFile=${o.known_hosts_path}`, '-p', String(PORT)];
+    await new Promise<void>((resolve, reject) => {
+      const c = spawn('ssh', [...sshBase, '-o', 'ControlMaster=yes', '-o', `ControlPath=${cp}`, '-o', 'ControlPersist=60', '-fN', 'opc@127.0.0.1'], { stdio: 'ignore' });
+      c.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`master exit ${code}`))));
+    });
+    const viaMaster = (cmd: string) => new Promise<string>((res) => {
+      const c = spawn('ssh', [...sshBase, '-o', `ControlPath=${cp}`, 'opc@127.0.0.1', cmd], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let b = ''; c.stdout.on('data', (d) => { b += d; }); c.stderr.on('data', (d) => { b += d; });
+      c.on('close', () => res(b));
+    });
+    expect(await viaMaster('echo master-ok')).toContain('master-ok');
     const a = own('echo in-$(id -un); sleep 120', o.socket_path, o.public_key_path, o.known_hosts_path!);
     const b = own('echo in2; sleep 120', o.socket_path, o.public_key_path, o.known_hosts_path!);
     const keep = own('echo kept; sleep 25; echo still-here', other.socket_path, other.public_key_path, other.known_hosts_path!);
@@ -186,6 +200,11 @@ runIt('guided setup against a real sshd', () => {
     expect(rb.out).toContain('in2');
     expect(ra.at - flip).toBeLessThan(8_000);
     expect(rb.at - flip).toBeLessThan(8_000);
+    // r2 F1: the held-open connection cannot start a command after End now.
+    const after = await viaMaster('echo SHOULD-NOT-RUN');
+    expect(after).not.toContain('SHOULD-NOT-RUN');
+    expect(after).toContain('admin access was ended');
+    try { execFileSync('ssh', [...sshBase, '-o', `ControlPath=${cp}`, '-O', 'exit', 'opc@127.0.0.1'], { stdio: 'ignore' }); } catch { /* gone */ }
     const rk = await keep;
     expect(rk.out).toContain('still-here');           // the other session was not touched
     ops.closeSsh(other.session_id);

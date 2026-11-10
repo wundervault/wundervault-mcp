@@ -142,6 +142,20 @@ describe.skipIf(!supported)('admin-key.sh', () => {
     });
   });
 
+  it('refuses when a folder above the session check is writable by others (r2 F2)', () => {
+    withFixture((fixture) => {
+      const open = join(fixture.dir, 'open');
+      mkdirSync(open, { mode: 0o777 });
+      execFileSync('chmod', ['0777', open]);
+      const env = { ...fixture.env, WV_ADMIN_LIB_DIR: join(open, 'lib') };
+      const r = spawnSync('sh', [script, ...withPublic([])], { env, encoding: 'utf8' });
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain('can be changed by someone other than root');
+      expect(existsSync(fixture.keysFile)).toBe(false);
+      expect(existsSync(join(open, 'lib'))).toBe(false);
+    });
+  });
+
   it('leaves no private key directory or file in TMPDIR after adding', () => {
     withFixture((fixture) => {
       run(fixture);

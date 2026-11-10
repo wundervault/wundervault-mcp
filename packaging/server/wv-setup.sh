@@ -39,8 +39,26 @@ home_of() { getent passwd "$1" | cut -d: -f6; }
 
 step=${1:-}; shift || true
 
+# Every folder above the programs must be root's and closed to others, or a non-root user could
+# swap the folder out and have root run their copy (whole-build review r2 F2).
+safe_ancestors() {
+  _d=$1; _want=${2:-0}
+  while :; do
+    if [ -e "$_d" ] || [ -L "$_d" ]; then
+      [ -L "$_d" ] && return 1
+      _m=$(ls -ldn "$_d" | awk '{print $1}'); _o=$(ls -ldn "$_d" | awk '{print $3}')
+      [ "$_o" = 0 ] || [ "$_o" = "$_want" ] || return 1
+      # Writable by others only with the sticky bit (like /tmp): then no one else can rename
+      # what is inside it.
+      case $_m in ?????????[tT]*) ;; ?????w*|????????w*) return 1;; esac
+    fi
+    [ "$_d" = / ] && return 0
+    _d=$(dirname "$_d")
+  done
+}
 # The two server-side programs are embedded below, so the helper sends one fixed file.
 install_programs() {
+  safe_ancestors "$(dirname "$LIB")" || die "a folder above $LIB can be changed by someone other than root; refusing"
   install -d -o root -g root -m 755 "$LIB"
   install -d -o root -g root -m 700 "$STATE"
   cat > "$LIB/wv-admin-session.new" <<'WVSESSION'

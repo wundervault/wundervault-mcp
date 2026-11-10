@@ -39,8 +39,26 @@ home_of() { getent passwd "$1" | cut -d: -f6; }
 
 step=${1:-}; shift || true
 
+# Every folder above the programs must be root's and closed to others, or a non-root user could
+# swap the folder out and have root run their copy (whole-build review r2 F2).
+safe_ancestors() {
+  _d=$1; _want=${2:-0}
+  while :; do
+    if [ -e "$_d" ] || [ -L "$_d" ]; then
+      [ -L "$_d" ] && return 1
+      _m=$(ls -ldn "$_d" | awk '{print $1}'); _o=$(ls -ldn "$_d" | awk '{print $3}')
+      [ "$_o" = 0 ] || [ "$_o" = "$_want" ] || return 1
+      # Writable by others only with the sticky bit (like /tmp): then no one else can rename
+      # what is inside it.
+      case $_m in ?????????[tT]*) ;; ?????w*|????????w*) return 1;; esac
+    fi
+    [ "$_d" = / ] && return 0
+    _d=$(dirname "$_d")
+  done
+}
 # The two server-side programs are embedded below, so the helper sends one fixed file.
 install_programs() {
+  safe_ancestors "$(dirname "$LIB")" || die "a folder above $LIB can be changed by someone other than root; refusing"
   install -d -o root -g root -m 755 "$LIB"
   install -d -o root -g root -m 700 "$STATE"
   cat > "$LIB/wv-admin-session.new" <<'WVSESSION'
@@ -64,10 +82,18 @@ install_programs() {
 # The everyday account and the emergency key do not pass through here.
 set -u
 tag_ok() { case ${1:-} in ''|*[!0-9a-f]*) return 1;; esac; [ ${#1} -le 32 ]; }
+# Tags ended early. A connection the agent already holds open (an ssh ControlMaster with no
+# command yet) starts every later command through this script, which refuses a marked tag
+# (whole-build review r2 F1). Kept for two hours: a certificate lives at most one.
+ENDED=${HOME:-/tmp}/.wundervault-ended
 
 if [ "${1:-}" = end-now ]; then
   tag_ok "${2:-}" || { echo "wundervault: no session to end." >&2; exit 2; }
-  # The timers of that tag end their sessions on this signal (same account, so allowed).
+  mkdir -p "$ENDED" 2>/dev/null; chmod 700 "$ENDED" 2>/dev/null
+  : > "$ENDED/$2" || { echo "wundervault: could not record the end." >&2; exit 1; }
+  find "$ENDED" -type f -mmin +120 -exec rm -f {} + 2>/dev/null
+  # The timers of that tag end their sessions on this signal (same account, so allowed);
+  # each timer also sees the mark within a second if the signal is missed.
   pkill -USR1 -f "wv-cutoff-$2 " 2>/dev/null
   echo "ended"
   exit 0
@@ -77,6 +103,10 @@ end=${1:-}
 case $end in ''|*[!0-9]*) echo "wundervault: admin access has no valid end time; refused." >&2; exit 126;; esac
 tag=${2:-none}
 tag_ok "$tag" || tag=none
+if [ "$tag" != none ] && [ -e "$ENDED/$tag" ]; then
+  echo "wundervault: admin access was ended; ask your owner to allow it again." >&2
+  exit 126
+fi
 now=$(date +%s)
 left=$((end - now))
 if [ "$left" -le 0 ]; then
@@ -101,7 +131,7 @@ fi
 # kills the rest.
 # shellcheck disable=SC2016
 sh -c '
-  end=$1; sid=$2; root=$3; f=$4
+  end=$1; sid=$2; root=$3; f=$4; mark=$5
   [ -n "$f" ] && trap "rm -f \"$f\"" EXIT
   kill_all() {
     if [ -n "$sid" ]; then pkill -KILL -s "$sid"; return; fi
@@ -116,6 +146,7 @@ sh -c '
   }
   trap "kill_all; exit 0" USR1
   while [ "$(date +%s)" -lt "$end" ]; do
+    if [ -n "$mark" ] && [ -e "$mark" ]; then kill_all; exit 0; fi
     if [ -n "$sid" ]; then
       # A failed write (a full disk) is not "empty": keep watching and cut off at the end.
       if pgrep -s "$sid" > "$f" 2>/dev/null && [ -s "$f" ]; then grep -qvx "$$" "$f" || exit 0; fi
@@ -125,7 +156,7 @@ sh -c '
     sleep 1
   done
   kill_all
-' "wv-cutoff-$tag " "$end" "$sid" "$$" "$f" </dev/null >/dev/null 2>&1 &
+' "wv-cutoff-$tag " "$end" "$sid" "$$" "$f" "$( [ "$tag" != none ] && echo "$ENDED/$tag" )" </dev/null >/dev/null 2>&1 &
 if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
   exec "${SHELL:-/bin/sh}" -c "$SSH_ORIGINAL_COMMAND"
 fi
