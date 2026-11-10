@@ -147,7 +147,8 @@ export function createServer(args: { url?: string } = {}) {
         description: (
           'Call this when you have finished the task your owner gave you. It tells the vault you are done, '
           + 'which (by your owner\'s setting) ends the time-limited approvals they gave you, so nothing stays '
-          + 'open after the work. It can only end approvals, never extend them. Takes no arguments.'
+          + 'open after the work, including admin access and any SSH connection it opened. It can only end '
+          + 'approvals, never extend them. Takes no arguments.'
         ),
         inputSchema: { type: 'object', properties: {} },
       },
@@ -307,6 +308,11 @@ export function createServer(args: { url?: string } = {}) {
         description: (
           'Run a command on a remote host, or rsync files to it, using a vaulted SSH key '
           + 'that is never written to disk and never returned to you.\n\n'
+          + 'Admin keys: a server can have an everyday key (use it by default: reading code, health, logs) '
+          + 'and an admin key (for changes: deploys, settings, containers). The admin key works only while '
+          + 'your owner has allowed admin access (5, 15 or 60 minutes); without it you get '
+          + 'ADMIN_ACCESS_REQUIRED and your owner is asked. The connection is closed when admin access ends. '
+          + 'Call vault_done when you have finished.\n\n'
           + 'The key stays inside the broker, which answers signature requests over a private '
           + 'ssh-agent socket that exists only for the duration of this call. You choose the '
           + 'remote command; you do not get the key.\n\n'
@@ -368,7 +374,8 @@ export function createServer(args: { url?: string } = {}) {
         const text = data.setting === 'keep'
           ? 'Noted. Your owner keeps approvals until their timers run out, so nothing was ended.'
           : `Done. ${n} approval${n === 1 ? '' : 's'} the owner gave you ${n === 1 ? 'was' : 'were'} ended; `
-            + 'the next use of an "ask me first" secret will ask again.';
+            + 'the next use of an "ask me first" secret will ask again.'
+            + (Number(data.ssh_closed ?? 0) > 0 ? ` ${Number(data.ssh_closed)} open SSH connection(s) were closed.` : '');
         return CallToolResultSchema.parse({ content: [{ type: 'text', text }] });
       }
 
@@ -386,7 +393,9 @@ export function createServer(args: { url?: string } = {}) {
             : e.entry_mode === 'BROKER_SIGN' ? 'signing key → vault_sign'
             : 'not usable until the owner sets how it is used';
           const ops = e.operations?.length ? `; operations: ${e.operations.join(', ')}` : '';
-          lines.push(`  [${e.id}]  ${e.secret_name}  (tier: ${e.access_tier ?? 'read'}; ${use}${ops})`);
+          const admin = (e as { admin_access?: boolean }).admin_access === true
+            ? '; ADMIN key: needs admin access, which your owner allows for 5-60 minutes; use an everyday key for anything that only reads' : '';
+          lines.push(`  [${e.id}]  ${e.secret_name}  (tier: ${e.access_tier ?? 'read'}; ${use}${ops}${admin})`);
         }
         return CallToolResultSchema.parse({ content: [{ type: 'text', text: lines.join('\n') }] });
       }

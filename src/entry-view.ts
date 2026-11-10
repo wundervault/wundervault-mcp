@@ -155,6 +155,7 @@ export async function resolveEntry<T extends EntryResponse>(
       // reads `operations` as an array of ids (server.ts list rendering) — and carries no setup.
       const listed: Record<string, unknown> = {
         id: entryId, secret_name: setup.name, access_tier: resp.access_tier, entry_mode: view.entry_mode,
+        ...(resp.admin_access === true ? { admin_access: true } : {}),
       };
       if (nonEmptyObject(setup.operations)) listed.operations = Object.keys(setup.operations);
       return { ok: true, entry: listed as unknown as T };
