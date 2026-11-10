@@ -842,11 +842,22 @@ export async function runSshWithAgent(opts: {
   // kept asynchronous now that the broker hosts it too, because the child still has to
   // be able to talk while we wait.
   return await new Promise((resolve) => {
+    // Its own process group, so stopping it also stops what it started: rsync runs ssh as a
+    // child, and killing rsync alone left that authenticated ssh connection running (helper
+    // review round 1, F4).
+    const group = process.platform !== 'win32';
     const child = spawn(argv[0], argv.slice(1), {
       shell: false,
       cwd,
       env: { ...process.env, SSH_AUTH_SOCK: socketPath },
+      detached: group,
     });
+    const killAll = () => {
+      try {
+        if (group && child.pid) process.kill(-child.pid, 'SIGKILL');
+        else child.kill('SIGKILL');
+      } catch { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
+    };
 
     // Bounded. A chatty or hostile remote could otherwise grow these strings for the
     // whole timeout window; truncation is visible rather than silent.
@@ -870,12 +881,12 @@ export async function runSshWithAgent(opts: {
     };
 
     const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      killAll();
       finish(124, `\nCommand timed out after ${Math.round(timeoutMs / 1000)}s.`);
     }, timeoutMs);
 
     const onAbort = () => {
-      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      killAll();
       finish(125, `\n${String(signal?.reason ?? 'Stopped.')}`);
     };
     if (signal?.aborted) onAbort();

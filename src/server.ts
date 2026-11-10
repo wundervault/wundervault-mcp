@@ -67,20 +67,31 @@ export const ADMIN_ENDED = 'Admin access ended, so the connection was closed. As
  * still open; when it is not (End now, done, the time is up), abort, which kills the command
  * and its connection. A plain session gets a no-op watcher.
  */
+export const SESSION_CLOSED = 'The helper app closed this connection (you said you were done, or the owner ended it).';
+
+/**
+ * While an SSH/git command runs, ask the helper app every 3 s whether its signing session is
+ * still open, and stop the command when it is not (vault_done with "end", End now, the time is
+ * up). An admin session also stops at admin_until even if the helper can't be reached.
+ * Every session is watched, not only admin ones: vault_done closes them all, and a command left
+ * running would make "closed" untrue (helper review round 1, F2). The helper is local, so a
+ * poll is cheap.
+ */
 export function watchAdminSession(
   broker: { send(op: string, payload?: Record<string, unknown>): Promise<Record<string, unknown>> },
   opened: Record<string, unknown>, sessionId: string, everyMs = 3_000,
-): { signal?: AbortSignal; stop(): void } {
-  if (typeof opened.admin_until !== 'string') return { stop() { /* not an admin session */ } };
+): { signal: AbortSignal; stop(): void } {
   const ac = new AbortController();
-  const until = Date.parse(opened.admin_until);
-  const end = setTimeout(() => ac.abort(ADMIN_ENDED), Math.max(1, until - Date.now()));
+  const admin = typeof opened.admin_until === 'string';
+  const until = admin ? Date.parse(opened.admin_until as string) : NaN;
+  const end = Number.isFinite(until) ? setTimeout(() => ac.abort(ADMIN_ENDED), Math.max(1, until - Date.now())) : undefined;
   const poll = setInterval(() => {
     broker.send('ssh_agent_status', { session_id: sessionId }).then((st) => {
-      if (st && st.open === false) ac.abort(ADMIN_ENDED);
-    }, () => { /* the end timer still bounds it */ });
+      if (st && st.open === false) ac.abort(admin ? ADMIN_ENDED : SESSION_CLOSED);
+    }, () => { /* an admin session is still bounded by its end timer */ });
   }, everyMs);
-  return { signal: ac.signal, stop() { clearTimeout(end); clearInterval(poll); } };
+  (poll as unknown as { unref?: () => void }).unref?.();
+  return { signal: ac.signal, stop() { if (end) clearTimeout(end); clearInterval(poll); } };
 }
 
 function mockToolResult(name: string, args: Record<string, any>) {

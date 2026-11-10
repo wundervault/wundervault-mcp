@@ -8,6 +8,7 @@ import path from 'node:path';
 import { BrokerOps } from '../src/broker-ops.js';
 import { ADMIN_ACCESS_REQUIRED, adminAccessRequiredMessage } from '../src/api-client.js';
 import { watchAdminSession, adminTimeoutMs, ADMIN_ENDED } from '../src/server.js';
+import { runSshWithAgent } from '../src/ssh-agent.js';
 
 /**
  * Admin access (site SPEC-admin-access-2026-11-10), helper half: a signing session for an
@@ -201,23 +202,63 @@ describe('the agent process stops an admin command when access ends', () => {
     let open = true;
     const w = watchAdminSession({ send: async () => ({ open }) }, { admin_until: inMs(60_000) }, 's', 20);
     await sleep(60);
-    expect(w.signal!.aborted).toBe(false);
+    expect(w.signal.aborted).toBe(false);
     open = false;
     await sleep(60);
-    expect(w.signal!.aborted).toBe(true);
-    expect(w.signal!.reason).toBe(ADMIN_ENDED);
+    expect(w.signal.aborted).toBe(true);
+    expect(w.signal.reason).toBe(ADMIN_ENDED);
     w.stop();
   });
 
   it('aborts at admin_until even if the helper cannot be reached', async () => {
     const w = watchAdminSession({ send: async () => { throw new Error('gone'); } }, { admin_until: inMs(100) }, 's', 20);
     await sleep(160);
-    expect(w.signal!.aborted).toBe(true);
+    expect(w.signal.aborted).toBe(true);
     w.stop();
   });
 
-  it('does nothing for a plain session, and caps the timeout only for admin', () => {
-    expect(watchAdminSession({ send: async () => ({}) }, {}, 's').signal).toBeUndefined();
+  it('watches a plain session too: done/End now stops its command (review F2)', async () => {
+    let open = true;
+    const w = watchAdminSession({ send: async () => ({ open }) }, {}, 's', 20);
+    await sleep(60);
+    expect(w.signal.aborted).toBe(false);
+    open = false;
+    await sleep(60);
+    expect(w.signal.aborted).toBe(true);
+    expect(String(w.signal.reason)).toContain('closed this connection');
+    w.stop();
+  });
+
+  it('stopping a command kills what it started, not just the command (review F4)', async () => {
+    // A stand-in "ssh" that starts a child of its own, as rsync starts ssh.
+    const bin = path.join(base, 'bin');
+    fs.mkdirSync(bin);
+    const pidFile = path.join(base, 'grandchild.pid');
+    fs.writeFileSync(path.join(bin, 'ssh'), `#!/bin/sh\nsleep 30 &\necho $! > ${pidFile}\nwait\n`, { mode: 0o755 });
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${bin}:${savedPath}`;
+    try {
+      const ac = new AbortController();
+      const run = runSshWithAgent({
+        op: { kind: 'ssh', destination: 'u@h', remoteArgv: ['true'] }, socketPath: '/nonexistent',
+        publicKeyPath: '/nonexistent', timeoutMs: 20_000, signal: ac.signal,
+      });
+      const t0 = Date.now();
+      while (!fs.existsSync(pidFile) && Date.now() - t0 < 5000) await sleep(20);
+      const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+      ac.abort(ADMIN_ENDED);
+      const r = await run;
+      expect(r.exitCode).toBe(125);
+      await sleep(100);
+      let alive = true;
+      try { process.kill(pid, 0); } catch { alive = false; }
+      expect(alive).toBe(false);
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+
+  it('caps the timeout only for admin', () => {
     expect(adminTimeoutMs({}, 120_000)).toBe(120_000);
     const t = adminTimeoutMs({ admin_until: inMs(5_000) }, 120_000);
     expect(t).toBeGreaterThan(4_000);
