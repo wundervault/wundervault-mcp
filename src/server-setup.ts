@@ -277,6 +277,11 @@ export function parseReport(out: string): string[] | null {
   return fitLines(lines.filter((l) => /^(NEW|GONE)\t/.test(l) || l.startsWith('NO-BASELINE')).map((l) => l.slice(0, 200)));
 }
 
+/** The admin sign-in of a set-up server ("opc@host[:port]"): the report names its own server (round 2 F2). */
+export function adminDestination(rec: SetupRecord): string {
+  return rec.admin_user + rec.everyday_destination.slice(rec.everyday_destination.indexOf('@'));
+}
+
 /** D14: run the read-only report with the everyday key. */
 export async function runChangeCheck(ops: ServerRunner, rec: SetupRecord):
   Promise<{ ok: true; changed: boolean; lines: string[] } | { ok: false; error: string }> {

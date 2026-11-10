@@ -51,7 +51,7 @@ import {
 } from './endpoint.js';
 import { loadOrCreateIdentity, logSignerFromIdentity, brokerPublicKeyObject } from './broker-key.js';
 import { startPolling, updateSpoolDir } from './broker-update.js';
-import { SetupRecords, bundledScript, runSetup, runRemoveOrAccept, runChangeCheck, sealForOwner, resultAad, checkAad, fitLines } from './server-setup.js';
+import { SetupRecords, bundledScript, runSetup, runRemoveOrAccept, runChangeCheck, sealForOwner, resultAad, checkAad, fitLines, adminDestination } from './server-setup.js';
 import type { OrderClient } from './broker-update.js';
 import { load as loadNetworkShape } from './network-store.js';
 import { BrokerOps, type ActivitySink } from './broker-ops.js';
@@ -830,7 +830,7 @@ class AgentDaemon {
                 changed = true; lines = [`FAIL the change check could not run: ${r.error}`];
               }
               const sealed = sealForOwner(await route.key(), checkAad(item.request_id),
-                { v: 1, request_id: item.request_id, lines });
+                { v: 1, request_id: item.request_id, destination: adminDestination(rec), lines });
               await route.check(item.request_id, changed, sealed.ciphertext, sealed.nonce);
               checkFailures.delete(item.request_id);
             } catch { log('Change check not delivered'); } finally { running.delete(item.request_id); }
