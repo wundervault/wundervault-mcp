@@ -16,7 +16,7 @@ import path from 'node:path';
 import tls from 'node:tls';
 import { execFileSync } from 'node:child_process';
 import { BrokerOps } from '../src/broker-ops.js';
-import { BUILTIN_RECIPES, NewKeyRecipes, recipeProblem, readNewKey, type NewKeyRecipe } from '../src/new-key.js';
+import { BUILTIN_RECIPES, NewKeyRecipes, NewKeyOutbox, recipeProblem, readNewKey, carriesKey, type NewKeyRecipe } from '../src/new-key.js';
 
 type CallResult = Awaited<ReturnType<BrokerOps['call']>>;
 
@@ -158,7 +158,8 @@ beforeAll(async () => {
     req.on('data', (c: Buffer) => chunks.push(c));
     req.on('end', () => {
       wire.push({ method: req.method ?? '', url: req.url ?? '/', body: Buffer.concat(chunks).toString('utf8') });
-      const a = serviceAnswer();
+      let a: ReturnType<typeof serviceAnswer>;
+      try { a = serviceAnswer(); } catch { req.socket.destroy(); return; }   // took the request, then dropped the line
       sendJson(res, a.raw ?? a.body, a.status);
     });
   });
@@ -191,11 +192,12 @@ beforeAll(async () => {
         if (req.method === 'DELETE') { const had = incoming.delete(id); return sendJson(res, { removed: had }); }
         if (req.method === 'PUT') {
           if (deliverFails > 0) { deliverFails--; return sendJson(res, { detail: 'boom' }, 500); }
-          const row = incoming.get(id);
+          const blob = JSON.parse(raw) as { ciphertext: string; nonce: string; name_mac?: string };
+          let row = incoming.get(id);
+          if (!row && blob.name_mac) { row = { name_mac: blob.name_mac }; incoming.set(id, row); }   // a late delivery
           if (!row) return sendJson(res, { detail: 'No such reservation.' }, 404);
-          const blob = JSON.parse(raw) as { ciphertext: string; nonce: string };
           if (row.blob && row.blob.ciphertext !== blob.ciphertext) return sendJson(res, { detail: 'filled' }, 409);
-          row.blob = blob;
+          row.blob = { ciphertext: blob.ciphertext, nonce: blob.nonce };
           return sendJson(res, { id, state: 'waiting' });
         }
       }
@@ -422,6 +424,96 @@ describe('vault_new_key', () => {
     expect((r as { body: object }).body).toEqual({ new_key: 'waiting for the owner', id: 'tok_1' });
     expect(JSON.stringify(r)).not.toContain(ADMIN);
     expectNowhere(r);
+  });
+});
+
+describe('review round 1', () => {
+  it.each([
+    ['lower-case percent escapes', 'abc%2fdef%2bghi%3d%3d'],
+    ['mixed-case escapes', 'abc%2Fdef%2bghi%3D%3d'],
+    ['every byte escaped', [...Buffer.from('abc/def+ghi==')].map((x) => `%${x.toString(16)}`).join('')],
+    ['only part escaped', 'abc/def%2Bghi=='],
+    ['double escaped', 'abc%252Fdef%252Bghi%253D%253D'],
+    ['form encoding of a key with a space', null],
+    ['upper-case hex', Buffer.from('abc/def+ghi==').toString('hex').toUpperCase()],
+    ['inside other text', 'key=abc%2fdef%2bghi%3d%3d&x=1'],
+  ])('F1: a key echoed with %s in an allow-listed field does not reach the agent', async (_n, echo) => {
+    const key = echo === null ? 'abc def+ghi/123' : 'abc/def+ghi==';
+    const e = adminEntry();
+    serviceAnswer = () => ({ status: 200, body: { id: 'k1', name: echo === null ? 'abc+def%2Bghi%2F123' : echo, token: key } });
+    const r = await newKey(e.id);
+    expect((r as { body: object }).body).toEqual({ new_key: 'waiting for the owner', id: 'k1' });
+    expect(opened([...incoming.keys()][0]).value).toBe(key);
+  });
+
+  it('F2: a key made of digits that equals a numeric id: saved, the id is dropped, nothing throws', async () => {
+    const e = adminEntry();
+    serviceAnswer = () => ({ status: 200, body: { id: 12345678, name: 'n', token: '12345678' } });
+    const r = await newKey(e.id);
+    expect((r as { body: object }).body).toEqual({ new_key: 'waiting for the owner', name: 'n' });
+    expect(opened([...incoming.keys()][0]).value).toBe('12345678');
+    expect(fs.existsSync(path.join(dir, 'outbox')) ? fs.readdirSync(path.join(dir, 'outbox')) : []).toEqual([]);
+  });
+
+  it('F2: a name that IS the key is not quoted back in the notice', async () => {
+    const e = adminEntry();
+    const r = await newKey(e.id, {}, NEW) as { notice: string };
+    expect(r.notice).toContain('the name you gave');
+    expect(JSON.stringify(r)).not.toContain(NEW);
+  });
+
+  it('F3: the service takes the request and drops the connection: "not known", never "no key was made"', async () => {
+    const e = adminEntry();
+    serviceAnswer = () => { throw new Error('drop'); };
+    const r = await newKey(e.id) as { error: string; code?: string };
+    expect(wire).toHaveLength(1);                       // it WAS sent
+    expect(r.code).toBe('NEW_KEY_UNKNOWN');
+    expect(r.error).toContain('NOT KNOWN');
+    expect(r.error).not.toMatch(/No key was made/);
+    expect(incoming.size).toBe(0);
+  }, 90_000);
+
+  it('F3: a 500 is "not known"; a 4xx is "no key was made"', async () => {
+    const e = adminEntry();
+    serviceAnswer = () => ({ status: 500, body: { token: NEW } });
+    expect(((await newKey(e.id)) as { code?: string }).code).toBe('NEW_KEY_UNKNOWN');
+    serviceAnswer = () => ({ status: 422, body: { token: NEW } });
+    const r = await newKey(e.id) as { error: string; code?: string };
+    expect(r.code).toBe('NEW_KEY_FAILED');
+    expect(r.error).toContain('No key was made');
+    expectNowhere(r);
+  });
+
+  it('B3: a complete file left before its rename is taken up; a half-written one is left alone', () => {
+    const d = path.join(dir, 'outbox-b3');
+    fs.mkdirSync(d, { recursive: true });
+    const id = crypto.randomBytes(16).toString('hex'), id2 = crypto.randomBytes(16).toString('hex');
+    fs.writeFileSync(path.join(d, `${id}.json.tmp`), JSON.stringify({ id, agent_id: 'a1', ciphertext: 'x', nonce: 'y', made_at: 'now' }));
+    fs.writeFileSync(path.join(d, `${id2}.json.tmp`), '{"id":"' + id2 + '","agent_id":"a1","cipher');
+    const got = new NewKeyOutbox(d).list('a1');
+    expect(got.map((g) => g.id)).toEqual([id]);
+    expect(fs.readdirSync(d).sort()).toEqual([`${id}.json`, `${id2}.json.tmp`].sort());
+    fs.rmSync(d, { recursive: true, force: true });
+  });
+
+  it('late delivery: the slot lapsed while the vault was down; the kept key still lands, with its name tag', async () => {
+    const e = adminEntry();
+    deliverFails = 99;
+    await newKey(e.id);
+    const slot = fs.readdirSync(path.join(dir, 'outbox'))[0].replace('.json', '');
+    incoming.delete(slot);                                  // the server swept the unfilled slot
+    deliverFails = 0;
+    serviceAnswer = () => ({ status: 201, body: { id: 'key_2', token: 're_SECOND_KEY_0011223344' } });
+    await newKey(e.id, {}, 'Second');
+    expect(fs.readdirSync(path.join(dir, 'outbox'))).toEqual([]);
+    expect(opened(slot).value).toBe(NEW);
+    expect(incoming.get(slot)!.name_mac).toBe(incomingNameMac(vaultKey, agentId, 'Resend sending key'));
+  }, 30_000);
+
+  it('carriesKey: plain neighbours are not mistaken for the key', () => {
+    expect(carriesKey('key_123', 're_abcdef123456')).toBe(false);
+    expect(carriesKey('2026-11-11T10:00:00Z', 're_abcdef123456')).toBe(false);
+    expect(carriesKey('x re_abcdef123456 y', 're_abcdef123456')).toBe(true);
   });
 });
 

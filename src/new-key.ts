@@ -211,11 +211,39 @@ function dig(body: unknown, p: string[]): unknown {
 /** The spellings of the new key that must never reach the agent. Longest first. */
 export function newKeyForms(value: string): string[] {
   const b = Buffer.from(value, 'utf8');
+  const every = [...b].map((x) => `%${x.toString(16).padStart(2, '0').toUpperCase()}`).join('');
+  const lowerEscapes = (s: string) => s.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
   const forms = new Set<string>([
-    value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1),
-    b.toString('base64'), b.toString('base64').replace(/=+$/, ''), b.toString('base64url'), b.toString('hex'),
+    value, JSON.stringify(value).slice(1, -1),
+    // Percent-encoded: as a browser writes it, with lower-case escapes, and with every byte escaped.
+    encodeURIComponent(value), lowerEscapes(encodeURIComponent(value)), every, every.toLowerCase(),
+    b.toString('base64'), b.toString('base64').replace(/=+$/, ''), b.toString('base64url'),
+    b.toString('hex'), b.toString('hex').toUpperCase(),
   ]);
   return [...forms].filter((f) => f.length >= 4).sort((a, c) => c.length - a.length);
+}
+
+/** Percent-decoding that never throws: what a reader could turn the text back into. */
+function decoded(text: string): string {
+  let out = text;
+  for (let i = 0; i < 2; i++) {
+    const next = out.replace(/(?:%[0-9a-fA-F]{2})+/g, (m) => { try { return decodeURIComponent(m); } catch { return m; } });
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
+/**
+ * Does this text carry the key in any spelling we know? Checked as written, percent-decoded
+ * (so a mixed-case or partly escaped copy is caught: review r1 F1), and without regard to case
+ * for the hex and percent spellings.
+ */
+export function carriesKey(text: string, value: string, forms: readonly string[] = newKeyForms(value)): boolean {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  if (decoded(text).includes(value) || decoded(text.replace(/\+/g, ' ')).includes(value)) return true;
+  return forms.some((f) => text.includes(f) || (/^(?:%[0-9a-f]{2})+$|^[0-9a-f]+$/i.test(f) && lower.includes(f.toLowerCase())));
 }
 
 export function cutForms(text: string, forms: readonly string[]): string {
@@ -237,13 +265,11 @@ export function readNewKey(recipe: NewKeyRecipe, body: unknown):
   const info: Record<string, string | number | boolean> = {};
   for (const [name, p] of Object.entries(recipe.info)) {
     const v = dig(body, p);
-    if (typeof v === 'number' && Number.isFinite(v)) info[name] = v;
+    // A field that carries the key (in any spelling) is dropped whole, never patched: a number
+    // too (a key made of digits could equal an id; review r1 F2).
+    if (typeof v === 'number' && Number.isFinite(v)) { if (!carriesKey(String(v), value, forms)) info[name] = v; }
     else if (typeof v === 'boolean') info[name] = v;
-    else if (typeof v === 'string' && v.length <= 200) {
-      const cut = cutForms(v, forms);
-      // A field that carried the key (or any spelling of it) is dropped whole, not patched.
-      if (cut === v) info[name] = v;
-    }
+    else if (typeof v === 'string' && v.length <= 200 && !carriesKey(v, value, forms)) info[name] = v;
   }
   return { ok: true, value, info };
 }
@@ -253,6 +279,8 @@ export function readNewKey(recipe: NewKeyRecipe, body: unknown):
 export interface OutboxItem {
   id: string;
   agent_id: string;
+  /** So the vault can take the key even after its slot lapsed. */
+  name_mac?: string;
   /** Already locked with the agent's vault key: this file holds no readable secret. */
   ciphertext: string;
   nonce: string;
@@ -287,6 +315,16 @@ export class NewKeyOutbox {
 
   list(agentId: string): OutboxItem[] {
     let names: string[];
+    try { names = fs.readdirSync(this.dir); } catch { return []; }
+    // A helper stopped between writing a file and giving it its name: a complete one is the only
+    // copy of a made key, so it is taken up (review r1 B3); a half-written one cannot be read.
+    for (const n of names) {
+      if (!n.endsWith('.json.tmp') || !ITEM_ID.test(n.slice(0, -9)) || names.includes(n.slice(0, -4))) continue;
+      try {
+        const j = JSON.parse(fs.readFileSync(path.join(this.dir, n), 'utf8')) as OutboxItem;
+        if (j && j.id === n.slice(0, -9) && typeof j.ciphertext === 'string') fs.renameSync(path.join(this.dir, n), path.join(this.dir, n.slice(0, -4)));
+      } catch { /* half-written */ }
+    }
     try { names = fs.readdirSync(this.dir); } catch { return []; }
     const out: OutboxItem[] = [];
     for (const n of names.sort()) {

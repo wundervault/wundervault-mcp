@@ -261,7 +261,7 @@ export class AgentVaultAPI {
   }
 
   /** The locked new key, once. The same delivery again is answered the same way. */
-  async deliverIncoming(id: string, blob: { ciphertext: string; nonce: string }): Promise<{ id: string; state: string }> {
+  async deliverIncoming(id: string, blob: { ciphertext: string; nonce: string; name_mac?: string }): Promise<{ id: string; state: string }> {
     return this.sendJson('PUT', `/agent/vault/incoming/${encodeURIComponent(id)}`, blob);
   }
 

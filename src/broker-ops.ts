@@ -79,7 +79,7 @@ import type { VaultEntry } from './types.js';
 import { BEARER, bindingFromExecConfig, looksLikePrivateKey, secretForms, validateAgentHeaders, pathBindingProblem } from './delivery.js';
 import { checkAgentHeaders, oauth1FromParts, readValue, scrub as scrubParts, secretFormsAll, validateBindingV2, type BindingV2, type Shape } from './parts.js';
 import { SetupPins, sealT2Detail, t2MatchMac, t2OriginMac, newRequestId, sealIncoming, incomingNameMac } from './setup-seal.js';
-import { NewKeyRecipes, NewKeyOutbox, readNewKey, newKeyForms, cutForms, type NewKeyRecipe } from './new-key.js';
+import { NewKeyRecipes, NewKeyOutbox, readNewKey, newKeyForms, carriesKey, type NewKeyRecipe } from './new-key.js';
 import { renderDetail } from './render.js';
 import { SigningState, readPolicy } from './wallet.js';
 import { normalizeOrigin, validateSendAs, placementRecipe, placementSha, describePlacement, isAskBinding, type SendAs } from './placement.js';
@@ -1044,7 +1044,7 @@ export class BrokerOps {
         );
       } catch (e) {
         // Nothing of the service's words: an error here can quote the answer.
-        if (recipe) return await this.newKeyFailed(slot, rec, undefined, 'threw');
+        if (recipe) { rec.outcome = 'failed'; return await this.newKeyFailed(slot, rec, undefined, 'threw'); }
         throw e;
       }
       if (recipe) {
@@ -1095,27 +1095,39 @@ export class BrokerOps {
     let left = 0;
     for (const item of this.outbox.list(agentId)) {
       try {
-        await this.api.deliverIncoming(item.id, { ciphertext: item.ciphertext, nonce: item.nonce });
+        // With its name tag, so the vault takes it even if its slot lapsed meanwhile.
+        await this.api.deliverIncoming(item.id, {
+          ciphertext: item.ciphertext, nonce: item.nonce, ...(item.name_mac ? { name_mac: item.name_mac } : {}),
+        });
         this.outbox.remove(item.id);
-      } catch (e) {
-        // 404: the slot is gone (it waited more than 15 minutes unfilled). Take a new slot is
-        // not possible (the blob is bound to its id), so it stays here for a person to see.
-        left++;
+      } catch {
+        left++;   // still unreachable, or refused: it stays here, locked, for the next call
       }
     }
     return left;
   }
 
   /** The service did not hand over a key (or we cannot tell). Never any of its words. */
-  private async newKeyFailed(slot: string, rec: ActivityRecord, status: number | undefined, why: string): Promise<OpError> {
+  private async newKeyFailed(
+    slot: string, rec: ActivityRecord, status: number | undefined, why: string, notSent = false,
+  ): Promise<OpError> {
     try { await this.api.unreserveIncoming(slot); } catch { /* it lapses by itself in 15 minutes */ }
     rec.detail = `new key: ${why}`;
-    const made = status !== undefined && status >= 200 && status < 300;
-    return err(made
-      ? `The service answered HTTP ${status}, but no new key could be read from its answer. Nothing was saved. `
-        + 'If a key was made there, delete it at the service: nobody holds it.'
-      : `No key was made: the service answered${status ? ` HTTP ${status}` : ' with an error'}. Nothing was saved. `
-        + 'Its answer is not shown, because an answer from a key-making address can hold a key.', 'NEW_KEY_FAILED');
+    const hidden = 'Its answer is not shown, because an answer from a key-making address can hold a key.';
+    if (notSent) return err('Refused before anything was sent, so no key was made. Nothing was saved.', 'NEW_KEY_FAILED');
+    if (status !== undefined && status >= 200 && status < 300) {
+      return err(`The service answered HTTP ${status}, but no new key could be read from its answer. Nothing was saved. `
+        + 'If a key was made there, nobody holds it: tell the owner to delete it at the service.', 'NEW_KEY_FAILED');
+    }
+    if (status !== undefined && status >= 400 && status < 500) {
+      return err(`No key was made: the service refused (HTTP ${status}). Nothing was saved. ${hidden}`, 'NEW_KEY_FAILED');
+    }
+    // No answer at all (the connection dropped, a timeout), a redirect, or a 5xx: the request
+    // may have been carried out before the answer was lost. Never "no key was made" (review r1 F3).
+    return err(`${status ? `The service answered HTTP ${status}` : 'No answer came back from the service'}, so it is NOT KNOWN `
+      + 'whether a key was made. Nothing was saved, and if one was made nobody holds it. Do not simply try again: '
+      + "first look at the service's list of keys (a GET with vault_call is allowed) and tell the owner about any key "
+      + `with the name you asked for, so they can delete it there. ${hidden}`, 'NEW_KEY_UNKNOWN');
   }
 
   private async finishNewKey(a: {
@@ -1126,7 +1138,9 @@ export class BrokerOps {
     const { recipe, slot, result, rec } = a;
     if (result.status) rec.status = result.status;
     if (!result.ok || !result.status || result.status < 200 || result.status > 299) {
-      return this.newKeyFailed(slot, rec, result.status, 'service refused');
+      // performOperation's own refusals (a blocked address, a bad placement) say so and send nothing.
+      const notSent = !result.status && /^Refused\b|Nothing was sent/.test(String((result as { error?: string }).error ?? ''));
+      return this.newKeyFailed(slot, rec, result.status, result.status ? 'service refused' : 'no answer', notSent);
     }
     let body = result.body;
     if (typeof body === 'string') { try { body = JSON.parse(body); } catch { body = undefined; } }
@@ -1141,11 +1155,12 @@ export class BrokerOps {
     });
     if (!sealed.ok) return this.newKeyFailed(slot, rec, result.status, 'could not be locked');
     const blob = { ciphertext: sealed.ciphertext, nonce: sealed.nonce };
+    const nameMac = incomingNameMac(a.vaultKey, a.agentId, a.saveAs);
 
     // On disk (locked) BEFORE the first try, so a crash between the service's answer and the
     // vault's cannot lose the only copy.
     let kept = true;
-    try { this.outbox.put({ id: slot, agent_id: a.agentId, ...blob, made_at: new Date().toISOString() }); }
+    try { this.outbox.put({ id: slot, agent_id: a.agentId, name_mac: nameMac, ...blob, made_at: new Date().toISOString() }); }
     catch { kept = false; }
     let delivered = false;
     for (const wait of [0, 500, 1500]) {
@@ -1154,11 +1169,16 @@ export class BrokerOps {
     }
     if (delivered && kept) this.outbox.remove(slot);
 
-    const info = JSON.parse(cutForms(JSON.stringify(got.info), forms)) as Record<string, unknown>;
+    // readNewKey already dropped any field that carries the key; checked once more, value by
+    // value (never by rewriting JSON text, which a digits-only key could break: review r1 F2).
+    const info: Record<string, string | number | boolean> = {};
+    for (const [k, v] of Object.entries(got.info)) {
+      if (!carriesKey(String(v), got.value, forms) && !carriesKey(k, got.value, forms)) info[k] = v;
+    }
     rec.extra = { ...(rec.extra ?? {}), saved: delivered };
     const where = `${recipe.service_name} made a new key`;
     const notice = delivered
-      ? `${where}. It went straight into the owner's vault as "${cutForms(a.saveAs, forms)}" and is WAITING FOR THE OWNER: `
+      ? `${where}. It went straight into the owner's vault as "${carriesKey(a.saveAs, got.value, forms) ? 'the name you gave' : a.saveAs}" and is WAITING FOR THE OWNER: `
         + 'no agent can use it until the owner saves it (passkey) and sets it up. You were not given the key and no tool will return it. '
         + 'Tell the owner a new key is waiting in the vault under Needs you.'
       : kept
