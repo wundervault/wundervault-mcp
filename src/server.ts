@@ -251,11 +251,12 @@ export function createServer(args: { url?: string } = {}) {
           + 'Twilio https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Keys.json; '
           + 'OpenRouter https://openrouter.ai/api/v1/keys. '
           + 'vault_call refuses these addresses. Anywhere else, the owner makes the key and adds it to the vault by hand.\n\n'
-          + 'ROTATING a key: pass replaces_entry_id (the secret the new key replaces). The order is: (1) vault_new_key; '
+          + 'ROTATING a key: pass replaces_entry_id (the secret the new key replaces). The order is: (0) list the keys at the '
+          + 'service and note the id of the OLD key, the one in use now; (1) vault_new_key, giving the new key the same permissions; '
           + '(2) tell the owner and wait until they press Replace; (3) make a harmless call with that secret to prove the new '
-          + 'value works; (4) only then delete the OLD key at the service with vault_call (DELETE, by its id); (5) tell the owner. '
-          + 'Never delete the old key before the new one has worked. Cloudflare can also roll a token in place '
-          + '(PUT .../tokens/{token_id}/value): that kills the old value at once, so prefer making a new one.'
+          + 'value works; (4) only then delete the OLD key at the service with vault_call (DELETE, by the OLD id you noted, never '
+          + 'the id vault_new_key returned); (5) tell the owner. Never delete the old key before the new one has worked. '
+          + 'Rolling a token in place (Cloudflare PUT .../tokens/{token_id}/value) is refused: it ends the old value at once.'
         ),
         inputSchema: {
           type: 'object',

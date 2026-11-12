@@ -18,5 +18,5 @@ A recipe we cannot confirm this way stays out. Re-check when a service changes i
 
 Not checked against a live account: only Resend is planned for the real run (spec check 16).
 
-The two roll recipes are PUT; all others are POST. Cloudflare's page does not say whether a roll ends
-the old value at once; we tell the owner it may have.
+The two roll addresses are PUT and are known ONLY so both tools refuse them: a roll ends the old
+value at once, before the new one is saved or tried.

@@ -24,7 +24,11 @@ export interface NewKeyRecipe {
   service_name: string;
   origin: { scheme: 'https'; host: string; port: number };
   method: 'POST' | 'PUT';
-  /** The address replaces an existing key's value in place: the old value stops working at once. */
+  /**
+   * The address replaces an existing key's value in place: the old value stops working at once,
+   * before the new one is saved anywhere. The helper never does that (the owner's rule is: the
+   * old key works until the new one has). Such an address is known ONLY so both tools refuse it.
+   */
   rolls?: boolean;
   /** Path segments; '*' stands for exactly one id-like segment. */
   path: string[];
@@ -56,7 +60,7 @@ export const BUILTIN_RECIPES: readonly NewKeyRecipe[] = Object.freeze([
     path: ['client', 'v4', 'accounts', '*', 'tokens'], secret: ['result', 'value'],
     info: { id: ['result', 'id'], name: ['result', 'name'], status: ['result', 'status'], expires_on: ['result', 'expires_on'] },
   },
-  // Rolling a token in place: the answer is the new value itself (SPEC-key-rotation R6).
+  // Rolling a token in place: the answer is the new value itself. Refused by both tools (SPEC-key-rotation R6).
   {
     id: 'cloudflare.user-token-roll', service: 'cloudflare', service_name: 'Cloudflare', rolls: true,
     origin: { scheme: 'https', host: 'api.cloudflare.com', port: 443 }, method: 'PUT',
@@ -190,7 +194,7 @@ export class NewKeyRecipes {
     const segs = strictSegments(String(rawPath ?? ''));
     if (!segs) return null;
     for (const r of this.list) {
-      if (r.method !== m || !sameOrigin(r, origin) || String(origin.host) !== r.origin.host) continue;
+      if (r.rolls || r.method !== m || !sameOrigin(r, origin) || String(origin.host) !== r.origin.host) continue;
       if (r.path.length !== segs.length) continue;
       if (r.path.every((want, i) => (want === '*' ? ID_SEGMENT.test(segs[i]) : want === segs[i]))) return r;
     }

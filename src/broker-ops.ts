@@ -110,6 +110,11 @@ function finish(rec: ActivityRecord, r: unknown): void {
 
 export interface OpError { error: string; code?: string }
 
+const ROLL_REFUSED = (service: string) =>
+  `Refused: this address rolls a key at ${service} in place, which ends the old value at once, before the new one is `
+  + 'saved anywhere or has been tried. Nothing was sent. To rotate, make a NEW key with vault_new_key (with replaces_entry_id), '
+  + 'wait for the owner to press Replace, prove it works, and only then delete the old key.';
+
 const NEW_KEY_POINTER = (service: string) =>
   `Refused: this address makes a new key at ${service}, and its answer would hand that key to you. `
   + 'Nothing was sent. Use vault_new_key with the same entry and request: the helper makes the key, puts it '
@@ -418,6 +423,8 @@ export class BrokerOps {
         return err('Refused: vault_new_key does not take sign_in, send_as or trust_certificate. Nothing was sent.', 'BAD_REQUEST');
       }
       recipe = this.recipes.exact(agentReq.origin, agentReq.method, String(agentReq.path ?? ''));
+      const roll = recipe ? null : this.recipes.loose(agentReq.origin, agentReq.method || 'GET', String(agentReq.path ?? ''));
+      if (roll?.rolls) return err(ROLL_REFUSED(roll.service_name), 'ROLL_REFUSED');
       if (!recipe) {
         return err('Refused: the helper has no recipe for making a key at this address, so it cannot tell '
           + 'which part of the answer is the new key. Nothing was sent. vault_new_key works only at the exact '
@@ -441,7 +448,7 @@ export class BrokerOps {
       }
     } else if (agentReq?.origin) {
       const hit = this.recipes.loose(agentReq.origin, agentReq.method || 'GET', String(agentReq.path ?? ''));
-      if (hit) return err(NEW_KEY_POINTER(hit.service_name), 'USE_NEW_KEY');
+      if (hit) return err(hit.rolls ? ROLL_REFUSED(hit.service_name) : NEW_KEY_POINTER(hit.service_name), hit.rolls ? 'ROLL_REFUSED' : 'USE_NEW_KEY');
     }
 
     let haveValue = false;
@@ -727,7 +734,7 @@ export class BrokerOps {
     // own address, and the query the agent gave is part of the path by now.
     if (!recipe) {
       const hit = this.recipes.loose(def.origin, def.route.method, def.route.path);
-      if (hit) return err(NEW_KEY_POINTER(hit.service_name), 'USE_NEW_KEY');
+      if (hit) return err(hit.rolls ? ROLL_REFUSED(hit.service_name) : NEW_KEY_POINTER(hit.service_name), hit.rolls ? 'ROLL_REFUSED' : 'USE_NEW_KEY');
     } else if (this.recipes.exact(def.origin, def.route.method, def.route.path) !== recipe) {
       return err('Refused: this request no longer matches the key-making address. Nothing was sent.', 'NO_RECIPE');
     }
@@ -1045,10 +1052,17 @@ export class BrokerOps {
         }
         slot = newRequestId();
         try {
-          await this.api.reserveIncoming(slot, incomingNameMac(vaultKey, s.agent_id ?? '', saveAs));
+          // A replacement is tagged by the secret it replaces, so a second one for the same secret
+          // is refused while the first waits (two could be approved in the wrong order).
+          await this.api.reserveIncoming(slot, incomingNameMac(vaultKey, s.agent_id ?? '',
+            replaces ? `\u0000replaces\u0000${replaces.entry_id}` : saveAs));
         } catch (e) {
           const body = (e as { body?: { detail?: { error?: string; message?: string } } }).body;
           const st = (e as { status?: number }).status;
+          if (st === 409 && replaces && body?.detail?.error === 'NAME_WAITING') {
+            return err('Refused: a replacement for that secret is already waiting for the owner. Nothing was made. '
+              + 'Ask the owner to replace or throw away the one that is waiting.', 'NAME_WAITING');
+          }
           if (st === 409 && body?.detail?.message) return err(`Refused: ${body.detail.message}`, body.detail.error);
           if (st === 404 || st === 405) {
             return err('Refused: this vault cannot hold a waiting key yet (the site is older than this helper). Nothing was sent.', 'UNSUPPORTED');
@@ -1180,11 +1194,11 @@ export class BrokerOps {
       name: a.saveAs, service: recipe.service, service_name: recipe.service_name, recipe: recipe.id,
       value: got.value, info: got.info, source_entry: a.entryId, source_name: a.sourceName,
       address: a.address, made_at: new Date().toISOString(),
-      ...(a.replaces ? { replaces: a.replaces } : {}), ...(recipe.rolls ? { rolled: true } : {}),
+      ...(a.replaces ? { replaces: a.replaces } : {}),
     });
     if (!sealed.ok) return this.newKeyFailed(slot, rec, result.status, 'could not be locked');
     const blob = { ciphertext: sealed.ciphertext, nonce: sealed.nonce };
-    const nameMac = incomingNameMac(a.vaultKey, a.agentId, a.saveAs);
+    const nameMac = incomingNameMac(a.vaultKey, a.agentId, a.replaces ? `\u0000replaces\u0000${a.replaces.entry_id}` : a.saveAs);
 
     // On disk (locked) BEFORE the first try, so a crash between the service's answer and the
     // vault's cannot lose the only copy.
@@ -1213,9 +1227,8 @@ export class BrokerOps {
         + (a.replaces
           ? ` It is marked as the replacement for "${carriesKey(a.replaces.name, got.value, forms) ? 'that secret' : a.replaces.name}": once the owner presses `
             + 'Replace, that secret holds the new value and you keep using it with the same entry id. '
-            + (recipe.rolls
-              ? 'This address rolled the key in place, so the OLD value may already have stopped working: until the owner presses Replace, calls with that secret can fail.'
-              : 'Then prove the new value works with a harmless call, and ONLY THEN delete the old key at the service (a DELETE with vault_call), and tell the owner.')
+            + 'Then prove the new value works with a harmless call, and ONLY THEN delete the OLD key at the service (a DELETE with vault_call, '
+            + "by the OLD key's id, never the id below, which is the new key's), and tell the owner."
           : '')
       : kept
         ? `${where}, but it is NOT in the vault yet: the vault could not be reached. The helper is holding it, locked, `

@@ -566,7 +566,7 @@ describe('rotation (SPEC-key-rotation checks 1, 2)', () => {
     const r = await newKey(admin.id, {}, 'Resend sending key', old.id) as { notice: string; body: object };
     expect(r.body).toMatchObject({ new_key: 'waiting for the owner', id: 'key_123' });
     expect(r.notice).toContain('replacement for "Resend admin"');
-    expect(r.notice).toContain('ONLY THEN delete the old key');
+    expect(r.notice).toContain('ONLY THEN delete the OLD key');
     const item = opened([...incoming.keys()][0]);
     expect(item.replaces).toEqual({ entry_id: old.id, name: 'Resend admin' });
     expect(item.rolled).toBeUndefined();
@@ -587,43 +587,50 @@ describe('rotation (SPEC-key-rotation checks 1, 2)', () => {
       expect(incoming.size).toBe(0);
     });
 
-  it('check 2: rolling in place through vault_call is refused, nothing sent', async () => {
+  it('check 2: rolling in place is refused by BOTH tools, nothing sent', async () => {
     const e = adminEntry();
-    for (const method of ['PUT', 'POST', 'PATCH']) {
-      const r = await plainCall(e.id, { method, path: '/v4/user/tokens/tok_1/value', body: {} }) as { code?: string };
-      expect(r.code).toBe('USE_NEW_KEY');
-    }
-    expect(wire).toEqual([]);
-  });
-
-  it('check 2: rolling through vault_new_key: the whole answer string goes to the vault, none of it to the agent', async () => {
-    const admin = adminEntry();
     const old = adminEntry();
-    serviceAnswer = () => ({ status: 200, body: { success: true, errors: [], result: NEW } });
-    const r = await newKey(admin.id, { method: 'PUT', path: '/v4/user/tokens/tok_1/value', body: {} }, 'CF token', old.id) as { notice: string; body: object };
-    expect(wire).toHaveLength(1);
-    expect(wire[0]).toMatchObject({ method: 'PUT', url: '/v4/user/tokens/tok_1/value' });
-    expect(r.body).toEqual({ new_key: 'waiting for the owner' });
-    expect(r.notice).toContain('OLD value may already have stopped working');
-    expect(r.notice).not.toContain('ONLY THEN delete');
-    const item = opened([...incoming.keys()][0]);
-    expect(item).toMatchObject({ value: NEW, rolled: true, replaces: { entry_id: old.id }, address: `https://127.0.0.1:${port}/v4/user/tokens/tok_1/value` });
-    expectNowhere(r);
+    for (const method of ['PUT', 'POST', 'PATCH']) {
+      const r = await plainCall(e.id, { method, path: '/v4/user/tokens/tok_1/value', body: {} }) as { code?: string; error: string };
+      expect(r.code).toBe('ROLL_REFUSED');
+      expect(r.error).toContain('ends the old value at once');
+      const n = await newKey(e.id, { method, path: '/v4/user/tokens/tok_1/value', body: {} }, 'CF token', old.id) as { code?: string };
+      expect(n.code).toBe('ROLL_REFUSED');
+    }
+    expect(((await plainCall(e.id, { method: 'PUT', path: '/v4/user/tokens/tok_1/VALUE/' })) as { code?: string }).code).toBe('ROLL_REFUSED');
+    expect(wire).toEqual([]);
+    expect(incoming.size).toBe(0);
   });
 
-  it('check 2: POST to a roll address, and PUT to a create address, have no recipe for vault_new_key', async () => {
-    const e = adminEntry();
-    expect(((await newKey(e.id, { method: 'POST', path: '/v4/user/tokens/tok_1/value' })) as { code?: string }).code).toBe('NO_RECIPE');
-    expect(((await newKey(e.id, { method: 'PUT', path: '/api-keys' })) as { code?: string }).code).toBe('NO_RECIPE');
+  it('review r1: the notice says to delete the OLD id, never the one returned', async () => {
+    const admin = adminEntry(); const old = adminEntry();
+    const r = await newKey(admin.id, {}, 'n', old.id) as { notice: string };
+    expect(r.notice).toContain("by the OLD key's id, never the id below");
+  });
+
+  it('review r1: a second replacement for the same secret is tagged the same, whatever its name', async () => {
+    const admin = adminEntry(); const old = adminEntry(); const other = adminEntry();
+    await newKey(admin.id, {}, 'first name', old.id);
+    await newKey(admin.id, {}, 'second name', old.id);
+    await newKey(admin.id, {}, 'third', other.id);
+    const tags = [...incoming.values()].map((v) => v.name_mac);
+    expect(tags[0]).toBe(tags[1]);                 // the server refuses the second while the first waits
+    expect(tags[2]).not.toBe(tags[0]);
+    expect(tags[0]).not.toBe(incomingNameMac(vaultKey, agentId, 'first name'));
+    reserveAnswer = () => ({ status: 409, body: { detail: { error: 'NAME_WAITING', message: 'x' } } });
+    wire = [];
+    const r = await newKey(admin.id, {}, 'again', old.id) as { code?: string; error: string };
+    expect(r.code).toBe('NAME_WAITING');
+    expect(r.error).toContain('replacement for that secret is already waiting');
     expect(wire).toEqual([]);
   });
 
   it('the real Cloudflare roll addresses are recipes', () => {
     const R = new NewKeyRecipes();
     const cf = { scheme: 'https', host: 'api.cloudflare.com', port: 443 };
-    expect(R.exact(cf, 'PUT', '/client/v4/user/tokens/abc123/value')?.id).toBe('cloudflare.user-token-roll');
-    expect(R.exact(cf, 'PUT', '/client/v4/accounts/acc1/tokens/abc123/value')?.id).toBe('cloudflare.account-token-roll');
-    expect(R.exact(cf, 'POST', '/client/v4/user/tokens/abc123/value')).toBeNull();
+    expect(R.exact(cf, 'PUT', '/client/v4/user/tokens/abc123/value')).toBeNull();     // never handled, only refused
+    expect(R.loose(cf, 'PUT', '/client/v4/accounts/acc1/tokens/abc123/value')?.id).toBe('cloudflare.account-token-roll');
+    expect(R.loose(cf, 'PUT', '/client/v4/user/tokens/abc123/value')?.id).toBe('cloudflare.user-token-roll');
     expect(R.loose(cf, 'PUT', '/client/v4/user/tokens/abc123/value/')?.rolls).toBe(true);
     expect(R.loose(cf, 'PUT', '/client/v4/user/tokens/abc123')).toBeNull();          // editing a token's settings is fine
     expect(R.loose(cf, 'DELETE', '/client/v4/user/tokens/abc123')).toBeNull();       // deleting the old one is fine

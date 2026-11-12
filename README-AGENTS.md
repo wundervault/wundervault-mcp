@@ -99,13 +99,16 @@ All your config has to say is which agent this is.
 
 ## Rotating a key
 
+0. List the keys at the service and note the id of the OLD key (the one in use now).
 1. `vault_new_key` with `replaces_entry_id` set to the secret being rotated.
 2. Tell the owner, and wait until they press Replace in the vault. The secret keeps its entry id, name and rules.
 3. Make a harmless call with that secret to prove the new value works.
-4. Only then delete the OLD key at the service with `vault_call` (a DELETE with the old key's id).
+4. Only then delete the OLD key at the service with `vault_call` (a DELETE with the old key's id). Never the id
+   `vault_new_key` returned: that is the new key.
 5. Tell the owner the old key is gone.
 
-Never delete the old key before the new one has worked. Where a service has no way to create keys
+Never delete the old key before the new one has worked. Rolling a key in place (Cloudflare's
+`PUT .../tokens/{id}/value`) is refused: it ends the old value at once. Where a service has no way to create keys
 by API, the owner rotates by hand.
 
 ## Admin keys
