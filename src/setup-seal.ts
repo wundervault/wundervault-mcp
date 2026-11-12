@@ -342,6 +342,49 @@ export function t2OriginMac(vaultKey: Uint8Array, fields: { origin: string; entr
   return createHmac('sha256', key).update(values.join('\n'), 'utf8').digest('hex');
 }
 
+/**
+ * A key the helper made at a service, locked for the owner's browser (SPEC-helper-fetch-and-save F5).
+ * Same key and method as an approval's sealed detail, its own tag, bound to the agent and the item.
+ */
+export interface IncomingKey {
+  name: string; service: string; service_name: string; recipe: string; value: string;
+  info: Record<string, string | number | boolean>;
+  source_entry: string; source_name: string; address: string; made_at: string;
+}
+
+export function sealIncoming(
+  vaultKey: Uint8Array, agentId: string, itemId: string, item: IncomingKey, nonce?: Buffer,
+): SealResult {
+  if (!validId(agentId) || !validRequestId(itemId) || !isObject(item)
+      || typeof item.name !== 'string' || !item.name || item.name.length > 80
+      || typeof item.value !== 'string' || !item.value || Buffer.byteLength(item.value, 'utf8') > 16 * 1024) {
+    return { ok: false, reason: 'malformed' };
+  }
+  let json: string;
+  try { json = JSON.stringify({ v: 1, ...item }); } catch { return { ok: false, reason: 'malformed' }; }
+  if (Buffer.byteLength(json, 'utf8') > 65536) return { ok: false, reason: 'malformed' };
+  return seal(vaultKey, 'wv-incoming-1', `wv-incoming-1|${agentId}|${itemId}`, json, nonce);
+}
+
+/** The browser's half, here so both ends are tested against the same bytes. */
+export function openIncoming(
+  vaultKey: Uint8Array, agentId: string, itemId: string, ciphertextB64: string, nonceB64: string,
+): { ok: true; item: IncomingKey } | Failure {
+  if (!validId(agentId) || !validRequestId(itemId)) return { ok: false, reason: 'malformed' };
+  const opened = openBlob(vaultKey, 'wv-incoming-1', `wv-incoming-1|${agentId}|${itemId}`, ciphertextB64, nonceB64, 65536);
+  if (!opened.ok) return opened;
+  const v = opened.value as Record<string, unknown>;
+  if (!isObject(v) || v.v !== 1 || typeof v.name !== 'string' || typeof v.value !== 'string') return { ok: false, reason: 'malformed' };
+  return { ok: true, item: v as unknown as IncomingKey };
+}
+
+/** So the server can refuse a second waiting key with the same name without learning the name. */
+export function incomingNameMac(vaultKey: Uint8Array, agentId: string, name: string): string {
+  if (vaultKey.length !== 32) throw new Error('Invalid vault key');
+  const key = hkdfKey(vaultKey, zeroSalt, 'wv-incoming-name-1');
+  return createHmac('sha256', key).update(`${agentId}\n${name.trim().toLowerCase()}`, 'utf8').digest('hex');
+}
+
 export function newRequestId(): string {
   return randomBytes(16).toString('hex');
 }

@@ -236,6 +236,40 @@ export class AgentVaultAPI {
     return resp.json() as Promise<T>;
   }
 
+  private async sendJson<T>(method: 'PUT' | 'DELETE', path: string, body?: unknown): Promise<T> {
+    const url = `${this.baseUrl}${path}`;
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+    const resp = await fetch(url, {
+      method,
+      headers: this.signedHeaders(method, url, payload),
+      ...(payload === undefined ? {} : { body: payload }),
+      signal: AbortSignal.timeout(TIMEOUT),
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      const err: any = new Error(`HTTP ${resp.status}: ${text}`);
+      err.status = resp.status;
+      try { err.body = JSON.parse(text); } catch { /* not JSON */ }
+      throw err;
+    }
+    return resp.json() as Promise<T>;
+  }
+
+  /** A slot for a key about to be made (SPEC-helper-fetch-and-save): asked BEFORE the service is called. */
+  async reserveIncoming(id: string, nameMac: string): Promise<{ id: string; state: string }> {
+    return this.postJson('/agent/vault/incoming/reserve', { id, name_mac: nameMac });
+  }
+
+  /** The locked new key, once. The same delivery again is answered the same way. */
+  async deliverIncoming(id: string, blob: { ciphertext: string; nonce: string }): Promise<{ id: string; state: string }> {
+    return this.sendJson('PUT', `/agent/vault/incoming/${encodeURIComponent(id)}`, blob);
+  }
+
+  /** Give back a slot that was never filled. */
+  async unreserveIncoming(id: string): Promise<{ removed: boolean }> {
+    return this.sendJson('DELETE', `/agent/vault/incoming/${encodeURIComponent(id)}`);
+  }
+
   /** End this agent's approvals according to the owner's setting. */
   async agentDone(): Promise<{ ended: number; setting: 'end' | 'keep' }> {
     return this.postJson('/agent/vault/done', {});

@@ -78,7 +78,8 @@ import { runtimeDir, systemRoot } from './paths.js';
 import type { VaultEntry } from './types.js';
 import { BEARER, bindingFromExecConfig, looksLikePrivateKey, secretForms, validateAgentHeaders, pathBindingProblem } from './delivery.js';
 import { checkAgentHeaders, oauth1FromParts, readValue, scrub as scrubParts, secretFormsAll, validateBindingV2, type BindingV2, type Shape } from './parts.js';
-import { SetupPins, sealT2Detail, t2MatchMac, t2OriginMac, newRequestId } from './setup-seal.js';
+import { SetupPins, sealT2Detail, t2MatchMac, t2OriginMac, newRequestId, sealIncoming, incomingNameMac } from './setup-seal.js';
+import { NewKeyRecipes, NewKeyOutbox, readNewKey, newKeyForms, cutForms, type NewKeyRecipe } from './new-key.js';
 import { renderDetail } from './render.js';
 import { SigningState, readPolicy } from './wallet.js';
 import { normalizeOrigin, validateSendAs, placementRecipe, placementSha, describePlacement, isAskBinding, type SendAs } from './placement.js';
@@ -109,6 +110,11 @@ function finish(rec: ActivityRecord, r: unknown): void {
 
 export interface OpError { error: string; code?: string }
 
+const NEW_KEY_POINTER = (service: string) =>
+  `Refused: this address makes a new key at ${service}, and its answer would hand that key to you. `
+  + 'Nothing was sent. Use vault_new_key with the same entry and request: the helper makes the key, puts it '
+  + "straight into the owner's vault, and tells you its id.";
+
 function err(message: string, code?: string): OpError {
   return code ? { error: message, code } : { error: message };
 }
@@ -131,6 +137,8 @@ function coerceCfg(raw: unknown): Record<string, unknown> {
  */
 export class BrokerOps {
   private api: AgentVaultAPI;
+  private readonly recipes: NewKeyRecipes;
+  private readonly outbox: NewKeyOutbox;
   /** BUILD 2: this machine's payment record, policy versions and used approvals. */
   private state: SigningState;
   private readonly keyscan: (t: NonNullable<ReturnType<typeof normalizeSshTarget>>) => Promise<string | null>;
@@ -215,8 +223,14 @@ export class BrokerOps {
     opts: {
       pinsPath?: string;
       keyscan?: (t: NonNullable<ReturnType<typeof normalizeSshTarget>>) => Promise<string | null>;
+      /** Tests only: recipes for a local stand-in service. The real list is compiled in (new-key.ts). */
+      newKeyRecipes?: NewKeyRecipes;
+      /** Where a made-but-undelivered key waits, already locked. Default: the helper's own folder. */
+      outboxDir?: string;
     } = {},
   ) {
+    this.recipes = opts.newKeyRecipes ?? new NewKeyRecipes();
+    this.outbox = new NewKeyOutbox(opts.outboxDir ?? path.join(systemRoot(), 'new-key-outbox'));
     const pins = SetupPins.shared(opts.pinsPath ?? path.join(systemRoot(), 'setup-pins.json'));
     this.api = new AgentVaultAPI(apiKey, loadEncryptionKey(encKeyB64), vaultUrl, signer, pins);
     this.state = state;
@@ -339,6 +353,8 @@ export class BrokerOps {
   async call(args: {
     entryId: string; purpose: string; operationId?: string;
     callArgs?: Record<string, unknown>; request?: AgentRequest & { send_as?: unknown };
+    /** vault_new_key: the answer holds a new key; it goes to the vault, never to the agent. */
+    newKey?: { saveAs: string };
   }): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
     // One line in the activity log for every call, whatever happens to it. The inner body
     // fills in what it learns (the key's name, the address, the approval, the status) as
@@ -358,6 +374,7 @@ export class BrokerOps {
     } else if (args.operationId) {
       rec.extra = { operation: args.operationId };
     }
+    if (args.newKey) rec.extra = { ...(rec.extra ?? {}), new_key: true };
     try {
       const r = await this.callInner(args, rec);
       finish(rec, r);
@@ -374,11 +391,42 @@ export class BrokerOps {
   private async callInner(args: {
     entryId: string; purpose: string; operationId?: string;
     callArgs?: Record<string, unknown>; request?: AgentRequest & { send_as?: unknown };
+    /** vault_new_key: the answer holds a new key; it goes to the vault, never to the agent. */
+    newKey?: { saveAs: string };
   }, rec: ActivityRecord): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
     const { entryId, purpose } = args;
     const operationId = args.operationId || '';
     const callArgs = args.callArgs ?? {};
     let agentReq = args.request;
+
+    // ── KEY-MAKING ADDRESSES (SPEC-helper-fetch-and-save F1, F2, F4). Decided from what the
+    // agent asked, before the entry is fetched, anything is approved or anything is sent.
+    const newKey = args.newKey;
+    let recipe: NewKeyRecipe | null = null;
+    let saveAs = '';
+    if (newKey) {
+      saveAs = typeof newKey.saveAs === 'string' ? newKey.saveAs.trim() : '';
+      if (!saveAs || saveAs.length > 80 || /[\u0000-\u001f\u007f]/.test(saveAs)) {
+        return err('Refused: save_as is the name for the new secret, 1 to 80 characters. Nothing was sent.', 'BAD_REQUEST');
+      }
+      if (operationId || !agentReq) {
+        return err('Refused: vault_new_key takes a request, not a signed operation. Nothing was sent.', 'BAD_REQUEST');
+      }
+      const extras = agentReq as { sign_in?: unknown; send_as?: unknown; trust_certificate?: unknown };
+      if (extras.sign_in !== undefined || extras.send_as !== undefined || extras.trust_certificate !== undefined) {
+        return err('Refused: vault_new_key does not take sign_in, send_as or trust_certificate. Nothing was sent.', 'BAD_REQUEST');
+      }
+      recipe = this.recipes.exact(agentReq.origin, agentReq.method, String(agentReq.path ?? ''));
+      if (!recipe) {
+        return err('Refused: the helper has no recipe for making a key at this address, so it cannot tell '
+          + 'which part of the answer is the new key. Nothing was sent. vault_new_key works only at the exact '
+          + 'key-making addresses it knows (see its description).', 'NO_RECIPE');
+      }
+      rec.extra = { ...(rec.extra ?? {}), recipe: recipe.id };
+    } else if (agentReq?.origin) {
+      const hit = this.recipes.loose(agentReq.origin, agentReq.method || 'GET', String(agentReq.path ?? ''));
+      if (hit) return err(NEW_KEY_POINTER(hit.service_name), 'USE_NEW_KEY');
+    }
 
     let haveValue = false;
     let grant: string | undefined;
@@ -654,6 +702,15 @@ export class BrokerOps {
       }
       def = definitionFromAgentRequest({ ...r, headers: agentHeaders }, binding);
       label = `${def.route.method} ${originString(r.origin)}${r.path || '/'}`;
+    }
+
+    // The same question again on the request AS IT WILL BE SENT: a signed operation names its
+    // own address, and the query the agent gave is part of the path by now.
+    if (!recipe) {
+      const hit = this.recipes.loose(def.origin, def.route.method, def.route.path);
+      if (hit) return err(NEW_KEY_POINTER(hit.service_name), 'USE_NEW_KEY');
+    } else if (this.recipes.exact(def.origin, def.route.method, def.route.path) !== recipe) {
+      return err('Refused: this request no longer matches the key-making address. Nothing was sent.', 'NO_RECIPE');
     }
 
     const bodyHash = agentReq?.body !== undefined
@@ -954,14 +1011,49 @@ export class BrokerOps {
           ...(noticeForAgent ? { notice: noticeForAgent } : {}),
         };
       }
-      let result = await performOperation(
+      // ── vault_new_key: a slot in the vault FIRST, so a full list or a taken name costs no new
+      // key at the service; then the call; then the key goes to the vault and nowhere else.
+      let slot = '';
+      if (recipe) {
+        if (signIn || this.recipes.exact(def.origin, def.route.method, def.route.path) !== recipe) {
+          return err('Refused: this request no longer matches the key-making address. Nothing was sent.', 'NO_RECIPE');
+        }
+        await this.flushNewKeys(s.agent_id ?? '');
+        slot = newRequestId();
+        try {
+          await this.api.reserveIncoming(slot, incomingNameMac(vaultKey, s.agent_id ?? '', saveAs));
+        } catch (e) {
+          const body = (e as { body?: { detail?: { error?: string; message?: string } } }).body;
+          const st = (e as { status?: number }).status;
+          if (st === 409 && body?.detail?.message) return err(`Refused: ${body.detail.message}`, body.detail.error);
+          if (st === 404 || st === 405) {
+            return err('Refused: this vault cannot hold a waiting key yet (the site is older than this helper). Nothing was sent.', 'UNSUPPORTED');
+          }
+          return err('Refused: the vault could not be reached to hold the new key, so none was made. Nothing was sent. Try again.', 'VAULT_UNREACHABLE');
+        }
+      }
+      let result: Awaited<ReturnType<typeof performOperation>>;
+      try {
+        result = await performOperation(
         def, operationId ? callArgs : (typeof agentReq?.body === 'string'
           ? agentReq.body
           : ((agentReq?.body ?? {}) as Record<string, unknown>)),
         stamped ? stamped.secret : (partsBinding ? '' : secret), approvedOrigins,
         stamped ? (img) => computeStamp(stampRecipe!, img, stamped) : undefined,
         partsBinding && parts && !stamped ? { binding: partsBinding, parts } : undefined,
-      );
+        );
+      } catch (e) {
+        // Nothing of the service's words: an error here can quote the answer.
+        if (recipe) return await this.newKeyFailed(slot, rec, undefined, 'threw');
+        throw e;
+      }
+      if (recipe) {
+        return await this.finishNewKey({
+          recipe, slot, saveAs, result, vaultKey, agentId: s.agent_id ?? '', entryId,
+          sourceName: s.name ?? entryId, address: `${originString(def.origin)}/${recipe.path.join('/')}`,
+          tier: verdict.tier, label, rec,
+        });
+      }
       if (parts && stamped) {
         for (const value of Object.values(parts).sort((a, b) => b.length - a.length)) {
           result = scrubSecret(result, value) as typeof result;
@@ -994,6 +1086,90 @@ export class BrokerOps {
     } finally {
       bytes.fill(0);
     }
+  }
+
+  // ── vault_new_key: after the service answered ──────────────────────────────
+
+  /** Deliver anything this agent's earlier calls made but could not hand to the vault. */
+  private async flushNewKeys(agentId: string): Promise<number> {
+    let left = 0;
+    for (const item of this.outbox.list(agentId)) {
+      try {
+        await this.api.deliverIncoming(item.id, { ciphertext: item.ciphertext, nonce: item.nonce });
+        this.outbox.remove(item.id);
+      } catch (e) {
+        // 404: the slot is gone (it waited more than 15 minutes unfilled). Take a new slot is
+        // not possible (the blob is bound to its id), so it stays here for a person to see.
+        left++;
+      }
+    }
+    return left;
+  }
+
+  /** The service did not hand over a key (or we cannot tell). Never any of its words. */
+  private async newKeyFailed(slot: string, rec: ActivityRecord, status: number | undefined, why: string): Promise<OpError> {
+    try { await this.api.unreserveIncoming(slot); } catch { /* it lapses by itself in 15 minutes */ }
+    rec.detail = `new key: ${why}`;
+    const made = status !== undefined && status >= 200 && status < 300;
+    return err(made
+      ? `The service answered HTTP ${status}, but no new key could be read from its answer. Nothing was saved. `
+        + 'If a key was made there, delete it at the service: nobody holds it.'
+      : `No key was made: the service answered${status ? ` HTTP ${status}` : ' with an error'}. Nothing was saved. `
+        + 'Its answer is not shown, because an answer from a key-making address can hold a key.', 'NEW_KEY_FAILED');
+  }
+
+  private async finishNewKey(a: {
+    recipe: NewKeyRecipe; slot: string; saveAs: string; result: { ok: boolean; status?: number; body?: unknown };
+    vaultKey: Uint8Array; agentId: string; entryId: string; sourceName: string; address: string;
+    tier: string; label: string; rec: ActivityRecord;
+  }): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
+    const { recipe, slot, result, rec } = a;
+    if (result.status) rec.status = result.status;
+    if (!result.ok || !result.status || result.status < 200 || result.status > 299) {
+      return this.newKeyFailed(slot, rec, result.status, 'service refused');
+    }
+    let body = result.body;
+    if (typeof body === 'string') { try { body = JSON.parse(body); } catch { body = undefined; } }
+    const got = readNewKey(recipe, body);
+    if (!got.ok) return this.newKeyFailed(slot, rec, result.status, 'no key in the answer');
+
+    const forms = newKeyForms(got.value);
+    const sealed = sealIncoming(a.vaultKey, a.agentId, slot, {
+      name: a.saveAs, service: recipe.service, service_name: recipe.service_name, recipe: recipe.id,
+      value: got.value, info: got.info, source_entry: a.entryId, source_name: a.sourceName,
+      address: a.address, made_at: new Date().toISOString(),
+    });
+    if (!sealed.ok) return this.newKeyFailed(slot, rec, result.status, 'could not be locked');
+    const blob = { ciphertext: sealed.ciphertext, nonce: sealed.nonce };
+
+    // On disk (locked) BEFORE the first try, so a crash between the service's answer and the
+    // vault's cannot lose the only copy.
+    let kept = true;
+    try { this.outbox.put({ id: slot, agent_id: a.agentId, ...blob, made_at: new Date().toISOString() }); }
+    catch { kept = false; }
+    let delivered = false;
+    for (const wait of [0, 500, 1500]) {
+      if (wait) await new Promise((r) => setTimeout(r, wait));
+      try { await this.api.deliverIncoming(slot, blob); delivered = true; break; } catch { /* again */ }
+    }
+    if (delivered && kept) this.outbox.remove(slot);
+
+    const info = JSON.parse(cutForms(JSON.stringify(got.info), forms)) as Record<string, unknown>;
+    rec.extra = { ...(rec.extra ?? {}), saved: delivered };
+    const where = `${recipe.service_name} made a new key`;
+    const notice = delivered
+      ? `${where}. It went straight into the owner's vault as "${cutForms(a.saveAs, forms)}" and is WAITING FOR THE OWNER: `
+        + 'no agent can use it until the owner saves it (passkey) and sets it up. You were not given the key and no tool will return it. '
+        + 'Tell the owner a new key is waiting in the vault under Needs you.'
+      : kept
+        ? `${where}, but it is NOT in the vault yet: the vault could not be reached. The helper is holding it, locked, `
+          + 'and will hand it over on your next vault call. You were not given the key. Do not make another one.'
+        : `${where}, but it could not be saved and the helper could not keep it. Nobody holds it: delete it at the service `
+          + '(its id is below) and try again.';
+    return {
+      status: result.status, body: { new_key: delivered ? 'waiting for the owner' : kept ? 'made, not saved yet' : 'lost', ...info },
+      tier: a.tier, label: a.label, notice,
+    };
   }
 
   // ── ssh_agent_open / ssh_agent_close ───────────────────────────────────────

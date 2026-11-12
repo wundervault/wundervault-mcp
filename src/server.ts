@@ -106,6 +106,9 @@ function mockToolResult(name: string, args: Record<string, any>) {
     case 'vault_call':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ ${args.operation_id ?? args.request?.method ?? 'demo.op'} returned 200. Credential was used, not disclosed.${MOCK_NOTE}` }] });
+    case 'vault_new_key':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `Demo made a new key. It went straight into the owner's vault as "${args.save_as ?? 'new key'}" and is waiting for the owner. You were not given the key.${MOCK_NOTE}` }] });
     case 'vault_pay':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ Paid 0.01 USDC on base-sepolia inside the owner's rules. Send this header when you retry: `
@@ -230,6 +233,38 @@ export function createServer(args: { url?: string } = {}) {
             purpose: { type: 'string', description: 'Why this is needed (audit log).' },
           },
           required: ['entry_id', 'purpose'],
+        },
+      },
+      {
+        name: 'vault_new_key',
+        description: (
+          'Make a NEW key at a service (for example a new API key at Resend or Cloudflare), using a vaulted key that is '
+          + 'allowed to create keys there. The helper sends your request, takes the new key out of the answer and puts it '
+          + "straight into the owner's vault, where it waits for the owner. You never see the new key: you get its id and "
+          + 'name at the service. No agent can use it until the owner saves it with their passkey and sets it up, so tell '
+          + 'the owner it is waiting under Needs you.\n\n'
+          + 'Works only at these exact addresses (POST): '
+          + 'Resend https://api.resend.com/api-keys; '
+          + 'Cloudflare https://api.cloudflare.com/client/v4/user/tokens and /client/v4/accounts/{account_id}/tokens; '
+          + 'SendGrid https://api.sendgrid.com/v3/api_keys; '
+          + 'OpenAI https://api.openai.com/v1/organization/admin_api_keys and /v1/organization/projects/{project_id}/service_accounts; '
+          + 'Twilio https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Keys.json; '
+          + 'OpenRouter https://openrouter.ai/api/v1/keys. '
+          + 'vault_call refuses these addresses. Anywhere else, the owner makes the key and adds it to the vault by hand.'
+        ),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            entry_id: { type: 'string', description: 'Vault entry holding the key that is allowed to create keys at the service.' },
+            request: {
+              type: 'object',
+              description: 'As for vault_call: {origin:{scheme:"https",host,port:443}, method:"POST", path, body?, headers?}. '
+                + 'The body is what the service wants for a new key (its name, permissions).',
+            },
+            save_as: { type: 'string', description: 'Name for the new secret in the vault, 1 to 80 characters.' },
+            purpose: { type: 'string', description: 'Why this is needed (audit log, and shown to the owner).' },
+          },
+          required: ['entry_id', 'request', 'save_as', 'purpose'],
         },
       },
       {
@@ -447,6 +482,22 @@ export function createServer(args: { url?: string } = {}) {
           content: [{ type: 'text', text:
             `✅ ${r.label} → HTTP ${r.status} (tier ${r.tier}). The credential was used here, not returned to you.\n`
             + `${renderBody(r.body)}${r.notice ? `\n\n${r.notice}` : ''}` }],
+        });
+      }
+
+      if (request.params.name === 'vault_new_key') {
+        const a = (request.params.arguments ?? {}) as Record<string, unknown>;
+        const fail = (text: string) => CallToolResultSchema.parse({ content: [{ type: 'text', text }], isError: true });
+        const entry_id = String(a.entry_id ?? '');
+        const purpose = String(a.purpose ?? '');
+        const save_as = typeof a.save_as === 'string' ? a.save_as : '';
+        if (!entry_id || !purpose || !save_as || !a.request || typeof a.request !== 'object') {
+          return fail('vault_new_key needs entry_id, request, save_as and purpose.');
+        }
+        const r = await broker.send('new_key', { entry_id, purpose: purpose.slice(0, 200), request: a.request, save_as });
+        if (r.error) return fail(String(r.error));
+        return CallToolResultSchema.parse({
+          content: [{ type: 'text', text: `${r.notice ?? ''}\n${renderBody(r.body)}`.trim() }],
         });
       }
 

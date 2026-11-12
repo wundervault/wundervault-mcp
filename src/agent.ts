@@ -92,6 +92,8 @@ interface SocketRequest {
   /** BUILD 2: pay */
   payment_required?: unknown;
   accept_index?: unknown;
+  /** vault_new_key: the name for the new secret */
+  save_as?: unknown;
   /** BUILD 2: sign */
   data?: unknown;
   encoding?: unknown;
@@ -1072,6 +1074,16 @@ class AgentDaemon {
           operationId: typeof msg.operation_id === 'string' ? msg.operation_id : undefined,
           callArgs: (msg.args ?? {}) as Record<string, unknown>,
           request: msg.request as never,
+        }) as unknown as Record<string, unknown>;
+      }
+
+      case 'new_key': {
+        if (!entry() || !purpose()) return { error: 'new_key needs entry_id and purpose.' };
+        return await ops.call({
+          entryId: entry(),
+          purpose: purpose(),
+          request: msg.request as never,
+          newKey: { saveAs: typeof msg.save_as === 'string' ? msg.save_as : '' },
         }) as unknown as Record<string, unknown>;
       }
 
