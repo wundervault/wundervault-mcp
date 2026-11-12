@@ -354,7 +354,7 @@ export class BrokerOps {
     entryId: string; purpose: string; operationId?: string;
     callArgs?: Record<string, unknown>; request?: AgentRequest & { send_as?: unknown };
     /** vault_new_key: the answer holds a new key; it goes to the vault, never to the agent. */
-    newKey?: { saveAs: string };
+    newKey?: { saveAs: string; replacesEntryId?: string };
   }): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
     // One line in the activity log for every call, whatever happens to it. The inner body
     // fills in what it learns (the key's name, the address, the approval, the status) as
@@ -392,7 +392,7 @@ export class BrokerOps {
     entryId: string; purpose: string; operationId?: string;
     callArgs?: Record<string, unknown>; request?: AgentRequest & { send_as?: unknown };
     /** vault_new_key: the answer holds a new key; it goes to the vault, never to the agent. */
-    newKey?: { saveAs: string };
+    newKey?: { saveAs: string; replacesEntryId?: string };
   }, rec: ActivityRecord): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
     const { entryId, purpose } = args;
     const operationId = args.operationId || '';
@@ -403,6 +403,7 @@ export class BrokerOps {
     // agent asked, before the entry is fetched, anything is approved or anything is sent.
     const newKey = args.newKey;
     let recipe: NewKeyRecipe | null = null;
+    let replaces: { entry_id: string; name: string } | undefined;
     let saveAs = '';
     if (newKey) {
       saveAs = typeof newKey.saveAs === 'string' ? newKey.saveAs.trim() : '';
@@ -423,6 +424,21 @@ export class BrokerOps {
           + 'key-making addresses it knows (see its description).', 'NO_RECIPE');
       }
       rec.extra = { ...(rec.extra ?? {}), recipe: recipe.id };
+      // SPEC-key-rotation R1: the secret this key is to replace must be one this agent has. Its
+      // setup is read (never its value), which the server refuses for an entry that is not ours.
+      if (newKey.replacesEntryId !== undefined && newKey.replacesEntryId !== '') {
+        const rid = newKey.replacesEntryId;
+        let old: Awaited<ReturnType<AgentVaultAPI['getSecretMeta']>> | null = null;
+        if (typeof rid === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(rid)) {
+          try { old = await this.api.getSecretMeta(rid); } catch { old = null; }
+        }
+        if (!old) {
+          return err('Refused: replaces_entry_id is not a secret this agent has. Nothing was sent. '
+            + 'Use vault_entries_list for the id of the secret the new key should replace, or leave it out to save a new secret.', 'BAD_REQUEST');
+        }
+        replaces = { entry_id: rid as string, name: String(old.name ?? '').slice(0, 256) };
+        rec.extra = { ...(rec.extra ?? {}), replaces: rid as string };
+      }
     } else if (agentReq?.origin) {
       const hit = this.recipes.loose(agentReq.origin, agentReq.method || 'GET', String(agentReq.path ?? ''));
       if (hit) return err(NEW_KEY_POINTER(hit.service_name), 'USE_NEW_KEY');
@@ -1058,8 +1074,8 @@ export class BrokerOps {
       if (recipe) {
         return await this.finishNewKey({
           recipe, slot, saveAs, result, vaultKey, agentId: s.agent_id ?? '', entryId,
-          sourceName: s.name ?? entryId, address: `${originString(def.origin)}/${recipe.path.join('/')}`,
-          tier: verdict.tier, label, rec,
+          sourceName: s.name ?? entryId, address: `${originString(def.origin)}${def.route.path.split(/[?#]/)[0]}`,
+          tier: verdict.tier, label, rec, replaces,
         });
       }
       if (parts && stamped) {
@@ -1145,7 +1161,7 @@ export class BrokerOps {
   private async finishNewKey(a: {
     recipe: NewKeyRecipe; slot: string; saveAs: string; result: { ok: boolean; status?: number; body?: unknown };
     vaultKey: Uint8Array; agentId: string; entryId: string; sourceName: string; address: string;
-    tier: string; label: string; rec: ActivityRecord;
+    tier: string; label: string; rec: ActivityRecord; replaces?: { entry_id: string; name: string };
   }): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
     const { recipe, slot, result, rec } = a;
     if (result.status) rec.status = result.status;
@@ -1164,6 +1180,7 @@ export class BrokerOps {
       name: a.saveAs, service: recipe.service, service_name: recipe.service_name, recipe: recipe.id,
       value: got.value, info: got.info, source_entry: a.entryId, source_name: a.sourceName,
       address: a.address, made_at: new Date().toISOString(),
+      ...(a.replaces ? { replaces: a.replaces } : {}), ...(recipe.rolls ? { rolled: true } : {}),
     });
     if (!sealed.ok) return this.newKeyFailed(slot, rec, result.status, 'could not be locked');
     const blob = { ciphertext: sealed.ciphertext, nonce: sealed.nonce };
@@ -1193,6 +1210,13 @@ export class BrokerOps {
       ? `${where}. It went straight into the owner's vault as "${carriesKey(a.saveAs, got.value, forms) ? 'the name you gave' : a.saveAs}" and is WAITING FOR THE OWNER: `
         + 'no agent can use it until the owner saves it (passkey) and sets it up. You were not given the key and no tool will return it. '
         + 'Tell the owner a new key is waiting in the vault under Needs you.'
+        + (a.replaces
+          ? ` It is marked as the replacement for "${carriesKey(a.replaces.name, got.value, forms) ? 'that secret' : a.replaces.name}": once the owner presses `
+            + 'Replace, that secret holds the new value and you keep using it with the same entry id. '
+            + (recipe.rolls
+              ? 'This address rolled the key in place, so the OLD value may already have stopped working: until the owner presses Replace, calls with that secret can fail.'
+              : 'Then prove the new value works with a harmless call, and ONLY THEN delete the old key at the service (a DELETE with vault_call), and tell the owner.')
+          : '')
       : kept
         ? `${where}, but it is NOT in the vault yet: the vault could not be reached. The helper is holding it, locked, `
           + 'and will hand it over on your next vault call. You were not given the key. Do not make another one.'

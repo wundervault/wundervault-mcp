@@ -23,7 +23,9 @@ export interface NewKeyRecipe {
   /** What the owner reads: "Resend". */
   service_name: string;
   origin: { scheme: 'https'; host: string; port: number };
-  method: 'POST';
+  method: 'POST' | 'PUT';
+  /** The address replaces an existing key's value in place: the old value stops working at once. */
+  rolls?: boolean;
   /** Path segments; '*' stands for exactly one id-like segment. */
   path: string[];
   /** Where the new key is in the JSON answer. */
@@ -53,6 +55,17 @@ export const BUILTIN_RECIPES: readonly NewKeyRecipe[] = Object.freeze([
     origin: { scheme: 'https', host: 'api.cloudflare.com', port: 443 }, method: 'POST',
     path: ['client', 'v4', 'accounts', '*', 'tokens'], secret: ['result', 'value'],
     info: { id: ['result', 'id'], name: ['result', 'name'], status: ['result', 'status'], expires_on: ['result', 'expires_on'] },
+  },
+  // Rolling a token in place: the answer is the new value itself (SPEC-key-rotation R6).
+  {
+    id: 'cloudflare.user-token-roll', service: 'cloudflare', service_name: 'Cloudflare', rolls: true,
+    origin: { scheme: 'https', host: 'api.cloudflare.com', port: 443 }, method: 'PUT',
+    path: ['client', 'v4', 'user', 'tokens', '*', 'value'], secret: ['result'], info: {},
+  },
+  {
+    id: 'cloudflare.account-token-roll', service: 'cloudflare', service_name: 'Cloudflare', rolls: true,
+    origin: { scheme: 'https', host: 'api.cloudflare.com', port: 443 }, method: 'PUT',
+    path: ['client', 'v4', 'accounts', '*', 'tokens', '*', 'value'], secret: ['result'], info: {},
   },
   {
     id: 'sendgrid.api-key', service: 'sendgrid', service_name: 'SendGrid',
@@ -102,7 +115,8 @@ export function recipeProblem(r: NewKeyRecipe, allowLoopback = false): string | 
   const hostOk = /^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/.test(o.host)
     || (allowLoopback && o.host === '127.0.0.1');
   if (!hostOk) return 'host';
-  if (r.method !== 'POST') return 'method';
+  if (r.method !== 'POST' && r.method !== 'PUT') return 'method';
+  if (r.rolls !== undefined && typeof r.rolls !== 'boolean') return 'rolls';
   if (!Array.isArray(r.path) || r.path.length < 1 || r.path.length > 8
       || !r.path.every((s) => s === '*' || SAFE_SEGMENT.test(s))) return 'path';
   const okPath = (p: unknown): p is string[] => Array.isArray(p) && p.length >= 1 && p.length <= 4
@@ -171,12 +185,12 @@ export class NewKeyRecipes {
 
   /** For vault_new_key: the request is spelled exactly as the recipe is. */
   exact(origin: { scheme?: unknown; host?: unknown; port?: unknown }, method: string, rawPath: string): NewKeyRecipe | null {
-    if (String(method).toUpperCase() !== 'POST') return null;
+    const m = String(method).toUpperCase();
     if (String(origin?.host ?? '') !== String(origin?.host ?? '').toLowerCase()) return null;
     const segs = strictSegments(String(rawPath ?? ''));
     if (!segs) return null;
     for (const r of this.list) {
-      if (!sameOrigin(r, origin) || String(origin.host) !== r.origin.host) continue;
+      if (r.method !== m || !sameOrigin(r, origin) || String(origin.host) !== r.origin.host) continue;
       if (r.path.length !== segs.length) continue;
       if (r.path.every((want, i) => (want === '*' ? ID_SEGMENT.test(segs[i]) : want === segs[i]))) return r;
     }

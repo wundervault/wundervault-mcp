@@ -94,6 +94,7 @@ interface SocketRequest {
   accept_index?: unknown;
   /** vault_new_key: the name for the new secret */
   save_as?: unknown;
+  replaces_entry_id?: unknown;
   /** BUILD 2: sign */
   data?: unknown;
   encoding?: unknown;
@@ -1083,7 +1084,10 @@ class AgentDaemon {
           entryId: entry(),
           purpose: purpose(),
           request: msg.request as never,
-          newKey: { saveAs: typeof msg.save_as === 'string' ? msg.save_as : '' },
+          newKey: {
+            saveAs: typeof msg.save_as === 'string' ? msg.save_as : '',
+            ...(typeof msg.replaces_entry_id === 'string' && msg.replaces_entry_id ? { replacesEntryId: msg.replaces_entry_id } : {}),
+          },
         }) as unknown as Record<string, unknown>;
       }
 

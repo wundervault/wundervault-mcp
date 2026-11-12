@@ -250,7 +250,12 @@ export function createServer(args: { url?: string } = {}) {
           + 'OpenAI https://api.openai.com/v1/organization/admin_api_keys and /v1/organization/projects/{project_id}/service_accounts; '
           + 'Twilio https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Keys.json; '
           + 'OpenRouter https://openrouter.ai/api/v1/keys. '
-          + 'vault_call refuses these addresses. Anywhere else, the owner makes the key and adds it to the vault by hand.'
+          + 'vault_call refuses these addresses. Anywhere else, the owner makes the key and adds it to the vault by hand.\n\n'
+          + 'ROTATING a key: pass replaces_entry_id (the secret the new key replaces). The order is: (1) vault_new_key; '
+          + '(2) tell the owner and wait until they press Replace; (3) make a harmless call with that secret to prove the new '
+          + 'value works; (4) only then delete the OLD key at the service with vault_call (DELETE, by its id); (5) tell the owner. '
+          + 'Never delete the old key before the new one has worked. Cloudflare can also roll a token in place '
+          + '(PUT .../tokens/{token_id}/value): that kills the old value at once, so prefer making a new one.'
         ),
         inputSchema: {
           type: 'object',
@@ -262,6 +267,7 @@ export function createServer(args: { url?: string } = {}) {
                 + 'The body is what the service wants for a new key (its name, permissions).',
             },
             save_as: { type: 'string', description: 'Name for the new secret in the vault, 1 to 80 characters.' },
+            replaces_entry_id: { type: 'string', description: 'Optional. The entry id of the secret this new key replaces (one you have). The owner can then replace its value in one step; its name, rules and agents stay as they are.' },
             purpose: { type: 'string', description: 'Why this is needed (audit log, and shown to the owner).' },
           },
           required: ['entry_id', 'request', 'save_as', 'purpose'],
@@ -494,7 +500,10 @@ export function createServer(args: { url?: string } = {}) {
         if (!entry_id || !purpose || !save_as || !a.request || typeof a.request !== 'object') {
           return fail('vault_new_key needs entry_id, request, save_as and purpose.');
         }
-        const r = await broker.send('new_key', { entry_id, purpose: purpose.slice(0, 200), request: a.request, save_as });
+        const r = await broker.send('new_key', {
+          entry_id, purpose: purpose.slice(0, 200), request: a.request, save_as,
+          ...(typeof a.replaces_entry_id === 'string' && a.replaces_entry_id ? { replaces_entry_id: a.replaces_entry_id } : {}),
+        });
         if (r.error) return fail(String(r.error));
         return CallToolResultSchema.parse({
           content: [{ type: 'text', text: `${r.notice ?? ''}\n${renderBody(r.body)}`.trim() }],

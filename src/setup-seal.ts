@@ -350,6 +350,10 @@ export interface IncomingKey {
   name: string; service: string; service_name: string; recipe: string; value: string;
   info: Record<string, string | number | boolean>;
   source_entry: string; source_name: string; address: string; made_at: string;
+  /** SPEC-key-rotation: the vault secret (this agent's entry of it) the new key is meant to replace. */
+  replaces?: { entry_id: string; name: string };
+  /** Made by rolling a key in place: the old value stopped working when this one was made. */
+  rolled?: boolean;
 }
 
 export function sealIncoming(

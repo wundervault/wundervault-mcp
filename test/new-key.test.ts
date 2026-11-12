@@ -57,6 +57,7 @@ function recipes(): NewKeyRecipes {
   return new NewKeyRecipes([
     { ...base, id: 'test.api-key', path: ['api-keys'], secret: ['token'], info: { id: ['id'], name: ['name'] } },
     { ...base, id: 'test.nested', path: ['v4', 'accounts', '*', 'tokens'], secret: ['result', 'value'], info: { id: ['result', 'id'] } },
+    { ...base, id: 'test.roll', method: 'PUT' as const, rolls: true, path: ['v4', 'user', 'tokens', '*', 'value'], secret: ['result'], info: {} },
   ], true);
 }
 
@@ -102,11 +103,11 @@ function adminEntry(tier: '1' | '2' = '1'): Record<string, unknown> & { id: stri
   return e;
 }
 
-function newKey(id: string, over: Record<string, unknown> = {}, saveAs = 'Resend sending key'): Promise<CallResult> {
+function newKey(id: string, over: Record<string, unknown> = {}, saveAs = 'Resend sending key', replacesEntryId?: string): Promise<CallResult> {
   return broker.call({
     entryId: id, purpose: 'Make a sending key',
     request: { origin: { scheme: 'https', host: '127.0.0.1', port }, method: 'POST', path: '/api-keys', body: { name: 'prod' }, ...over } as never,
-    newKey: { saveAs },
+    newKey: { saveAs, ...(replacesEntryId !== undefined ? { replacesEntryId } : {}) },
   });
 }
 function plainCall(id: string, over: Record<string, unknown> = {}): Promise<CallResult> {
@@ -555,6 +556,77 @@ describe('review round 1', () => {
     expect(carriesKey('key_123', 're_abcdef123456')).toBe(false);
     expect(carriesKey('2026-11-11T10:00:00Z', 're_abcdef123456')).toBe(false);
     expect(carriesKey('x re_abcdef123456 y', 're_abcdef123456')).toBe(true);
+  });
+});
+
+describe('rotation (SPEC-key-rotation checks 1, 2)', () => {
+  it('check 1: replaces_entry_id naming a secret this agent has rides in the blob, with that secret\'s name', async () => {
+    const admin = adminEntry();
+    const old = adminEntry();                    // the secret being rotated (same setup, its own id)
+    const r = await newKey(admin.id, {}, 'Resend sending key', old.id) as { notice: string; body: object };
+    expect(r.body).toMatchObject({ new_key: 'waiting for the owner', id: 'key_123' });
+    expect(r.notice).toContain('replacement for "Resend admin"');
+    expect(r.notice).toContain('ONLY THEN delete the old key');
+    const item = opened([...incoming.keys()][0]);
+    expect(item.replaces).toEqual({ entry_id: old.id, name: 'Resend admin' });
+    expect(item.rolled).toBeUndefined();
+    expectNowhere(r);
+    // Reading the old secret's setup never fetched its value: only ?meta=1 reads of it.
+    const reads = toVault.filter((t) => t.includes(`/agent/vault/secrets/${old.id}`));
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads.every((t) => t.includes('meta=1'))).toBe(true);
+  });
+
+  it.each([['an id this agent does not have', 'f'.repeat(32)], ['a malformed id', '../x'], ['an id with a slash', 'a/b']])(
+    'check 1: replaces_entry_id that is %s is refused before anything is sent', async (_n, rid) => {
+      const admin = adminEntry();
+      const r = await newKey(admin.id, {}, 'n', rid) as { error: string; code?: string };
+      expect(r.code).toBe('BAD_REQUEST');
+      expect(r.error).toContain('not a secret this agent has');
+      expect(wire).toEqual([]);
+      expect(incoming.size).toBe(0);
+    });
+
+  it('check 2: rolling in place through vault_call is refused, nothing sent', async () => {
+    const e = adminEntry();
+    for (const method of ['PUT', 'POST', 'PATCH']) {
+      const r = await plainCall(e.id, { method, path: '/v4/user/tokens/tok_1/value', body: {} }) as { code?: string };
+      expect(r.code).toBe('USE_NEW_KEY');
+    }
+    expect(wire).toEqual([]);
+  });
+
+  it('check 2: rolling through vault_new_key: the whole answer string goes to the vault, none of it to the agent', async () => {
+    const admin = adminEntry();
+    const old = adminEntry();
+    serviceAnswer = () => ({ status: 200, body: { success: true, errors: [], result: NEW } });
+    const r = await newKey(admin.id, { method: 'PUT', path: '/v4/user/tokens/tok_1/value', body: {} }, 'CF token', old.id) as { notice: string; body: object };
+    expect(wire).toHaveLength(1);
+    expect(wire[0]).toMatchObject({ method: 'PUT', url: '/v4/user/tokens/tok_1/value' });
+    expect(r.body).toEqual({ new_key: 'waiting for the owner' });
+    expect(r.notice).toContain('OLD value may already have stopped working');
+    expect(r.notice).not.toContain('ONLY THEN delete');
+    const item = opened([...incoming.keys()][0]);
+    expect(item).toMatchObject({ value: NEW, rolled: true, replaces: { entry_id: old.id }, address: `https://127.0.0.1:${port}/v4/user/tokens/tok_1/value` });
+    expectNowhere(r);
+  });
+
+  it('check 2: POST to a roll address, and PUT to a create address, have no recipe for vault_new_key', async () => {
+    const e = adminEntry();
+    expect(((await newKey(e.id, { method: 'POST', path: '/v4/user/tokens/tok_1/value' })) as { code?: string }).code).toBe('NO_RECIPE');
+    expect(((await newKey(e.id, { method: 'PUT', path: '/api-keys' })) as { code?: string }).code).toBe('NO_RECIPE');
+    expect(wire).toEqual([]);
+  });
+
+  it('the real Cloudflare roll addresses are recipes', () => {
+    const R = new NewKeyRecipes();
+    const cf = { scheme: 'https', host: 'api.cloudflare.com', port: 443 };
+    expect(R.exact(cf, 'PUT', '/client/v4/user/tokens/abc123/value')?.id).toBe('cloudflare.user-token-roll');
+    expect(R.exact(cf, 'PUT', '/client/v4/accounts/acc1/tokens/abc123/value')?.id).toBe('cloudflare.account-token-roll');
+    expect(R.exact(cf, 'POST', '/client/v4/user/tokens/abc123/value')).toBeNull();
+    expect(R.loose(cf, 'PUT', '/client/v4/user/tokens/abc123/value/')?.rolls).toBe(true);
+    expect(R.loose(cf, 'PUT', '/client/v4/user/tokens/abc123')).toBeNull();          // editing a token's settings is fine
+    expect(R.loose(cf, 'DELETE', '/client/v4/user/tokens/abc123')).toBeNull();       // deleting the old one is fine
   });
 });
 
