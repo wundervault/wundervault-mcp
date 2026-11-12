@@ -249,10 +249,15 @@ describe('the agent process stops an admin command when access ends', () => {
       ac.abort(ADMIN_ENDED);
       const r = await run;
       expect(r.exitCode).toBe(125);
-      await sleep(100);
-      let alive = true;
-      try { process.kill(pid, 0); } catch { alive = false; }
-      expect(alive).toBe(false);
+      // Gone, or a zombie waiting for init to reap it (a slow reaper on CI runners): either way
+      // it no longer runs. Polled, not one fixed sleep.
+      const running = () => {
+        try { process.kill(pid, 0); } catch { return false; }
+        try { return !/^\d+ \(.*\) Z/.test(fs.readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return true; }
+      };
+      const t1 = Date.now();
+      while (running() && Date.now() - t1 < 3000) await sleep(50);
+      expect(running()).toBe(false);
     } finally {
       process.env.PATH = savedPath;
     }
