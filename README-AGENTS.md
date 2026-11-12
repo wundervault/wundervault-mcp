@@ -90,6 +90,13 @@ crosses the socket is the result, not the secret.
 
 All your config has to say is which agent this is.
 
+## Making a new key
+
+- To create a key at a service, use `vault_new_key`, never `vault_call` (which refuses key-making addresses).
+- You get the new key's id, not the key. It goes to the owner's vault and waits for them.
+- Tell the owner it is waiting under Needs you. You cannot use it until they save it and give it to you.
+- If you are told it is NOT KNOWN whether a key was made, look at the service's key list before trying again.
+
 ## Admin keys
 
 - Use `vault_entries_list` to identify admin keys, which can change the server; it marks them.

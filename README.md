@@ -30,6 +30,7 @@ the installer, at [wundervault.com/verify](https://wundervault.com/verify).
 | Tool | What it does |
 |---|---|
 | `vault_call` | Calls a web service with a secret attached, and returns the answer with the secret removed. |
+| `vault_new_key` | Makes a new key at a service and puts it straight into your vault, where it waits for you. The agent never sees it. |
 | `vault_ssh_exec` | Runs a command on a server you approved, or rsyncs files to it. The broker signs the SSH login; the key never leaves it. |
 | `vault_git` | Runs git push, pull, fetch, clone or ls-remote over SSH with a vaulted key. Linux and macOS. |
 | `vault_2fa_code` | Gives the current authenticator-app code for a sign-in. Never the setup key. |
@@ -275,6 +276,28 @@ request?: {            describe the call (or operation_id + args instead)
 }
 operation_id?, args?   run an operation the owner defined for this secret
 ```
+
+### `vault_new_key`
+
+```
+entry_id: string       a secret that is allowed to create keys at the service
+request: { origin, method: "POST", path, body?, headers? }   as for vault_call
+save_as: string        the name for the new secret in the vault (1-80 characters)
+purpose: string
+```
+
+Makes a new key at a service and puts it straight into the owner's vault. The broker takes
+the new key out of the service's answer, encrypts it so only the owner's browser can read it,
+and the agent gets the key's id and name at the service: never the key, never the rest of the
+answer. The key waits under Needs you; no agent can use it until the owner saves it with a
+passkey and chooses which agents may.
+
+Works only at the key-making addresses the broker knows (Resend, Cloudflare user and account
+tokens, SendGrid, OpenAI admin keys and project service accounts, Twilio, OpenRouter; the list
+and where each was checked is in `RECIPES-new-key.md`). `vault_call` refuses those addresses.
+If the vault cannot be reached after the key is made, the broker keeps it, locked, and hands it
+over on the agent's next vault call; it makes no other key meanwhile. If no answer comes back
+from the service, the agent is told it is not known whether a key was made.
 
 ### `vault_ssh_exec`
 
