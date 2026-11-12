@@ -17,6 +17,7 @@ const ARGS: Record<string, Record<string, unknown>> = {
   vault_sign: { entry_id: 'demo-0004', data: 'hello', purpose: 'demo' },
   vault_2fa_code: { entry_id: 'demo-0005', purpose: 'demo' },
   vault_git: { entry_id: 'demo-0002', purpose: 'demo', subcommand: 'push', repo_dir: '/tmp', remote: 'origin' },
+  vault_new_key: { entry_id: 'demo-0001', purpose: 'demo', save_as: 'Demo key', request: { origin: { scheme: 'https', host: 'api.resend.com', port: 443 }, method: 'POST', path: '/api-keys' } },
 };
 
 describe('demo mode', () => {
