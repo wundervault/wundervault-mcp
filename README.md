@@ -283,6 +283,7 @@ operation_id?, args?   run an operation the owner defined for this secret
 entry_id: string       a secret that is allowed to create keys at the service
 request: { origin, method: "POST", path, body?, headers? }   as for vault_call
 save_as: string        the name for the new secret in the vault (1-80 characters)
+replaces_entry_id?: string   rotating: the secret this key replaces (one this agent has)
 purpose: string
 ```
 

@@ -97,6 +97,17 @@ All your config has to say is which agent this is.
 - Tell the owner it is waiting under Needs you. You cannot use it until they save it and give it to you.
 - If you are told it is NOT KNOWN whether a key was made, look at the service's key list before trying again.
 
+## Rotating a key
+
+1. `vault_new_key` with `replaces_entry_id` set to the secret being rotated.
+2. Tell the owner, and wait until they press Replace in the vault. The secret keeps its entry id, name and rules.
+3. Make a harmless call with that secret to prove the new value works.
+4. Only then delete the OLD key at the service with `vault_call` (a DELETE with the old key's id).
+5. Tell the owner the old key is gone.
+
+Never delete the old key before the new one has worked. Where a service has no way to create keys
+by API, the owner rotates by hand.
+
 ## Admin keys
 
 - Use `vault_entries_list` to identify admin keys, which can change the server; it marks them.
