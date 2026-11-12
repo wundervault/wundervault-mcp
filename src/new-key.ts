@@ -307,6 +307,13 @@ export class NewKeyOutbox {
       fs.fsyncSync(fd);
     } finally { fs.closeSync(fd); }
     fs.renameSync(tmp, this.file(item.id));
+    // The folder too, so the name survives a power cut (review r2 B5). Not every system allows it.
+    try { const d = fs.openSync(this.dir, 'r'); try { fs.fsyncSync(d); } finally { fs.closeSync(d); } } catch { /* best effort */ }
+  }
+
+  /** Anything at all waiting here? One directory read, for the common "nothing" case. */
+  any(): boolean {
+    try { return fs.readdirSync(this.dir).some((n) => n.endsWith('.json') || n.endsWith('.json.tmp')); } catch { return false; }
   }
 
   remove(id: string): void {

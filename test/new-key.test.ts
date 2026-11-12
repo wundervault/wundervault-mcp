@@ -510,6 +510,47 @@ describe('review round 1', () => {
     expect(incoming.get(slot)!.name_mac).toBe(incomingNameMac(vaultKey, agentId, 'Resend sending key'));
   }, 30_000);
 
+  it('r2 F1: a key that equals one of our own phrases is not returned inside it', async () => {
+    const e = adminEntry();
+    for (const key of ['waiting for the owner', 'WAITING FOR THE OWNER', 'Needs you']) {
+      serviceAnswer = () => ({ status: 201, body: { id: 'k', token: key } });
+      const r = await newKey(e.id, {}, `n-${key.length}-${Math.random()}`);
+      expect(JSON.stringify(r)).not.toContain(key);
+      expect(r).toMatchObject({ body: { ok: true }, notice: 'Done.' });
+    }
+  });
+
+  it('r2 F2: while an earlier made key cannot reach the vault, no other key is made', async () => {
+    const e = adminEntry();
+    deliverFails = 99;
+    await newKey(e.id);
+    expect(wire).toHaveLength(1);
+    const r = await newKey(e.id, {}, 'Another') as { code?: string; error: string };
+    expect(r.code).toBe('VAULT_UNREACHABLE');
+    expect(r.error).toContain('no key was made');
+    expect(wire).toHaveLength(1);                       // the service was not called again
+    expect(fs.readdirSync(path.join(dir, 'outbox'))).toHaveLength(1);
+  }, 30_000);
+
+  it('r2 B4: an ordinary vault_call hands over a key the helper is holding', async () => {
+    const e = adminEntry();
+    deliverFails = 99;
+    await newKey(e.id);
+    deliverFails = 0;
+    serviceAnswer = () => ({ status: 200, body: { ok: true } });
+    await plainCall(e.id, { path: '/emails' });
+    expect(fs.readdirSync(path.join(dir, 'outbox'))).toEqual([]);
+    expect(opened([...incoming.keys()][0]).value).toBe(NEW);
+  }, 30_000);
+
+  it('r2 B1: the signing key echoed in an allow-listed field is still removed', async () => {
+    const e = adminEntry();
+    serviceAnswer = () => ({ status: 201, body: { id: 'k', name: ADMIN, token: NEW } });
+    const r = await newKey(e.id);
+    expect(JSON.stringify(r)).not.toContain(ADMIN);
+    expectNowhere(r);
+  });
+
   it('carriesKey: plain neighbours are not mistaken for the key', () => {
     expect(carriesKey('key_123', 're_abcdef123456')).toBe(false);
     expect(carriesKey('2026-11-11T10:00:00Z', 're_abcdef123456')).toBe(false);

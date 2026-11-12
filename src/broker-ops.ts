@@ -440,6 +440,9 @@ export class BrokerOps {
     }
     rec.key = s.name;
     rec.tier = String(s.access_tier ?? '1');
+    // Any vault call hands over a made key the helper is still holding (review r2 B4); the
+    // key-making path below also insists on it.
+    if (!recipe) { try { await this.flushNewKeys(s.agent_id ?? ''); } catch { /* never fails a call */ } }
     if (!modeAllowsHttpBroker(s.entry_mode)) {
       return err(wrongModeMessage(s.entry_mode, 'http'), 'WRONG_MODE');
     }
@@ -1018,7 +1021,12 @@ export class BrokerOps {
         if (signIn || this.recipes.exact(def.origin, def.route.method, def.route.path) !== recipe) {
           return err('Refused: this request no longer matches the key-making address. Nothing was sent.', 'NO_RECIPE');
         }
-        await this.flushNewKeys(s.agent_id ?? '');
+        // A key made earlier that has still not reached the vault comes first: making another
+        // (perhaps with the same name, its slot having lapsed) would leave two (review r2 F2).
+        if (await this.flushNewKeys(s.agent_id ?? '') > 0) {
+          return err('Refused: a new key made earlier is still waiting to reach the vault, which cannot be reached right now. '
+            + 'Nothing was sent and no key was made. Try again in a few minutes.', 'VAULT_UNREACHABLE');
+        }
         slot = newRequestId();
         try {
           await this.api.reserveIncoming(slot, incomingNameMac(vaultKey, s.agent_id ?? '', saveAs));
@@ -1093,6 +1101,7 @@ export class BrokerOps {
   /** Deliver anything this agent's earlier calls made but could not hand to the vault. */
   private async flushNewKeys(agentId: string): Promise<number> {
     let left = 0;
+    if (!this.outbox.any()) return 0;
     for (const item of this.outbox.list(agentId)) {
       try {
         // With its name tag, so the vault takes it even if its slot lapsed meanwhile.
@@ -1100,8 +1109,11 @@ export class BrokerOps {
           ciphertext: item.ciphertext, nonce: item.nonce, ...(item.name_mac ? { name_mac: item.name_mac } : {}),
         });
         this.outbox.remove(item.id);
-      } catch {
-        left++;   // still unreachable, or refused: it stays here, locked, for the next call
+      } catch (e) {
+        // Unreachable (no answer, 5xx): counted, and no new key is made meanwhile. Refused
+        // outright (4xx): it stays here for a person, but does not block the agent for ever.
+        const st = (e as { status?: number }).status;
+        if (st === undefined || st >= 500) left++;
       }
     }
     return left;
@@ -1186,10 +1198,13 @@ export class BrokerOps {
           + 'and will hand it over on your next vault call. You were not given the key. Do not make another one.'
         : `${where}, but it could not be saved and the helper could not keep it. Nobody holds it: delete it at the service `
           + '(its id is below) and try again.';
-    return {
-      status: result.status, body: { new_key: delivered ? 'waiting for the owner' : kept ? 'made, not saved yet' : 'lost', ...info },
-      tier: a.tier, label: a.label, notice,
-    };
+    const reply = { new_key: delivered ? 'waiting for the owner' : kept ? 'made, not saved yet' : 'lost', ...info };
+    // The whole answer, our own words included, once more (review r2 F1): a key that happens to
+    // equal a phrase of ours must not ride out in it. The fallback is too short to hold a key.
+    if (carriesKey(JSON.stringify(reply) + notice + a.label, got.value, forms)) {
+      return { status: result.status, body: { ok: delivered }, tier: a.tier, label: 'new key', notice: delivered ? 'Done.' : 'Not saved.' };
+    }
+    return { status: result.status, body: reply, tier: a.tier, label: a.label, notice };
   }
 
   // ── ssh_agent_open / ssh_agent_close ───────────────────────────────────────
