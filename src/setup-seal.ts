@@ -354,6 +354,10 @@ export interface IncomingKey {
   replaces?: { entry_id: string; name: string };
   /** Made by rolling a key in place: the old value stopped working when this one was made. */
   rolled?: boolean;
+  /** SPEC-save-from-agent: 'saved' = a value the agent already had; absent = made at a service. */
+  origin?: 'saved';
+  /** Where an agent found a saved value: a file path, 'the command x', or 'given in the chat'. */
+  source?: { type: 'file' | 'command' | 'given'; label: string };
 }
 
 export function sealIncoming(

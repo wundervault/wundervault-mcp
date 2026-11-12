@@ -201,6 +201,20 @@ describe('the broker enforces the mode, not the client', () => {
     expect(getSecretCalls).toEqual([]);
   });
 
+  it('save_secret takes a value only: the helper account never reads a file or runs a command (SPEC-save-from-agent S2)', async () => {
+    const marker = path.join(os.tmpdir(), `wv-save-ran-${process.pid}`);
+    fs.rmSync(marker, { force: true });
+    for (const extra of [
+      { from_file: '/etc/hostname' },
+      { from_command: ['/bin/sh', '-c', `echo ran > ${marker}`] },
+      { pick: { env: 'X' }, value: 'some-long-value-123' },
+    ]) {
+      const r = await speak(sock(), { token: TOKEN, op: 'save_secret', save_as: 'x', purpose: 'p', source: { type: 'file', label: '/x' }, ...extra });
+      expect(r.json.code, JSON.stringify(extra)).toBe('BAD_REQUEST');
+    }
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
   it('pay and sign refuse every other kind of key, and the reply never carries it (build 2)', async () => {
     for (const id of ['http1', 'ssh1', 'legacy1']) {
       const p = await speak(sock(), { token: TOKEN, op: 'pay', entry_id: id, purpose: 'p',

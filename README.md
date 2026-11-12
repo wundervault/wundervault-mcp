@@ -31,6 +31,7 @@ the installer, at [wundervault.com/verify](https://wundervault.com/verify).
 |---|---|
 | `vault_call` | Calls a web service with a secret attached, and returns the answer with the secret removed. |
 | `vault_new_key` | Makes a new key at a service and puts it straight into your vault, where it waits for you. The agent never sees it. |
+| `vault_save_secret` | Saves a secret the agent already has (a file, a command's output) into your vault without reading it into the chat. It waits for you. |
 | `vault_ssh_exec` | Runs a command on a server you approved, or rsyncs files to it. The broker signs the SSH login; the key never leaves it. |
 | `vault_git` | Runs git push, pull, fetch, clone or ls-remote over SSH with a vaulted key. Linux and macOS. |
 | `vault_2fa_code` | Gives the current authenticator-app code for a sign-in. Never the setup key. |
@@ -276,6 +277,25 @@ request?: {            describe the call (or operation_id + args instead)
 }
 operation_id?, args?   run an operation the owner defined for this secret
 ```
+
+### `vault_save_secret`
+
+```
+save_as: string        the name for the secret in the vault (1-80 characters)
+from_file?: string     an absolute path, read as the agent's own user (up to 64 KB)
+from_command?: string[]  the program, then its arguments; no shell, 30 s, standard output only
+value?: string         the text itself, only when it is already in the chat
+pick?: { env: "NAME" } | { json: "a.b" }   with a file or command: one line of a .env, or one JSON field
+service?: string       a hint for the owner (e.g. "resend")
+purpose: string
+```
+
+Exactly one of `from_file`, `from_command`, `value`. The agent-side MCP process reads the file or
+runs the command as the agent's user (never the broker's account); only the value goes to the
+broker, which locks it so only the owner's browser can read it and puts it under Needs you,
+marked "Saved by an agent". The agent gets the name, the source and the length: never the value,
+never any of the file or output, also not in errors. A failing or slow command saves nothing; its
+standard error is never read. Same limits and outbox as `vault_new_key`.
 
 ### `vault_new_key`
 

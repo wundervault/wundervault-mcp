@@ -39,7 +39,7 @@ let entries = new Map<string, Record<string, unknown>>();
 let wire: { method: string; url: string; body: string }[] = [];
 /** Everything the helper sent to OUR server, verbatim. */
 let toVault: string[] = [];
-let incoming = new Map<string, { name_mac: string; blob?: { ciphertext: string; nonce: string } }>();
+let incoming = new Map<string, { name_mac: string; kind?: string; late_kind?: string; blob?: { ciphertext: string; nonce: string } }>();
 let checkAnswer: () => Record<string, unknown>;
 let serviceAnswer: () => { status: number; body: unknown; raw?: string };
 let reserveAnswer: (() => { status: number; body: unknown }) | null;
@@ -175,7 +175,7 @@ beforeAll(async () => {
     req.on('end', () => {
       const raw = Buffer.concat(chunks).toString('utf8');
       toVault.push(`${req.method} ${req.url} ${JSON.stringify(req.headers)} ${raw}`);
-      if (req.method === 'GET' && pathname === '/agent/profile') return sendJson(res, { vault_key_for_agent: vaultKeyForAgent });
+      if (req.method === 'GET' && pathname === '/agent/profile') return sendJson(res, { vault_key_for_agent: vaultKeyForAgent, agent_id: agentId });
       if (req.method === 'GET' && pathname.startsWith('/agent/vault/secrets/')) {
         const found = entries.get(pathname.slice('/agent/vault/secrets/'.length));
         return found ? sendJson(res, found) : sendJson(res, { detail: 'Not found' }, 404);
@@ -184,8 +184,8 @@ beforeAll(async () => {
       if (req.method === 'GET' && pathname.startsWith('/agent/vault/tier2-requests/')) return sendJson(res, { status: 'denied' });
       if (req.method === 'POST' && pathname === '/agent/vault/incoming/reserve') {
         if (reserveAnswer) { const a = reserveAnswer(); return sendJson(res, a.body, a.status); }
-        const b = JSON.parse(raw) as { id: string; name_mac: string };
-        incoming.set(b.id, { name_mac: b.name_mac });
+        const b = JSON.parse(raw) as { id: string; name_mac: string; kind?: string };
+        incoming.set(b.id, { name_mac: b.name_mac, ...(b.kind ? { kind: b.kind } : {}) });
         return sendJson(res, { id: b.id, state: 'reserved' }, 201);
       }
       if (pathname.startsWith('/agent/vault/incoming/')) {
@@ -193,9 +193,9 @@ beforeAll(async () => {
         if (req.method === 'DELETE') { const had = incoming.delete(id); return sendJson(res, { removed: had }); }
         if (req.method === 'PUT') {
           if (deliverFails > 0) { deliverFails--; return sendJson(res, { detail: 'boom' }, 500); }
-          const blob = JSON.parse(raw) as { ciphertext: string; nonce: string; name_mac?: string };
+          const blob = JSON.parse(raw) as { ciphertext: string; nonce: string; name_mac?: string; kind?: string };
           let row = incoming.get(id);
-          if (!row && blob.name_mac) { row = { name_mac: blob.name_mac }; incoming.set(id, row); }   // a late delivery
+          if (!row && blob.name_mac) { row = { name_mac: blob.name_mac, ...(blob.kind ? { late_kind: blob.kind } : {}) }; incoming.set(id, row); }   // a late delivery
           if (!row) return sendJson(res, { detail: 'No such reservation.' }, 404);
           if (row.blob && row.blob.ciphertext !== blob.ciphertext) return sendJson(res, { detail: 'filled' }, 409);
           row.blob = { ciphertext: blob.ciphertext, nonce: blob.nonce };
@@ -684,5 +684,112 @@ describe('recipes (check 15)', () => {
     expect(readNewKey(r, Object.create({ token: 'inherited-secret-1234' }))).toEqual({ ok: false });
     expect(readNewKey(r, [{ token: NEW }])).toEqual({ ok: false });
     expect(readNewKey(r, { token: NEW, id: 7 })).toEqual({ ok: true, value: NEW, info: { id: 7 } });
+  });
+});
+
+// ── vault_save_secret (SPEC-save-from-agent), broker half: checks 1, 6, 7, 8 ──
+describe('vault_save_secret (broker)', () => {
+  const SAVED = 'sk_saved_value_5f4e3d2c1b0a99887766';
+  const save = (over: Record<string, unknown> = {}) => broker.saveSecret({
+    saveAs: 'From .env', purpose: 'keep it safe', value: SAVED,
+    source: { type: 'file', label: '/home/agent/app/.env' }, ...over,
+  } as never);
+
+  it('check 1: sealed into a waiting item of kind saved; the value is nowhere else', async () => {
+    const r = await save({ service: 'resend' });
+    expect(r).toMatchObject({ body: { saved: 'waiting for the owner', name: 'From .env', from: '/home/agent/app/.env', characters: SAVED.length } });
+    expect(incoming.size).toBe(1);
+    const [id] = [...incoming.keys()];
+    expect(incoming.get(id)!.kind).toBe('saved');
+    expect(opened(id)).toMatchObject({ v: 1, name: 'From .env', value: SAVED, origin: 'saved', service: 'resend',
+      source: { type: 'file', label: '/home/agent/app/.env' } });
+    expect(incoming.get(id)!.name_mac).toBe(incomingNameMac(vaultKey, agentId, 'From .env'));
+    expectNowhere(r, SAVED);
+    expect(toVault.join('\n')).not.toContain('From .env');
+    expect(toVault.join('\n')).not.toContain('.env');
+    expect(wire).toHaveLength(0);                       // no service is called
+  });
+
+  it('a name or source line that carries the value is refused before anything is reserved', async () => {
+    expect(await save({ saveAs: `x ${SAVED}` })).toMatchObject({ code: 'BAD_REQUEST' });
+    expect(await save({ source: { type: 'command', label: `the command ${SAVED}` } })).toMatchObject({ code: 'BAD_REQUEST' });
+    expect(incoming.size).toBe(0);
+  });
+
+  it('check 5: a value that is too short, too long, has a NUL or spaces around it is refused, nothing reserved', async () => {
+    for (const value of ['short', 'x'.repeat(16 * 1024 + 1), 'abc\u0000defghij', ' padded-value-123', 'padded-value-123\n']) {
+      const r = await save({ value }) as { error: string; code?: string };
+      expect(r.code).toBe('BAD_VALUE');
+      expect(r.error).not.toContain(value.trim().slice(0, 8));
+    }
+    expect(incoming.size).toBe(0);
+  });
+
+  it('r1 F3: a purpose holding the value is refused and never logged', async () => {
+    const lines: unknown[] = [];
+    (broker as unknown as { activity: { record(r: unknown): void } }).activity = { record: (r) => lines.push(r) };
+    expect(await save({ purpose: `store ${SAVED} please` })).toMatchObject({ code: 'BAD_REQUEST' });
+    expect(await save({ purpose: `store ${SAVED}`, saveAs: '' })).toMatchObject({ code: 'BAD_REQUEST' });
+    expect(JSON.stringify(lines)).not.toContain(SAVED);
+    expect(incoming.size).toBe(0);
+  });
+
+  it('r2 F2: a multibyte value in the purpose is withheld from the log too', async () => {
+    const lines: unknown[] = [];
+    (broker as unknown as { activity: { record(r: unknown): void } }).activity = { record: (r) => lines.push(r) };
+    const value = '\u{1F511}\u{1F511}x';           // 9 bytes, 5 UTF-16 units
+    expect(await save({ value, purpose: `Save this secret: ${value}` })).toMatchObject({ code: 'BAD_REQUEST' });
+    expect(JSON.stringify(lines)).not.toContain(value);
+  });
+
+  it('r1 F2: a refusal that would spell the value is cut to two words', async () => {
+    reserveAnswer = () => ({ status: 422, body: {} });
+    const value = 'Nothing was saved.';
+    const r = await save({ value }) as { error: string; code?: string };
+    expect(r).toEqual({ error: 'Not saved.', code: 'UNSUPPORTED' });
+  });
+
+  it('a bad source type is refused', async () => {
+    expect(await save({ source: { type: 'url', label: 'x' } })).toMatchObject({ code: 'BAD_REQUEST' });
+    expect(await save({ source: { type: 'file', label: '' } })).toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('check 7: vault unreachable at delivery: kept locked on disk, delivered once on the next vault call with its kind', async () => {
+    deliverFails = 3;
+    const r = await save();
+    expect(r).toMatchObject({ body: { saved: 'not saved yet' } });
+    expectNowhere(r, SAVED);
+    const files = fs.readdirSync(path.join(dir, 'outbox'));
+    expect(files).toHaveLength(1);
+    if (process.platform !== 'win32') expect(fs.statSync(path.join(dir, 'outbox', files[0])).mode & 0o777).toBe(0o600);
+    const [id] = [...incoming.keys()];
+    incoming.delete(id);                                 // its slot lapsed meanwhile
+    const e = adminEntry();
+    await plainCall(e.id, { method: 'GET', path: '/other' });
+    expect(incoming.get(id)).toMatchObject({ late_kind: 'saved' });
+    expect(opened(id).value).toBe(SAVED);
+    expect(fs.readdirSync(path.join(dir, 'outbox'))).toEqual([]);
+  });
+
+  it('check 7: a site that does not know kind refuses at reserve: not supported, nothing kept', async () => {
+    reserveAnswer = () => ({ status: 422, body: { detail: 'extra fields not permitted' } });
+    expect(await save()).toMatchObject({ code: 'UNSUPPORTED' });
+    expect(fs.existsSync(path.join(dir, 'outbox')) ? fs.readdirSync(path.join(dir, 'outbox')) : []).toEqual([]);
+  });
+
+  it('check 8: the shared limits come back as the vault words them', async () => {
+    reserveAnswer = () => ({ status: 409, body: { detail: { error: 'NAME_WAITING', message: 'A secret with this name is already waiting for the owner.' } } });
+    expect(await save()).toMatchObject({ code: 'NAME_WAITING' });
+    reserveAnswer = () => ({ status: 409, body: { detail: { error: 'TOO_MANY_WAITING', message: '20 secrets from agents are already waiting.' } } });
+    expect(await save()).toMatchObject({ code: 'TOO_MANY_WAITING' });
+  });
+
+  it('the activity log row says saved, with the name and no value', async () => {
+    const lines: unknown[] = [];
+    (broker as unknown as { activity: { record(r: unknown): void } }).activity = { record: (r) => lines.push(r) };
+    await save();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ kind: 'save', outcome: 'saved', key: 'From .env', extra: { source: 'file', saved: true } });
+    expect(JSON.stringify(lines)).not.toContain(SAVED);
   });
 });

@@ -303,6 +303,8 @@ export interface OutboxItem {
   ciphertext: string;
   nonce: string;
   made_at: string;
+  /** SPEC-save-from-agent: 'saved' for a value an agent saved; absent = a key a service made. */
+  kind?: 'made' | 'saved';
 }
 
 const ITEM_ID = /^[A-Za-z0-9_-]{22,64}$/;

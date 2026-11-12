@@ -461,7 +461,7 @@ function render(){
   $('count').textContent = rows.length + ' of ' + DATA.length + ' destinations · ' + calls + ' calls';
 }
 
-const KIND = { call: 'Call', ssh: 'SSH session', ssh_closed: 'SSH session ended', pay: 'Payment', sign: 'Signature', pruned: 'Old lines removed' };
+const KIND = { call: 'Call', ssh: 'SSH session', ssh_closed: 'SSH session ended', pay: 'Payment', sign: 'Signature', save: 'Saved a secret into the vault', pruned: 'Old lines removed' };
 const OUTCOME = { sent: 'Sent', failed: 'Failed', refused: 'Refused', error: 'Error', opened: 'Opened', closed: 'Closed', signed: 'Signed', removed: 'Removed' };
 const BAD_OUTCOME = new Set(['failed', 'refused', 'error']);
 const APPROVAL = { asked: 'asked you', approved: 'you approved', not_approved: 'not approved' };

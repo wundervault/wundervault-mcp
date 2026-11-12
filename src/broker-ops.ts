@@ -1126,6 +1126,137 @@ export class BrokerOps {
     }
   }
 
+  // ── vault_save_secret (SPEC-save-from-agent) ──────────────────────────────
+  /**
+   * A value the agent's own process read (a file, a command's output, or text it was given)
+   * goes into the vault as "waiting for the owner", like a made key. This op takes ONLY the
+   * value: the broker account never reads a file or runs a command for an agent (S2), so it
+   * cannot become a way to read what the agent cannot.
+   */
+  async saveSecret(args: {
+    saveAs: string; purpose: string; value: string;
+    source: { type: 'file' | 'command' | 'given'; label: string }; service?: string;
+  }): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
+    const rec: ActivityRecord = {
+      kind: 'save', outcome: 'refused', agent: this.agentName, reason: args.purpose,
+      extra: { source: String(args.source?.type ?? '') },
+    };
+    // The purpose is logged whatever happens next: never with the value in it (review r1 F3).
+    if (typeof args.value === 'string' && Buffer.byteLength(args.value, 'utf8') >= 8
+        && carriesKey(String(args.purpose ?? ''), args.value, newKeyForms(args.value))) {
+      rec.reason = '(withheld: it held the value)';
+    }
+    try {
+      let r = await this.saveSecretInner(args, rec);
+      // Our own words too, once more (review r1 F2): a value that happens to equal a phrase of
+      // ours must not ride out in a refusal. The fallback is too short to hold a value.
+      if ('error' in r && typeof args.value === 'string' && Buffer.byteLength(args.value, 'utf8') >= 8
+          && carriesKey(r.error, args.value, newKeyForms(args.value))) {
+        r = err('Not saved.', r.code);
+      }
+      finish(rec, r);
+      return r;
+    } catch (e) {
+      rec.outcome = 'error';
+      // Our own words only: an exception here could quote the value.
+      rec.detail = 'save failed';
+      return err('The secret could not be saved. Nothing was kept.', 'SAVE_FAILED');
+    } finally {
+      this.record(rec);
+    }
+  }
+
+  private async saveSecretInner(args: {
+    saveAs: string; purpose: string; value: string;
+    source: { type: 'file' | 'command' | 'given'; label: string }; service?: string;
+  }, rec: ActivityRecord): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
+    const saveAs = typeof args.saveAs === 'string' ? args.saveAs.trim() : '';
+    if (!saveAs || saveAs.length > 80 || /[\u0000-\u001f\u007f]/.test(saveAs)) {
+      return err('Refused: save_as is the name for the secret, 1 to 80 characters. Nothing was saved.', 'BAD_REQUEST');
+    }
+    const value = args.value;
+    if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') < 8 || Buffer.byteLength(value, 'utf8') > 16 * 1024
+        || value.includes('\u0000') || value !== value.trim()) {
+      return err('Refused: the value must be 8 bytes to 16 KB of text with no spaces around it. Nothing was saved.', 'BAD_VALUE');
+    }
+    const src = args.source;
+    const type = src && (src.type === 'file' || src.type === 'command' || src.type === 'given') ? src.type : null;
+    if (!type || typeof src.label !== 'string' || !src.label || src.label.length > 300) {
+      return err('Refused: where the value came from is missing. Nothing was saved.', 'BAD_REQUEST');
+    }
+    const service = typeof args.service === 'string' && /^[a-z0-9][a-z0-9_.-]{0,63}$/.test(args.service) ? args.service : '';
+    const forms = newKeyForms(value);
+    // The name and the source line travel to the owner's card inside the blob; neither may
+    // carry the value (an agent could pass it as save_as).
+    if (carriesKey(saveAs, value, forms) || carriesKey(src.label, value, forms)) {
+      return err('Refused: the name or the source holds the value itself. Nothing was saved.', 'BAD_REQUEST');
+    }
+    // The purpose goes into the activity log and to the owner (review r1 F3).
+    if (carriesKey(args.purpose ?? '', value, forms)) {
+      return err('Refused: the purpose holds the value itself. Nothing was saved.', 'BAD_REQUEST');
+    }
+    rec.key = saveAs;
+    const profile = await this.api.getProfile() as { agent_id?: string };
+    const agentId = typeof profile.agent_id === 'string' ? profile.agent_id : '';
+    if (!agentId) return err('Refused: this helper could not tell which agent it is. Nothing was saved.', 'NO_AGENT');
+    if (await this.flushNewKeys(agentId) > 0) {
+      return err('Refused: a secret saved earlier is still waiting to reach the vault, which cannot be reached right now. '
+        + 'Nothing was saved. Try again in a few minutes.', 'VAULT_UNREACHABLE');
+    }
+    const vaultKey = await this.api.ensureVaultKey();
+    const slot = newRequestId();
+    const nameMac = incomingNameMac(vaultKey, agentId, saveAs);
+    try {
+      await this.api.reserveIncoming(slot, nameMac, 'saved');
+    } catch (e) {
+      const body = (e as { body?: { detail?: { error?: string; message?: string } } }).body;
+      const st = (e as { status?: number }).status;
+      if (st === 409 && body?.detail?.message) return err(`Refused: ${body.detail.message}`, body.detail.error);
+      if (st === 404 || st === 405 || st === 422) {
+        return err('Refused: this vault cannot take a saved secret yet (the site is older than this helper). Nothing was saved.', 'UNSUPPORTED');
+      }
+      return err('Refused: the vault could not be reached. Nothing was saved. Try again.', 'VAULT_UNREACHABLE');
+    }
+    const sealed = sealIncoming(vaultKey, agentId, slot, {
+      name: saveAs, service, service_name: '', recipe: '', value, info: {},
+      source_entry: '', source_name: '', address: '', made_at: new Date().toISOString(),
+      origin: 'saved', source: { type, label: src.label },
+    });
+    if (!sealed.ok) {
+      try { await this.api.unreserveIncoming(slot); } catch { /* lapses by itself */ }
+      return err('Refused: the value could not be locked. Nothing was saved.', 'BAD_VALUE');
+    }
+    const blob = { ciphertext: sealed.ciphertext, nonce: sealed.nonce };
+    let kept = true;
+    try { this.outbox.put({ id: slot, agent_id: agentId, name_mac: nameMac, ...blob, made_at: new Date().toISOString(), kind: 'saved' }); }
+    catch { kept = false; }
+    let delivered = false;
+    for (const wait of [0, 500, 1500]) {
+      if (wait) await new Promise((r) => setTimeout(r, wait));
+      try { await this.api.deliverIncoming(slot, blob); delivered = true; break; } catch { /* again */ }
+    }
+    if (delivered && kept) this.outbox.remove(slot);
+    if (!delivered && !kept) {
+      try { await this.api.unreserveIncoming(slot); } catch { /* lapses by itself */ }
+    }
+    rec.outcome = delivered || kept ? 'saved' : 'failed';
+    rec.extra = { ...(rec.extra ?? {}), saved: delivered };
+    const chars = [...value].length;
+    const notice = delivered
+      ? `Saved into the owner's vault as "${saveAs}" (${chars} characters, from ${src.label}). It is WAITING FOR THE OWNER: `
+        + 'no agent can use it until the owner saves it (passkey) and sets it up. You were not given the value and no tool will return it. '
+        + 'Tell the owner a secret is waiting in the vault under Needs you.'
+      : kept
+        ? 'NOT in the vault yet: the vault could not be reached. The helper is holding it, locked, and will hand it over on your next vault call.'
+        : 'Not saved: the vault could not be reached and the helper could not keep it. Try again later.';
+    const reply = { saved: delivered ? 'waiting for the owner' : kept ? 'not saved yet' : 'not saved', name: saveAs, from: src.label, characters: chars };
+    if (carriesKey(JSON.stringify(reply) + notice, value, forms)) {
+      return { status: 0, body: { ok: delivered }, tier: '', label: 'save', notice: delivered ? 'Done.' : 'Not saved.' };
+    }
+    if (!delivered && !kept) return err(notice, 'NOT_SAVED');
+    return { status: 0, body: reply, tier: '', label: 'save', notice };
+  }
+
   // ── vault_new_key: after the service answered ──────────────────────────────
 
   /** Deliver anything this agent's earlier calls made but could not hand to the vault. */
@@ -1137,6 +1268,7 @@ export class BrokerOps {
         // With its name tag, so the vault takes it even if its slot lapsed meanwhile.
         await this.api.deliverIncoming(item.id, {
           ciphertext: item.ciphertext, nonce: item.nonce, ...(item.name_mac ? { name_mac: item.name_mac } : {}),
+          ...(item.kind === 'saved' ? { kind: 'saved' as const } : {}),
         });
         this.outbox.remove(item.id);
       } catch (e) {

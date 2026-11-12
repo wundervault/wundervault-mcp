@@ -97,6 +97,12 @@ All your config has to say is which agent this is.
 - Tell the owner it is waiting under Needs you. You cannot use it until they save it and give it to you.
 - If you are told it is NOT KNOWN whether a key was made, look at the service's key list before trying again.
 
+## Saving a secret you already have
+
+- A key in a `.env` or config file, or printed by a command: use `vault_save_secret` with `from_file` or
+  `from_command` (and `pick` for one `NAME=value` line or one JSON field). Never cat or echo it into the chat first.
+- You get back the name, where it came from and its length. It waits for the owner under Needs you.
+
 ## Rotating a key
 
 0. List the keys at the service and note the id of the OLD key (the one in use now).

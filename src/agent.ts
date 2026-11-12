@@ -95,6 +95,10 @@ interface SocketRequest {
   /** vault_new_key: the name for the new secret */
   save_as?: unknown;
   replaces_entry_id?: unknown;
+  /** vault_save_secret: the value the agent's own process read, where from, and a service hint */
+  value?: unknown;
+  source?: unknown;
+  service?: unknown;
   /** BUILD 2: sign */
   data?: unknown;
   encoding?: unknown;
@@ -1088,6 +1092,23 @@ class AgentDaemon {
             saveAs: typeof msg.save_as === 'string' ? msg.save_as : '',
             ...(typeof msg.replaces_entry_id === 'string' && msg.replaces_entry_id ? { replacesEntryId: msg.replaces_entry_id } : {}),
           },
+        }) as unknown as Record<string, unknown>;
+      }
+
+      // SPEC-save-from-agent S2: only a VALUE crosses this socket. The agent's own process read
+      // the file or ran the command as the agent's user; the broker account never does either.
+      case 'save_secret': {
+        if ('from_file' in msg || 'from_command' in msg || 'pick' in msg) {
+          return { error: 'save_secret takes a value only; the file or command is read on the agent side.', code: 'BAD_REQUEST' };
+        }
+        if (!purpose()) return { error: 'save_secret needs purpose.' };
+        const src = (msg.source ?? {}) as { type?: unknown; label?: unknown };
+        return await ops.saveSecret({
+          saveAs: typeof msg.save_as === 'string' ? msg.save_as : '',
+          purpose: purpose(),
+          value: typeof msg.value === 'string' ? msg.value : '',
+          source: { type: src.type as 'file' | 'command' | 'given', label: typeof src.label === 'string' ? src.label : '' },
+          ...(typeof msg.service === 'string' ? { service: msg.service } : {}),
         }) as unknown as Record<string, unknown>;
       }
 

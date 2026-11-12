@@ -15,6 +15,7 @@ import type { AgentRequest } from './http-broker.js';
 import type { VaultEntry } from './types.js';
 import { VERSION } from './version.js';
 import { renderBody } from './render.js';
+import { readSaveSource } from './save-source.js';
 export { renderBody } from './render.js';
 
 export { DIRECTIVE } from './directive.js';
@@ -109,6 +110,9 @@ function mockToolResult(name: string, args: Record<string, any>) {
     case 'vault_new_key':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `Demo made a new key. It went straight into the owner's vault as "${args.save_as ?? 'new key'}" and is waiting for the owner. You were not given the key.${MOCK_NOTE}` }] });
+    case 'vault_save_secret':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `Demo saved "${args.save_as ?? 'secret'}" into the owner's vault; it is waiting for the owner. Nothing was read.${MOCK_NOTE}` }] });
     case 'vault_pay':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ Paid 0.01 USDC on base-sepolia inside the owner's rules. Send this header when you retry: `
@@ -233,6 +237,33 @@ export function createServer(args: { url?: string } = {}) {
             purpose: { type: 'string', description: 'Why this is needed (audit log).' },
           },
           required: ['entry_id', 'purpose'],
+        },
+      },
+      {
+        name: 'vault_save_secret',
+        description: (
+          "Save a secret you ALREADY HAVE into the owner's vault, without reading it into this chat: point at the file it is in, "
+          + 'or the command that prints it, and the helper takes the value from there. It waits for the owner, marked "saved by an agent"; '
+          + 'no agent can use it until the owner saves it with their passkey and sets it up, so tell the owner it is waiting under Needs you. '
+          + 'You get back the name, where it came from and its length, never the value.\n\n'
+          + 'Give exactly one of: from_file (an absolute path; read as your own user, up to 64 KB); from_command (a list: the program, '
+          + 'then its arguments; no shell, 30 seconds, only what it prints on standard output; a failing command saves nothing); '
+          + 'value (the text itself, only when it is already in this chat). With a file or command, pick takes one part: '
+          + '{env:"NAME"} for a NAME=value line (.env files), or {json:"a.b"} for a field of JSON. Otherwise the whole text is '
+          + 'the value, less one final newline. Never cat or echo a secret to find it: use this tool.'
+        ),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            save_as: { type: 'string', description: 'Name for the secret in the vault, 1 to 80 characters.' },
+            from_file: { type: 'string', description: 'Absolute path of the file holding the secret.' },
+            from_command: { type: 'array', items: { type: 'string' }, description: 'The program and its arguments, e.g. ["gh","auth","token"]. No shell.' },
+            value: { type: 'string', description: 'The secret itself, only if it is already in this chat.' },
+            pick: { type: 'object', description: 'Optional, with from_file or from_command: {env:"NAME"} or {json:"a.b.c"}.' },
+            service: { type: 'string', description: 'Optional: the service it is for (e.g. "resend"), shown to the owner as a hint.' },
+            purpose: { type: 'string', description: 'Why it should be in the vault (shown to the owner).' },
+          },
+          required: ['save_as', 'purpose'],
         },
       },
       {
@@ -504,6 +535,27 @@ export function createServer(args: { url?: string } = {}) {
         const r = await broker.send('new_key', {
           entry_id, purpose: purpose.slice(0, 200), request: a.request, save_as,
           ...(typeof a.replaces_entry_id === 'string' && a.replaces_entry_id ? { replaces_entry_id: a.replaces_entry_id } : {}),
+        });
+        if (r.error) return fail(String(r.error));
+        return CallToolResultSchema.parse({
+          content: [{ type: 'text', text: `${r.notice ?? ''}\n${renderBody(r.body)}`.trim() }],
+        });
+      }
+
+      if (request.params.name === 'vault_save_secret') {
+        const a = (request.params.arguments ?? {}) as Record<string, unknown>;
+        const fail = (text: string) => CallToolResultSchema.parse({ content: [{ type: 'text', text }], isError: true });
+        const purpose = String(a.purpose ?? '');
+        const save_as = typeof a.save_as === 'string' ? a.save_as : '';
+        if (!save_as || !purpose) return fail('vault_save_secret needs save_as and purpose.');
+        // Read HERE, in the agent's own process and as the agent's user (spec S2). Only the
+        // value crosses to the helper; nothing of it comes back.
+        const got = await readSaveSource({ from_file: a.from_file, from_command: a.from_command, value: a.value, pick: a.pick });
+        if (!got.ok) return fail(`Not saved: ${got.error}`);
+        const r = await broker.send('save_secret', {
+          save_as, purpose: purpose.slice(0, 200), value: got.value,
+          source: { type: got.type, label: got.label },
+          ...(typeof a.service === 'string' && a.service ? { service: a.service } : {}),
         });
         if (r.error) return fail(String(r.error));
         return CallToolResultSchema.parse({

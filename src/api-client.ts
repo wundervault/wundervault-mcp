@@ -256,12 +256,13 @@ export class AgentVaultAPI {
   }
 
   /** A slot for a key about to be made (SPEC-helper-fetch-and-save): asked BEFORE the service is called. */
-  async reserveIncoming(id: string, nameMac: string): Promise<{ id: string; state: string }> {
-    return this.postJson('/agent/vault/incoming/reserve', { id, name_mac: nameMac });
+  async reserveIncoming(id: string, nameMac: string, kind?: 'saved'): Promise<{ id: string; state: string }> {
+    // `kind` only when it is not the default, so an older site still takes a made key.
+    return this.postJson('/agent/vault/incoming/reserve', { id, name_mac: nameMac, ...(kind ? { kind } : {}) });
   }
 
   /** The locked new key, once. The same delivery again is answered the same way. */
-  async deliverIncoming(id: string, blob: { ciphertext: string; nonce: string; name_mac?: string }): Promise<{ id: string; state: string }> {
+  async deliverIncoming(id: string, blob: { ciphertext: string; nonce: string; name_mac?: string; kind?: 'saved' }): Promise<{ id: string; state: string }> {
     return this.sendJson('PUT', `/agent/vault/incoming/${encodeURIComponent(id)}`, blob);
   }
 
