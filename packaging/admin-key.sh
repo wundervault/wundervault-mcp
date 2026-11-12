@@ -355,7 +355,11 @@ safe_ancestors() {
   while :; do
     if [ -e "$_d" ] || [ -L "$_d" ]; then
       [ -L "$_d" ] && return 1
-      _m=$(ls -ldn "$_d" | awk '{print $1}'); _o=$(ls -ldn "$_d" | awk '{print $3}')
+      # One named folder with -d, so ls is safe here; stat differs between Linux and macOS.
+      # shellcheck disable=SC2012
+      _m=$(ls -ldn "$_d" | awk '{print $1}')
+      # shellcheck disable=SC2012
+      _o=$(ls -ldn "$_d" | awk '{print $3}')
       [ "$_o" = 0 ] || [ "$_o" = "$_want" ] || return 1
       # Writable by others only with the sticky bit (like /tmp): then no one else can rename
       # what is inside it.
