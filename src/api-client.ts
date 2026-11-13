@@ -214,8 +214,12 @@ export class AgentVaultAPI {
     });
     if (!resp.ok) {
       const text = await resp.text().catch(() => '');
-      const err: any = new Error(`HTTP ${resp.status}: ${text}`);
+      // Too many approval requests already waiting (site, owner 2026-11-13): say the server's plain sentence.
+      let waiting = '';
+      try { const b = JSON.parse(text); if (b?.detail?.error === 'too_many_waiting') waiting = String(b.detail.message || ''); } catch { /* not JSON */ }
+      const err: any = new Error(waiting ? `Refused: ${waiting}` : `HTTP ${resp.status}: ${text}`);
       err.status = resp.status;
+      if (waiting) err.code = 'TOO_MANY_WAITING';
       throw err;
     }
     return resp.json() as Promise<{ allowed: boolean; tier: string; request_id?: string;
