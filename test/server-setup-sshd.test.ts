@@ -32,6 +32,8 @@ function gcm(plaintext: Buffer) {
 }
 
 runIt('guided setup against a real sshd', () => {
+  // describe.skip still runs this body while collecting: without the switch, start nothing.
+  if (!process.env.WV_SSHD_SETUP_TEST) { it('needs WV_SSHD_SETUP_TEST=1', () => {}); return; }
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'wv-setup-'));
   process.env.WUNDERVAULT_RUNTIME_DIR = path.join(base, 'run');
   process.env.WUNDERVAULT_SYSTEM_ROOT = path.join(base, 'state');

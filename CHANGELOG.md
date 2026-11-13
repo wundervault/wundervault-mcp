@@ -4,6 +4,28 @@ Changes to `@wundervault/mcp-server`: the MCP server, the broker (`wundervault-a
 installers. The full history, with the website's changes beside it, is at
 <https://wundervault.com/changelog>.
 
+## [2.4.0] — 2026-11-11
+
+Update from the vault: Computers › Update now.
+
+### Added
+
+- **Admin access for minutes at a time.** An admin key works only while the owner allows it: 5, 15 or
+  60 minutes, for one agent. When the time is up, or the owner presses End now, the helper app closes
+  that agent's admin connections (short-lived SSH certificates plus a server-side session check). An agent
+  that tries without it gets `ADMIN_ACCESS_REQUIRED`, and the owner gets the request.
+- **Server setup.** From the vault, the helper app sets a Linux server up with an everyday key and an
+  admin key (`packaging/server/`), then checks its sign-in keys and accounts for changes after each admin
+  session and reports them.
+- **`vault_done`**: an agent says it has finished, which ends its approvals if the owner has set it to.
+
+### Changed
+
+- One use of an "ask me first" secret asks the owner once, not twice.
+- This computer's admin key (`packaging/admin-key.sh`) follows the same cut-off; make it again after
+  updating. It takes the vault's public key and never prints a private one.
+- `vault_entries_list` marks admin keys.
+
 ## [2.3.0] — 2026-11-07
 
 The broker is now called the helper app on every owner-facing screen. Update from the vault:
