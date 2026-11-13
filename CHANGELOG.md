@@ -4,6 +4,27 @@ Changes to `@wundervault/mcp-server`: the MCP server, the broker (`wundervault-a
 installers. The full history, with the website's changes beside it, is at
 <https://wundervault.com/changelog>.
 
+## [2.5.0] — 2026-11-13
+
+Update from the vault: Computers › Update now. Needs wundervault.com 1.5.0 (live with this release).
+
+### Added
+
+- **`vault_new_key`**: makes a new key at a service and puts it straight into the owner's vault, encrypted
+  for the owner's browser. The agent gets the key's id and name at the service, never the key. Built-in
+  recipes: Resend, Cloudflare (user and account tokens), SendGrid, OpenAI (admin keys, project service
+  accounts), Twilio, OpenRouter (`RECIPES-new-key.md`). `vault_call` refuses those addresses.
+  `replaces_entry_id` rotates: the new key replaces that secret's value once the owner saves it.
+- **`vault_save_secret`**: saves a secret the agent already has (a file, a command's output, or given)
+  into the vault as waiting, without reading it into the chat.
+- **`vault_send_secret`**: puts vaulted secrets into Cloudflare Worker secrets. One card per send
+  covers every pairing, Ask-me-first values included.
+
+### Changed
+
+- Too many approval requests waiting (10 per agent): the agent gets the site's plain sentence
+  (`TOO_MANY_WAITING`), not raw HTTP 429 JSON.
+
 ## [2.4.0] — 2026-11-11
 
 Update from the vault: Computers › Update now.

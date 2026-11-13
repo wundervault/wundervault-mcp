@@ -32,6 +32,7 @@ the installer, at [wundervault.com/verify](https://wundervault.com/verify).
 | `vault_call` | Calls a web service with a secret attached, and returns the answer with the secret removed. |
 | `vault_new_key` | Makes a new key at a service and puts it straight into your vault, where it waits for you. The agent never sees it. |
 | `vault_save_secret` | Saves a secret the agent already has (a file, a command's output) into your vault without reading it into the chat. It waits for you. |
+| `vault_send_secret` | Puts secrets from your vault into a Cloudflare Worker's settings (encrypted Worker secrets). You approve the list once; the agent never sees the values. |
 | `vault_ssh_exec` | Runs a command on a server you approved, or rsyncs files to it. The broker signs the SSH login; the key never leaves it. |
 | `vault_git` | Runs git push, pull, fetch, clone or ls-remote over SSH with a vaulted key. Linux and macOS. |
 | `vault_2fa_code` | Gives the current authenticator-app code for a sign-in. Never the setup key. |
