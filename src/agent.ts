@@ -99,6 +99,10 @@ interface SocketRequest {
   value?: unknown;
   source?: unknown;
   service?: unknown;
+  /** vault_send_secret: the signing key, the Cloudflare account, and the list */
+  using?: unknown;
+  account?: unknown;
+  items?: unknown;
   /** BUILD 2: sign */
   data?: unknown;
   encoding?: unknown;
@@ -1110,6 +1114,11 @@ class AgentDaemon {
           source: { type: src.type as 'file' | 'command' | 'given', label: typeof src.label === 'string' ? src.label : '' },
           ...(typeof msg.service === 'string' ? { service: msg.service } : {}),
         }) as unknown as Record<string, unknown>;
+      }
+
+      case 'send_secret': {
+        if (!purpose()) return { error: 'send_secret needs purpose.' };
+        return await ops.sendSecrets({ using: msg.using, account: msg.account, items: msg.items, purpose: purpose() }) as unknown as Record<string, unknown>;
       }
 
       case 'ssh_agent_open': {

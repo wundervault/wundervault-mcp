@@ -183,6 +183,13 @@ export class AgentVaultAPI {
     within_rules?: boolean;
     /** The approved request this call is spending. Single use, burned on the server. */
     approval_id?: string;
+    /**
+     * SPEC-send-a-secret R11. On a recipe ask: entry ids of "Ask me first" values the same owner
+     * approval lets this helper read once each. On a call check: `bundle_id`, the approved and
+     * spent recipe request whose read this spends (the check carries nothing else).
+     */
+    bundle?: string[];
+    bundle_id?: string;
     /** Spec #19: on a locked account the detail travels sealed (wv-t2op-1), under this broker-made id. */
     request_id?: string;
     detail_ciphertext?: string;

@@ -113,6 +113,9 @@ function mockToolResult(name: string, args: Record<string, any>) {
     case 'vault_save_secret':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `Demo saved "${args.save_as ?? 'secret'}" into the owner's vault; it is waiting for the owner. Nothing was read.${MOCK_NOTE}` }] });
+    case 'vault_send_secret':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `Demo: would put ${Array.isArray(args.items) ? args.items.length : 0} secret(s) into Cloudflare Worker settings after the owner approves. Nothing was sent.${MOCK_NOTE}` }] });
     case 'vault_pay':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `✅ Paid 0.01 USDC on base-sepolia inside the owner's rules. Send this header when you retry: `
@@ -264,6 +267,45 @@ export function createServer(args: { url?: string } = {}) {
             purpose: { type: 'string', description: 'Why it should be in the vault (shown to the owner).' },
           },
           required: ['save_as', 'purpose'],
+        },
+      },
+      {
+        name: 'vault_send_secret',
+        description: (
+          "Put secrets from the owner's vault into a Cloudflare Worker's settings (as encrypted Worker secrets), without "
+          + 'you ever seeing them. Use it when a Worker you build or deploy needs keys: a database connection string, a Stripe '
+          + 'key, a webhook secret, another API key. The helper app reads each value and sends it straight to Cloudflare.\n\n'
+          + 'Give: using (the vault entry of a Cloudflare API token allowed to edit Workers), account (the Cloudflare account id), '
+          + 'and items, a list of {secret (vault entry id), worker (the Worker\'s name), name (what its code reads, e.g. '
+          + 'STRIPE_KEY for env.STRIPE_KEY)}. One call can set several secrets in one Worker, or one secret in several Workers. '
+          + 'Find the secrets with vault_entries_list; if one the Worker needs is not there, ask the owner to add it to the '
+          + 'vault (never to paste it here).\n\n'
+          + 'The owner approves the list ONCE (each pairing is shown); sending the same pairing again later asks nothing, '
+          + 'except a secret the owner set to "Ask me first", which asks on every send (all of them on one card). '
+          + 'Only plain text secrets can be sent. Plain settings that are not secret (URLs, '
+          + 'ids, a Stripe publishable key) do not need this: put them in the Worker\'s config yourself. You get back, for '
+          + 'each item, whether it was set.'
+        ),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            using: { type: 'string', description: 'Vault entry id of the Cloudflare API token (permission: Workers Scripts Edit).' },
+            account: { type: 'string', description: 'Cloudflare account id (32 characters).' },
+            items: {
+              type: 'array', maxItems: 20,
+              items: {
+                type: 'object',
+                properties: {
+                  secret: { type: 'string', description: 'Vault entry id of the secret to send.' },
+                  worker: { type: 'string', description: "The Worker's name." },
+                  name: { type: 'string', description: 'The name its code reads, e.g. DATABASE_URL.' },
+                },
+                required: ['secret', 'worker', 'name'],
+              },
+            },
+            purpose: { type: 'string', description: 'Why (shown to the owner on the approval card).' },
+          },
+          required: ['using', 'account', 'items', 'purpose'],
         },
       },
       {
@@ -539,6 +581,25 @@ export function createServer(args: { url?: string } = {}) {
         if (r.error) return fail(String(r.error));
         return CallToolResultSchema.parse({
           content: [{ type: 'text', text: `${r.notice ?? ''}\n${renderBody(r.body)}`.trim() }],
+        });
+      }
+
+      if (request.params.name === 'vault_send_secret') {
+        const a = (request.params.arguments ?? {}) as Record<string, unknown>;
+        const fail = (text: string) => CallToolResultSchema.parse({ content: [{ type: 'text', text }], isError: true });
+        const purpose = String(a.purpose ?? '');
+        if (!purpose || a.using === undefined || a.account === undefined || !Array.isArray(a.items)) {
+          return fail('vault_send_secret needs using, account, items and purpose.');
+        }
+        const r = await broker.send('send_secret', { using: a.using, account: a.account, items: a.items, purpose: purpose.slice(0, 200) });
+        if (r.error) return fail(String(r.error));
+        const rows = (Array.isArray(r.results) ? r.results : []) as Array<Record<string, unknown>>;
+        const lines = rows.map((x) => `${x.sent ? '✅' : '❌'} ${x.name} in Worker ${x.worker}`
+          + (x.sent ? ` set (encrypted Worker secret, HTTP ${x.status})` : `: ${String(x.error ?? 'not set')}${x.status ? ` (HTTP ${x.status})` : ''}${x.code ? ` [${x.code}]` : ''}`));
+        return CallToolResultSchema.parse({
+          content: [{ type: 'text', text: `${r.sent} of ${rows.length} set${r.asked ? ' (the owner approved the list)' : ''}. `
+            + `The values went from the vault to Cloudflare; you were not given them.\n${lines.join('\n')}` }],
+          ...(Number(r.sent) === rows.length ? {} : { isError: true }),
         });
       }
 

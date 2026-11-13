@@ -70,7 +70,9 @@ async function ownerApproval(d: Deps, a: {
    * about on its own rather than riding on the first one's approval (round 1, F1).
    */
   pendingKey?: string;
-}): Promise<{ ok: true; addPayee: boolean } | OpError> {
+  /** R11: sent with the ask, outside the sealed detail, so the server can open one read per value. */
+  bundle?: string[];
+}): Promise<{ ok: true; addPayee: boolean; requestId: string } | OpError> {
   const pendingKey = a.pendingKey ?? a.commit;
   let requestId = d.state.pendingFor(pendingKey);
   if (requestId) {
@@ -97,9 +99,10 @@ async function ownerApproval(d: Deps, a: {
       body = {
         entry_id: a.entryId, kind: a.kind, request_id: generatedId,
         detail_ciphertext: sealed.ciphertext, detail_nonce: sealed.nonce, purpose: '',
+        ...(a.bundle?.length ? { bundle: a.bundle } : {}),
       };
     } else {
-      body = { entry_id: a.entryId, kind: a.kind, detail: a.detail, purpose: '' };
+      body = { entry_id: a.entryId, kind: a.kind, detail: a.detail, purpose: '', ...(a.bundle?.length ? { bundle: a.bundle } : {}) };
     }
     const v = await d.api.checkOperation(body);
     if (generatedId !== undefined && v.request_id !== generatedId) {
@@ -134,7 +137,7 @@ async function ownerApproval(d: Deps, a: {
   d.state.setPending(pendingKey, null);
   const second = await d.api.checkOperation({ entry_id: a.entryId, kind: a.kind, approval_id: requestId, purpose: '' });
   if (!second.allowed) return err(`${second.message ?? 'The approval could not be used.'} Nothing was signed.`, 'NOT_APPROVED');
-  return { ok: true, addPayee: opened.token.addPayee };
+  return { ok: true, addPayee: opened.token.addPayee, requestId };
 }
 
 /** Turn a thrown LedgerUnreadable (or anything) into a refusal, never a half-done payment. */
@@ -404,6 +407,10 @@ export async function twoFactorCode(d: Deps & { sleep?: (ms: number) => Promise<
 export async function approveStamp(d: Deps, args: {
   entryId: string; s: SecretResponse; vaultKey: Uint8Array; origin: string; recipe: unknown;
   recipeSha: string; summary: string; purpose: string;
+  /** R11: "Ask me first" values this approval also opens one read each for. Never "already approved". */
+  bundle?: string[];
+  /** Told the approved request's id once it is spent, so the caller can spend the bundle's reads. */
+  onApproved?: (requestId: string) => void;
 }): Promise<OpError | null> {
   const pol = readPolicy({ ciphertext: args.s.policy_ciphertext, nonce: args.s.policy_nonce, vaultKey: args.vaultKey, entryId: args.entryId, kind: 'stamped' });
   if (!pol.ok) return err(`Refused: this secret's settings could not be used (${pol.reason}). Nothing was sent.`, 'BAD_POLICY');
@@ -411,7 +418,7 @@ export async function approveStamp(d: Deps, args: {
     if (pol.policy) {
       const bad = d.state.acceptPolicy(pol.policy);
       if (bad) return err(`Refused: ${bad}. Nothing was sent.`, 'BAD_POLICY');
-      if (pol.policy.stamped!.approved.some((a) => a.recipe_sha256 === args.recipeSha && a.origin === args.origin)) {
+      if (!args.bundle?.length && pol.policy.stamped!.approved.some((a) => a.recipe_sha256 === args.recipeSha && a.origin === args.origin)) {
         return { ok: true as const };
       }
     }
@@ -420,8 +427,10 @@ export async function approveStamp(d: Deps, args: {
       entryId: args.entryId, kind: 'recipe', commit: commitment(fields), vaultKey: args.vaultKey, purpose: args.purpose,
       sealed: args.s.vault_locked === true ? { agentId: args.s.agent_id!, name: args.s.name! } : undefined,
       detail: { ...fields, recipe: args.recipe, summary: args.summary, purpose: args.purpose.slice(0, 200) },
+      bundle: args.bundle,
     });
     if ('error' in approval) return approval;
+    args.onApproved?.(approval.requestId);
     return { ok: true as const };
   });
   return 'error' in r ? r : null;

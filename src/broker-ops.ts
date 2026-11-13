@@ -79,7 +79,8 @@ import type { VaultEntry } from './types.js';
 import { BEARER, bindingFromExecConfig, looksLikePrivateKey, secretForms, validateAgentHeaders, pathBindingProblem } from './delivery.js';
 import { checkAgentHeaders, oauth1FromParts, readValue, scrub as scrubParts, secretFormsAll, validateBindingV2, type BindingV2, type Shape } from './parts.js';
 import { SetupPins, sealT2Detail, t2MatchMac, t2OriginMac, newRequestId, sealIncoming, incomingNameMac } from './setup-seal.js';
-import { NewKeyRecipes, NewKeyOutbox, readNewKey, newKeyForms, carriesKey, type NewKeyRecipe } from './new-key.js';
+import { NewKeyRecipes, NewKeyOutbox, readNewKey, newKeyForms, carriesKey, cutForms, type NewKeyRecipe } from './new-key.js';
+import { type SendItem, checkSendArgs, itemSha, listRecipe, listSha, describeList, itemRequest, cloudflareErrors, CLOUDFLARE_ORIGIN, MAX_VALUE_BYTES } from './worker-secrets.js';
 import { renderDetail } from './render.js';
 import { SigningState, readPolicy } from './wallet.js';
 import { normalizeOrigin, validateSendAs, placementRecipe, placementSha, describePlacement, isAskBinding, type SendAs } from './placement.js';
@@ -157,6 +158,8 @@ export class BrokerOps {
    * (StrictHostKeyChecking=yes), so a stale answer can only fail, never let another server in.
    */
   private scanCache = new Map<string, { at: number; key: string }>();
+  /** R11: the `send` nonce of a Worker-send card still waiting on the owner, per list (so a retry waits on it). */
+  private pendingSends = new Map<string, { send: string; missing: SendItem[] }>();
   private async scanCached(target: NonNullable<ReturnType<typeof normalizeSshTarget>>): Promise<string | null> {
     const id = `${target.host}:${target.port}`;
     const hit = this.scanCache.get(id);
@@ -212,6 +215,8 @@ export class BrokerOps {
     };
   }
 
+  private readonly cloudflareOrigin: string;
+
   constructor(
     public readonly agentName: string,
     apiKey: string,
@@ -232,8 +237,11 @@ export class BrokerOps {
       newKeyRecipes?: NewKeyRecipes;
       /** Where a made-but-undelivered key waits, already locked. Default: the helper's own folder. */
       outboxDir?: string;
+      /** Tests only: a local stand-in for api.cloudflare.com (vault_send_secret). */
+      cloudflareOrigin?: string;
     } = {},
   ) {
+    this.cloudflareOrigin = opts.cloudflareOrigin ?? CLOUDFLARE_ORIGIN;
     this.recipes = opts.newKeyRecipes ?? new NewKeyRecipes();
     this.outbox = new NewKeyOutbox(opts.outboxDir ?? path.join(systemRoot(), 'new-key-outbox'));
     const pins = SetupPins.shared(opts.pinsPath ?? path.join(systemRoot(), 'setup-pins.json'));
@@ -360,6 +368,10 @@ export class BrokerOps {
     callArgs?: Record<string, unknown>; request?: AgentRequest & { send_as?: unknown };
     /** vault_new_key: the answer holds a new key; it goes to the vault, never to the agent. */
     newKey?: { saveAs: string; replacesEntryId?: string };
+    /** vault_send_secret only (never from the agent): the body carries `placeholder`; `value` replaces it at sending. */
+    inject?: { placeholder: string; value: string };
+    /** vault_send_secret: which vaulted secret this call carries, for the activity row. */
+    sending?: { secret: string; worker: string; name: string };
   }): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
     // One line in the activity log for every call, whatever happens to it. The inner body
     // fills in what it learns (the key's name, the address, the approval, the status) as
@@ -380,6 +392,7 @@ export class BrokerOps {
       rec.extra = { operation: args.operationId };
     }
     if (args.newKey) rec.extra = { ...(rec.extra ?? {}), new_key: true };
+    if (args.sending) rec.extra = { ...(rec.extra ?? {}), send_secret: args.sending.secret, worker: args.sending.worker, as: args.sending.name };
     try {
       const r = await this.callInner(args, rec);
       finish(rec, r);
@@ -398,9 +411,16 @@ export class BrokerOps {
     callArgs?: Record<string, unknown>; request?: AgentRequest & { send_as?: unknown };
     /** vault_new_key: the answer holds a new key; it goes to the vault, never to the agent. */
     newKey?: { saveAs: string; replacesEntryId?: string };
+    inject?: { placeholder: string; value: string };
   }, rec: ActivityRecord): Promise<{ status: number; body: unknown; tier: string; label: string; notice?: string } | OpError> {
     const { entryId, purpose } = args;
     const operationId = args.operationId || '';
+    if (args.inject) {
+      const x = args.request as { sign_in?: unknown; stamp?: unknown; send_as?: unknown } | undefined;
+      if (args.newKey || args.operationId || !x || x.sign_in !== undefined || x.stamp !== undefined || x.send_as !== undefined) {
+        return err('Refused: a secret can be carried only in a plain request. Nothing was sent.', 'BAD_REQUEST');
+      }
+    }
     const callArgs = args.callArgs ?? {};
     let agentReq = args.request;
 
@@ -1070,12 +1090,28 @@ export class BrokerOps {
           return err('Refused: the vault could not be reached to hold the new key, so none was made. Nothing was sent. Try again.', 'VAULT_UNREACHABLE');
         }
       }
+      // vault_send_secret: the value goes into the body here and nowhere earlier, so every hash,
+      // approval and log line above saw only the placeholder. Plain requests only.
+      let sendBody: string | Record<string, unknown> = typeof agentReq?.body === 'string'
+        ? agentReq.body
+        : ((agentReq?.body ?? {}) as Record<string, unknown>);
+      const inject = args.inject;
+      if (inject) {
+        if (operationId || recipe || stamped || partsBinding || typeof sendBody === 'string') {
+          return err('Refused: this key cannot carry a secret into another service (it must be a plain token). Nothing was sent.', 'WRONG_KIND');
+        }
+        const filled: Record<string, unknown> = {};
+        let placed = 0;
+        for (const [k, v] of Object.entries(sendBody)) {
+          if (v === inject.placeholder) { filled[k] = inject.value; placed++; } else filled[k] = v;
+        }
+        if (placed !== 1) return err('Refused: the request had no single place for the secret. Nothing was sent.', 'BAD_REQUEST');
+        sendBody = filled;
+      }
       let result: Awaited<ReturnType<typeof performOperation>>;
       try {
         result = await performOperation(
-        def, operationId ? callArgs : (typeof agentReq?.body === 'string'
-          ? agentReq.body
-          : ((agentReq?.body ?? {}) as Record<string, unknown>)),
+        def, operationId ? callArgs : sendBody,
         stamped ? stamped.secret : (partsBinding ? '' : secret), approvedOrigins,
         stamped ? (img) => computeStamp(stampRecipe!, img, stamped) : undefined,
         partsBinding && parts && !stamped ? { binding: partsBinding, parts } : undefined,
@@ -1096,6 +1132,11 @@ export class BrokerOps {
         for (const value of Object.values(parts).sort((a, b) => b.length - a.length)) {
           result = scrubSecret(result, value) as typeof result;
         }
+      }
+      // A service may echo what it was sent: every spelling of the carried secret is cut from its answer.
+      if (inject) {
+        for (const form of newKeyForms(inject.value)) result = scrubSecret(result, form) as typeof result;
+        if (inject.value.length < 4) result = scrubSecret(result, inject.value) as typeof result;
       }
       if (result.status) rec.status = result.status;
       if (!result.ok && /internal or reserved address/.test(result.error ?? '')
@@ -1121,6 +1162,180 @@ export class BrokerOps {
         status: result.status ?? 0, body: result.body, tier: verdict.tier, label,
         ...(noticeForAgent ? { notice: noticeForAgent } : {}),
       };
+    } finally {
+      bytes.fill(0);
+    }
+  }
+
+  // ── vault_send_secret (SPEC-send-a-secret-to-a-service, revision 2) ─────────
+  /**
+   * Put vaulted secrets into Cloudflare Worker secrets. One owner approval for the items not
+   * approved before (remembered per item in the signing key's sealed policy); then one PUT per
+   * item, signed with `using` under ALL of its own rules (vault_call's path). The value is put
+   * into the body only at sending. The agent gets per-item results, never a value.
+   */
+  async sendSecrets(args: { using: unknown; account: unknown; items: unknown; purpose: string }): Promise<{
+    sent: number; results: Array<{ worker: string; name: string; sent: boolean; status?: number; error?: string; code?: string }>;
+    asked: boolean;
+  } | OpError> {
+    const checked = checkSendArgs(args);
+    if (!checked.ok) return err(`Refused: ${checked.reason}. Nothing was sent.`, 'BAD_REQUEST');
+    const { using, account, items } = checked.list;
+    const cf = this.cloudflareOrigin;
+    const purpose = String(args.purpose ?? '').slice(0, 200);
+    // The signing key: read its setup (never its value). Its own rules run again on every PUT.
+    let signer: Awaited<ReturnType<AgentVaultAPI['getSecretMeta']>>;
+    try { signer = await this.api.getSecretMeta(using); } catch {
+      return err('Refused: "using" is not a key this agent has. Nothing was sent.', 'BAD_REQUEST');
+    }
+    if (!modeAllowsHttpBroker(signer.entry_mode)) return err('Refused: "using" must be a web-service key (the Cloudflare API token). Nothing was sent.', 'WRONG_KIND');
+    // Each value: one this agent has, a single piece of text (R4). "Ask me first" values are sent too,
+    // and every send that includes one asks the owner, on one card for all of them (R11).
+    const names = new Map<string, string>();
+    const metas = new Map<string, Awaited<ReturnType<AgentVaultAPI['getSecretMeta']>>>();
+    for (const it of items) {
+      if (metas.has(it.secret)) continue;
+      let m: Awaited<ReturnType<AgentVaultAPI['getSecretMeta']>>;
+      try { m = await this.api.getSecretMeta(it.secret); } catch {
+        return err(`Refused: ${it.secret} is not a secret this agent has. Nothing was sent.`, 'BAD_REQUEST');
+      }
+      const shape = m.setup?.shape;
+      if (!modeAllowsHttpBroker(m.entry_mode) || shape === 'website_login' || shape === 'two_factor'
+          || shape === 'signed_set' || shape === 'key_id'
+          || (m.setup?.binding as { in?: string } | undefined)?.in === 'stamp'
+          || (coerceCfg(m.exec_config).credential_binding as { in?: string } | undefined)?.in === 'stamp') {
+        return err(`Refused: "${m.name ?? it.secret}" is not a single piece of text (a wallet, SSH or signing key, a stored login, a 2FA seed or a stamped key never leaves the vault). Nothing was sent.`, 'WRONG_KIND');
+      }
+      metas.set(it.secret, m);
+      names.set(it.secret, String(m.name ?? 'a secret'));
+    }
+    // One approval for the items not approved before.
+    const vaultKey = await this.api.ensureVaultKey();
+    const sp = signer as unknown as { policy_ciphertext?: string | null; policy_nonce?: string | null };
+    const pol = readPolicy({ ciphertext: sp.policy_ciphertext, nonce: sp.policy_nonce, vaultKey, entryId: using, kind: 'stamped' });
+    if (!pol.ok) return err(`Refused: the signing key's settings could not be read (${pol.reason}). Nothing was sent.`, 'BAD_POLICY');
+    if (pol.policy) {
+      const bad = this.deps().state.acceptPolicy(pol.policy);
+      if (bad) return err(`Refused: ${bad}. Nothing was sent.`, 'BAD_POLICY');
+    }
+    const approved = new Set((pol.policy?.stamped?.approved ?? []).filter((a) => a.origin === cf).map((a) => a.recipe_sha256));
+    const askEach = new Set([...metas].filter(([, m]) => String(m.access_tier ?? '1') !== '1').map(([id]) => id));
+    // The card: pairings never approved, and every pairing whose value asks every time (R11).
+    const missing: SendItem[] = items.filter((it) => !approved.has(itemSha(account, it, cf)) || askEach.has(it.secret));
+    let asked = false;
+    let bundleId: string | undefined;
+    if (missing.length) {
+      asked = true;
+      // A card still waiting for this exact request is waited on, not asked again: same lines, same
+      // nonce, even if the owner's answer has since remembered some pairings (review R11 r1 F2).
+      const waitKey = listSha(account, items, cf);
+      const waiting = this.pendingSends.get(waitKey);
+      if (waiting) { missing.length = 0; missing.push(...waiting.missing); }
+      const ids = [...new Set(missing.filter((it) => askEach.has(it.secret)).map((it) => it.secret))].sort();
+      let ask: { ids: string[]; send: string } | undefined;
+      if (ids.length) {
+        const send = waiting?.send ?? randomBytes(16).toString('hex');
+        if (!waiting) this.pendingSends.set(waitKey, { send, missing: [...missing] });
+        ask = { ids, send };
+      }
+      const refused = await approveStamp(this.deps(), {
+        entryId: using, s: signer, vaultKey, origin: cf,
+        recipe: listRecipe(account, missing, cf, ask), recipeSha: listSha(account, missing, cf, ask),
+        summary: describeList(account, missing, names, String(signer.name ?? 'the signing key'), askEach), purpose,
+        ...(ids.length ? { bundle: ids, onApproved: (rid: string) => { bundleId = rid; } } : {}),
+      });
+      if (!refused || refused.code !== 'WAITING') this.pendingSends.delete(waitKey);
+      if (!refused && ids.length && !bundleId) {
+        return err('Refused: the approval for the "Ask me first" secrets could not be used. Nothing was sent.', 'BAD_APPROVAL');
+      }
+      if (refused) {
+        this.record({ kind: 'call', outcome: 'refused', agent: this.agentName, entry_id: using, reason: purpose,
+          approval: 'not_approved', key: signer.name, detail: firstLine(refused.error),
+          extra: { send_secrets: missing.map((it) => `${it.secret}:${it.worker}:${it.name}`).join(' ').slice(0, 900) } } as ActivityRecord);
+        return { ...refused, error: refused.error.replace(/Nothing was signed\./g, 'Nothing was sent.') };
+      }
+    }
+    // Send, in the order given. A failure stops nothing else: each item says what happened.
+    const results: Array<{ worker: string; name: string; sent: boolean; status?: number; error?: string; code?: string }> = [];
+    // Each value is read ONCE per send and used for every item that names it: an "Ask me first" value
+    // has one read per card, and one secret into several Workers is the common case (review R11 r1 F1).
+    const readOnce = new Map<string, { value: string } | OpError>();
+    try {
+    // "Ask me first" values are read straight after the owner's approval, before any send, so a slow
+    // list can't outlast their ten-minute reads (review R11 r2 B3).
+    for (const id of askEach) {
+      if (!bundleId || !items.some((it) => it.secret === id)) continue;
+      try { readOnce.set(id, await this.readSendValue(id, metas.get(id)!, vaultKey, bundleId)); } catch {
+        readOnce.set(id, err('Not sent: the vault could not be reached to read this secret. Try again.', 'VAULT_UNREACHABLE'));
+      }
+    }
+    for (const it of items) {
+      let got = readOnce.get(it.secret);
+      if (!got) {
+        try { got = await this.readSendValue(it.secret, metas.get(it.secret)!, vaultKey, askEach.has(it.secret) ? bundleId : undefined); } catch {
+          got = err('Not sent: the vault could not be reached to read this secret. Try again.', 'VAULT_UNREACHABLE');
+        }
+        readOnce.set(it.secret, got);
+      }
+      if ('error' in got) { results.push({ worker: it.worker, name: it.name, sent: false, error: got.error, code: got.code }); continue; }
+      const placeholder = `wv-fill-${randomBytes(16).toString('hex')}`;
+      const forms = [...newKeyForms(got.value)];
+      const cut = (t: string) => cutForms(t, forms).split(placeholder).join('[secret]');
+      try {
+        const r = await this.call({
+          entryId: using, purpose: `${purpose} (set ${it.name} in Worker ${it.worker})`.slice(0, 200),
+          request: itemRequest(account, it, placeholder, cf) as never,
+          inject: { placeholder, value: got.value },
+          sending: { secret: it.secret, worker: it.worker, name: it.name },
+        });
+        if ('error' in r) {
+          results.push({ worker: it.worker, name: it.name, sent: false, error: cut(r.error).slice(0, 600), ...(r.code ? { code: r.code } : {}) });
+        } else {
+          // Only Cloudflare's own success envelope counts: a bare 2xx (or {}) is not proof it was set (review r1 F1).
+          const ok = r.status >= 200 && r.status < 300 && (r.body as { success?: unknown } | null)?.success === true;
+          const why = ok ? '' : cloudflareErrors(r.body).map((e) => cut(`${e.code ?? ''} ${e.message}`).trim().slice(0, 220)).join('; ');
+          results.push({ worker: it.worker, name: it.name, sent: ok, status: r.status, ...(ok ? {} : { error: why || `Cloudflare answered HTTP ${r.status}.` }) });
+        }
+      } catch (e) {
+        // A thrown send keeps the list going; the outcome is unknown, not "not set" (Cloudflare may have taken it).
+        results.push({ worker: it.worker, name: it.name, sent: false, error: cut(`The send did not finish (${firstLine((e as Error).message)}); it may or may not have been set. Check, then send it again.`).slice(0, 600), code: 'UNKNOWN_OUTCOME' });
+      }
+    }
+    } finally {
+      for (const g of readOnce.values()) if (!('error' in g)) g.value = '';
+    }
+    return { sent: results.filter((x) => x.sent).length, results, asked };
+  }
+
+  /**
+   * The value of a text secret, read the way vault_call reads one (a grant first). An "Ask me first"
+   * value is read only under the card the owner just approved (`bundleId`, one read each, R11).
+   */
+  private async readSendValue(entryId: string, m: Awaited<ReturnType<AgentVaultAPI['getSecretMeta']>>, vaultKey: Uint8Array,
+    bundleId?: string): Promise<{ value: string } | OpError> {
+    if (String(m.access_tier ?? '1') !== '1' && !bundleId) {
+      return err('Not sent: this secret asks the owner every time, and this send has no approval for it.', 'NOT_ALLOWED');
+    }
+    const verdict = await this.api.checkOperation((bundleId
+      ? { entry_id: entryId, bundle_id: bundleId }
+      : m.vault_locked === true
+        ? { entry_id: entryId, first_sighting: false }
+        : { entry_id: entryId, purpose: '', first_sighting: false }) as never);
+    if (!verdict.allowed) return err('Not sent: the vault did not allow this secret to be read right now (it may be paused or its access ended).', 'NOT_ALLOWED');
+    const full = await this.api.getSecret(entryId, verdict.fetch_grant);
+    if (String(full.rev) !== String(m.rev)) return err('Not sent: this secret changed just now. Try again.', 'CHANGED');
+    const bytes = decryptSecretContent(vaultKey, full.encrypted_content, full.content_nonce);
+    try {
+      let value = new TextDecoder().decode(bytes);
+      if (full.setup?.value_format === 'parts-1') {
+        const v = readValue(value, 'parts-1', 'http', full.setup.shape as Shape);
+        if (!v.ok || Object.keys(v.parts).length !== 1) return err('Not sent: this secret has more than one part; only a single piece of text can be sent.', 'WRONG_KIND');
+        value = Object.values(v.parts)[0];
+      }
+      if (!value.trim()) return err('Not sent: this secret is empty.', 'BAD_VALUE');
+      if (Buffer.byteLength(value, 'utf8') > MAX_VALUE_BYTES) return err(`Not sent: this secret is longer than Cloudflare allows for one Worker secret (${MAX_VALUE_BYTES} bytes).`, 'TOO_LONG');
+      if (looksLikePrivateKey(value) || looksLikeOAuth1Value(value)) return err('Not sent: this looks like a private key or OAuth keys, which never leave the vault.', 'WRONG_KIND');
+      return { value };
     } finally {
       bytes.fill(0);
     }
