@@ -38,6 +38,10 @@ the installer, at [wundervault.com/verify](https://wundervault.com/verify).
 | `vault_2fa_code` | Gives the current authenticator-app code for a sign-in. Never the setup key. |
 | `vault_pay` | Pays an x402 "402 Payment Required" in USDC on Base or Solana, inside the limits you set. |
 | `vault_sign` | Signs data with a signing key. You approve every signature. |
+| `vault_job_request` | Asks you for a scheduled job (a backup, a sync, a report) that the helper app runs on a server with an everyday SSH key. You approve the exact command on the vault's Jobs page; then it runs on its own, every run logged. |
+| `vault_job_status` | Says whether a job request is waiting, approved, declined or expired. |
+| `vault_jobs` | Lists the agent's jobs: name, schedule, state and how the last run went. Never commands, servers or output. |
+| `vault_job_run_now` | Asks for one run of an approved job now, exactly as approved. At most once per 10 minutes per job. |
 | `vault_entries_list` | Lists the secrets this agent may use, and what kind each is. Never their values. |
 
 No tool returns a secret's value. Version 1's hand-over tools (`vault_exec`, `vault_entry_get`,
@@ -278,6 +282,30 @@ request?: {            describe the call (or operation_id + args instead)
 }
 operation_id?, args?   run an operation the owner defined for this secret
 ```
+
+### `vault_job_request`
+
+```
+name: string             the job's name (1-80 characters)
+entry_id: string         an everyday SSH key this agent holds that runs without asking
+destination: string      user@host[:port]
+argv: string[]           the exact program and arguments; no shell; 16 KB total at most
+schedule: { kind: "daily", time: "HH:MM", tz } | { kind: "every", hours: 1-24, tz }
+timeout_s?: number       10-600, default 300
+grace_minutes?: number   5-1440, default 30: how late a run may be before it counts as missed
+why: string              shown to the owner (300 characters)
+```
+
+Nothing runs until the owner approves the request on the vault's **Jobs** page with a passkey; the
+card shows the exact server, command, key and schedule. After that the helper app runs the job by
+itself on its schedule, with no agent involved, and writes each run to its signed activity log as
+"job: <name>". Admin and ask-first keys are refused. One job runs per server at a time. A run's output
+stays with the helper; when a run fails, its last 20 lines are sealed so only the owner's browser can
+read them. The site tells the owner when a job fails or misses a run (on the Jobs page, and in at most
+one combined email an hour). Changing a job's command, server, key or schedule is a new request.
+`vault_job_status { request_id }` follows the request; `vault_jobs` lists the agent's jobs;
+`vault_job_run_now { job_id, purpose }` asks for one run of the stored definition (at most once per 10
+minutes per job).
 
 ### `vault_save_secret`
 

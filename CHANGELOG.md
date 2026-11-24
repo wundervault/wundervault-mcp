@@ -4,6 +4,46 @@ Changes to `@wundervault/mcp-server`: the MCP server, the broker (`wundervault-a
 installers. The full history, with the website's changes beside it, is at
 <https://wundervault.com/changelog>.
 
+## [2.6.0] — 2026-11-24
+
+Update from the vault: Computers › Update now. This release includes the security fixes that were
+prepared as 2.5.1 (never released on its own). Then, on each server you set up for admin access, run
+**Set up everyday access** once more (it is safe to repeat) so the server gets the fixed change check.
+Setup first lists anything that changed on the server since its last check (a long list is also saved
+on the server, and the result says where); read it, because setup then records the server as it is
+now as normal.
+
+### New: scheduled jobs the helper app runs for you
+
+- A backup, sync or report that has to run at 3 AM no longer needs a key left in a file. An agent asks
+  for a job with `vault_job_request` (key, server, exact command, schedule, why); you approve the exact
+  command on the vault's new **Jobs** page with your passkey. The helper app then runs it on schedule by
+  itself, with no agent involved, and writes every run to its activity log as "job: <name>". Only
+  everyday keys that run without asking can be used; changing anything is a new request.
+- A failed run's last 20 lines are sealed so only your browser can read them. A missed run is reported
+  by the site, which knows the schedule (a job cannot report its own absence). New tools:
+  `vault_job_request`, `vault_job_status`, `vault_jobs`, `vault_job_run_now`.
+- The activity log also records a job being saved, refused, paused, resumed or deleted on this computer.
+- Server pages list every sign-in key on the server, and removing one takes your passkey each time.
+
+### Security
+
+- Server setup, key removal and the change check now read and write each account's sign-in key file
+  as that account, never as the administrator. Before, someone with an account on a set-up server
+  could make the change check show pieces of a protected file (such as the password file), or, while
+  you ran setup or removed a key, have it change a file they should not be able to change. Setup and
+  key removal are fixed as soon as the helper app updates; the change check on a server is fixed when
+  you run the setup there again.
+- Setup and key removal now check the key file again just before writing and stop, changing nothing,
+  if it changed since they read it (a change in the last instant before the write can still be lost), and
+  refuse a key file over 1 MB; the change check reports such a file instead of reading it line by line.
+
+- Updated the MCP library (`@modelcontextprotocol/sdk` 1.29.0 → 1.32.2) and the parts it brings in
+  (`zod`, `proxy-addr`, `body-parser`, `qs`, `ip-address`, `fast-uri`, `@hono/node-server` and others).
+  `npm audit --omit=dev` went from 10 advisories (1 critical, 6 high) to none. The fixed problems are in the
+  library's web-server and sign-in parts, which the helper app does not use (it talks to agents over
+  stdin/stdout only), so no known attack reached it; this keeps it that way.
+
 ## [2.5.0] — 2026-11-13
 
 Update from the vault: Computers › Update now. Needs wundervault.com 1.5.0 (live with this release).

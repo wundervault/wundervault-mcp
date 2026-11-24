@@ -1,0 +1,4 @@
+{"round": 25, "decisions": [
+ {"id": "B1", "action": "deferred", "claim": "npm install -g can resolve newer deps than the lockfile", "reason": "true of every release; the signed archive (what Update now installs) uses the lockfile. Range floor ^1.32.2 guarantees the fixed SDK. Not in scope."},
+ {"id": "B2", "action": "fixed", "claim": "flaky test not named", "reason": "Identified: test/lock.test.ts 'reports the credential as taken while held, and free once released' fails the same way on unchanged 2.5.0 when two full suites run at once (load/timing). Pre-existing, not caused by this change. 2.5.1: lock.test.ts 10/10 passes alone; full suite runs 2 and 3 pass 2519/2519."}
+]}

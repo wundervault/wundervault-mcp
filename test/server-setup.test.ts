@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import crypto from 'node:crypto';
-import { validateServerOrder, runSetup, parseReport, fitLines, sealForOwner, resultAad, type ServerRunner } from '../src/server-setup.js';
+import { validateServerOrder, runSetup, parseReport, parseKeys, runListKeys, fitLines, sealForOwner, resultAad, type ServerRunner } from '../src/server-setup.js';
 import { openServerOrder, openOrder, pollOnce, type BrokerUpdateDeps } from '../src/broker-update.js';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -33,6 +33,14 @@ describe('setup orders are checked before anything runs (check 24)', () => {
     expect(PUB(1)).toMatch(/^ssh-ed25519 [A-Za-z0-9+/]{68}$/);
     const r = validateServerOrder(setup(), FP, Date.now());
     expect(r.ok).toBe(true);
+  });
+  it('accepts a list-keys order with only base fields, but refuses an extra field', () => {
+    const o = setup({ type: 'list-keys' });
+    for (const k of ['everyday_user', 'everyday_entry_id', 'everyday_pub', 'emergency_pub', 'logs']) delete o[k];
+    expect(validateServerOrder(o, FP, Date.now())).toEqual({ ok: true, order: {
+      type: 'list-keys', order_id: o.order_id, entry_id: o.entry_id, destination: o.destination,
+    } });
+    expect(validateServerOrder({ ...o, extra: 1 }, FP, Date.now())).toEqual({ ok: false, reason: 'malformed' });
   });
   it.each([
     ['another broker', { broker: 'SHA256:other' }, 'wrong broker'],
@@ -176,6 +184,105 @@ describe('change check report', () => {
     e.setAuthTag(raw.subarray(-16));
     e.update(raw.subarray(0, -16));
     expect(() => e.final()).toThrow();
+  });
+});
+
+describe('sign-in key listing', () => {
+  const key = 'KEY\topc\t0123456789abcdef\towner@example.test\tno';
+  const protectedKey = 'KEY\topc\tabcdef0123456789\twundervault-emergency\tyes';
+  const rec = { everyday_entry_id: 'entry-daily-1', everyday_destination: 'wv-agent@203.0.113.7:2222',
+    admin_user: 'opc', at: new Date().toISOString() };
+  const DEST = 'opc@203.0.113.7:2222';
+
+  it('keeps only valid key summaries and requires END', () => {
+    const emptyComment = 'KEY\twv-agent\t1111111111111111\t\tno';
+    expect(parseKeys(`${key}\n`)).toBeNull();
+    expect(parseKeys('END\n')).toEqual([]);
+    expect(parseKeys([
+      key + '\r', protectedKey, emptyComment,
+      PUB(1),
+      `KEY\topc\t0123456789abcdef\t${PUB(1)}\tno`,
+      'KEY\topc\tnot-a-fingerprint\towner\tno',
+      'KEY\topc\t0123456789abcdef\tbad/comment\tno',
+      'KEY\topc\t0123456789abcdef\tbad comment\tno',
+      'KEY\tbad user\t0123456789abcdef\towner\tno',
+      'KEY\tbad/user\t0123456789abcdef\towner\tno',
+      'NOTE\tsomething-else\t',
+      'KEY\topc\t0123456789abcdef\towner\tmaybe',
+      'END',
+    ].join('\n'))).toEqual([key, protectedKey, emptyComment]);
+  });
+
+  it('keeps keys of any account name the server has, and the notes on what it cannot see (r1 F3, B3)', () => {
+    const dotted = 'KEY\talice.example\t2222222222222222\talice\tno';
+    const notes = ['NOTE\tskipped-link\tbob', 'NOTE\tunreadable\tdave', 'NOTE\tother-file\tcarol', 'NOTE\tother-command', 'NOTE\tca-keys', 'NOTE\tother-config'];
+    // As the server prints them: a note with no account ends in a tab, which the cleanup trims.
+    const raw = notes.map((n) => (n.split('\t').length === 2 ? n + '\t' : n));
+    expect(parseKeys([dotted, ...raw, 'END'].join('\n'))).toEqual([dotted, ...notes]);
+  });
+
+  it('refuses to list a server other than the one this key was set up on (r1 F4)', async () => {
+    const { ops, calls } = fakeRunner(() => { throw new Error('must not run'); });
+    expect(await runListKeys(ops, rec, 'opc@198.51.100.9')).toEqual({
+      ok: false, lines: ['FAIL this key was last set up on another server; run Set up everyday access for this one'],
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('says when the list was cut short, never claiming the shown part is all (r1 F2)', async () => {
+    const many = Array.from({ length: 500 }, (_, i) => `KEY\topc\t${i.toString(16).padStart(16, '0')}\tk${i}\tno`);
+    const { ops } = fakeRunner(() => ({ exitCode: 0, stdout: many.join('\n') + '\nEND\n' }));
+    const r = await runListKeys(ops, rec, DEST);
+    expect(r.ok).toBe(true);
+    expect(r.lines[0]).toMatch(/^PASS listed \d+ of 500 sign-in keys \(the rest did not fit/);
+  });
+
+  it('bounds a large key list', () => {
+    const lines = parseKeys(Array.from({ length: 500 }, () => key).join('\n') + '\nEND\n')!;
+    expect(lines[lines.length - 1]).toMatch(/more not shown/);
+    expect(sealForOwner(KEY, 'x', { lines }).ciphertext.length).toBeLessThan(16_384);
+  });
+
+  it('uses only the everyday entry and destination with the fixed keys command', async () => {
+    const { ops, calls } = fakeRunner(() => ({ exitCode: 0, stdout: `${key}\n${protectedKey}\nEND\n` }));
+    expect(await runListKeys(ops, rec, DEST)).toEqual({
+      ok: true, lines: ['PASS listed 2 sign-in keys', key, protectedKey],
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.entryId).toBe(rec.everyday_entry_id);
+    expect(calls[0]!.destination).toBe(rec.everyday_destination);
+    expect(calls[0]!.argv).toEqual(['sudo', '-n', '/usr/local/lib/wundervault/wv-check', 'keys']);
+    expect(calls[0]!.input).toBeUndefined();
+    expect(calls[0]!.offer).toBeUndefined();
+  });
+
+  it('explains how to update a server whose sudoers predates key listing', async () => {
+    const { ops } = fakeRunner(() => ({ exitCode: 1, stdout: '', stderr: 'sudo: a password is required' }));
+    expect(await runListKeys(ops, rec, DEST)).toEqual({
+      ok: false, lines: ['FAIL this server was set up before key listing existed; run Set up everyday access again (it is safe to repeat), then try again'],
+    });
+  });
+
+  it('does not run without a setup record', async () => {
+    const { ops, calls } = fakeRunner(() => { throw new Error('must not run'); });
+    expect(await runListKeys(ops, undefined, DEST)).toEqual({
+      ok: false, lines: ['FAIL this server is not set up for everyday access yet; run Set up everyday access first'],
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('does not report success for an unfinished list or a failed command with END', async () => {
+    const unfinished = fakeRunner(() => ({ exitCode: 0, stdout: `${key}\n` }));
+    expect((await runListKeys(unfinished.ops, rec, DEST)).ok).toBe(false);
+    const failed = fakeRunner(() => ({ exitCode: 1, stdout: `${key}\nEND\n` }));
+    expect((await runListKeys(failed.ops, rec, DEST)).ok).toBe(false);
+  });
+
+  it('reports a runner error without treating it as old sudoers', async () => {
+    const ops: ServerRunner = { serverRun: async () => ({ error: 'connection refused\nmore detail' }) };
+    expect(await runListKeys(ops, rec, DEST)).toEqual({
+      ok: false, lines: ['FAIL list sign-in keys: connection refused'],
+    });
   });
 });
 

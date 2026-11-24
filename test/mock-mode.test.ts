@@ -20,6 +20,10 @@ const ARGS: Record<string, Record<string, unknown>> = {
   vault_save_secret: { purpose: 'demo', save_as: 'Demo secret', from_file: '/etc/hostname' },
   vault_send_secret: { purpose: 'demo', using: 'demo-0001', account: '0123456789abcdef0123456789abcdef', items: [{ secret: 'demo-0006', worker: 'shop', name: 'STRIPE_KEY' }] },
   vault_new_key: { entry_id: 'demo-0001', purpose: 'demo', save_as: 'Demo key', request: { origin: { scheme: 'https', host: 'api.resend.com', port: 443 }, method: 'POST', path: '/api-keys' } },
+  vault_job_request: { name: 'Nightly backup', entry_id: 'demo-0002', destination: 'demo@host', argv: ['true'], schedule: { kind: 'daily', time: '03:15', tz: 'UTC' }, why: 'demo' },
+  vault_job_status: { request_id: 'demo-job-request' },
+  vault_jobs: {},
+  vault_job_run_now: { job_id: 'demo-job', purpose: 'demo' },
 };
 
 describe('demo mode', () => {

@@ -3,6 +3,7 @@ import { constants } from 'node:fs';
 import { open, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { SERVER_ORDER_TYPES, validateServerOrder, type ServerOrder } from './server-setup.js';
+import { openJobOrder, type JobDefinition } from './jobs.js';
 
 export type OrderState = 'received' | 'refused' | 'working' | 'installed' |
   'rolled back' | 'rollback failed' | 'failed';
@@ -29,6 +30,8 @@ export interface BrokerUpdateDeps {
    * order, not awaited by the poll; it posts its own states. Absent = such orders are refused.
    */
   serverOrder?(agentId: string, order: ServerOrder): void;
+  /** Owner-approved job definition; the handler applies it and posts its sealed result. */
+  jobOrder?(agentId: string, job: JobDefinition): void;
   /** After each poll (D14 change checks). Errors are its own business. */
   afterPoll?(): Promise<void>;
 }
@@ -51,8 +54,8 @@ function newer(version: bigint[], own: bigint[]): boolean {
   return false;
 }
 
-function decodeBase64(value: string): Buffer {
-  if (typeof value !== 'string' || value.length > 16_384 ||
+function decodeBase64(value: string, maxLength = 16_384): Buffer {
+  if (typeof value !== 'string' || value.length > maxLength ||
       !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
     throw new Error('base64');
   }
@@ -76,12 +79,13 @@ function isoTime(value: unknown): number {
 }
 
 /** Decrypt and parse a sealed order of any type; the type's own check comes after. */
-function openSealed(
+export function openSealed(
   ciphertextB64: string, nonceB64: string, key: Uint8Array, fingerprint: string,
+  maxBase64Length = 16_384,
 ): { ok: true; value: Record<string, unknown> } | { ok: false; reason: string } {
   let plaintext: string;
   try {
-    const sealed = decodeBase64(ciphertextB64);
+    const sealed = decodeBase64(ciphertextB64, maxBase64Length);
     const nonce = decodeBase64(nonceB64);
     if (key.length !== 32 || nonce.length !== 12 || sealed.length < 16) {
       return { ok: false, reason: 'bad seal' };
@@ -356,6 +360,20 @@ async function serverEnvelope(
   const refuse = async (reason: string) => {
     if (await post(d, envelope.id, 'refused', reason)) await remember(d, state, [envelope.id]);
   };
+  if (kind === 'job-set') {
+    if (!d.jobOrder) return refuse('not supported');
+    const key = await d.vaultKeyFor(envelope.agent_id);
+    const opened = key
+      ? openJobOrder(envelope.ciphertext, envelope.nonce, key, d.fingerprint, d.now())
+      : { ok: false as const, reason: 'no key' };
+    if (!opened.ok) return refuse(opened.reason);
+    if (state.seen!.includes(opened.job.order_id)) return refuse('replay');
+    if (opened.job.order_id !== envelope.id) return refuse('id mismatch');
+    await remember(d, state, [envelope.id]);
+    await post(d, envelope.id, 'received', '');
+    d.jobOrder(envelope.agent_id, opened.job);
+    return;
+  }
   if (!d.serverOrder || !(SERVER_ORDER_TYPES as readonly string[]).includes(kind)) return refuse('not supported');
   const key = await d.vaultKeyFor(envelope.agent_id);
   const opened = key

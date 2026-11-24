@@ -182,6 +182,45 @@ export class BrokerOps {
     try { this.activity?.record(rec); } catch { /* bookkeeping never fails a vault call */ }
   }
 
+  /**
+   * Vault jobs: may this key run a job right now? Re-read every time (never trusted from the saved
+   * definition): an everyday, runs-without-asking SSH key only. A 3 AM run cannot wait for a passkey,
+   * and an admin key is for owner-approved windows, never a schedule.
+   */
+  async jobKeyCheck(entryId: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    let s;
+    try { s = await this.api.getSecretMeta(entryId); } catch (e) {
+      return { ok: false, reason: `the key could not be read (${firstLine((e as Error).message ?? String(e))})` };
+    }
+    if ((s as { admin_access?: unknown }).admin_access === true) return { ok: false, reason: 'jobs run with everyday keys, not an admin key' };
+    if (String(s.access_tier ?? '1') !== '1') return { ok: false, reason: 'jobs need a key that runs without asking' };
+    if (!modeAllowsSshBroker(s.entry_mode)) return { ok: false, reason: 'jobs need an SSH key' };
+    return { ok: true };
+  }
+
+  /** One line in the signed activity log per job run, with its outcome (SPEC vault jobs P2-4). */
+  recordJobRun(r: { entryId: string; name: string; destination: string; ok: boolean; exitCode: number;
+    bytes: number; ms: number; trigger: string; detail?: string }): void {
+    this.record({
+      kind: 'ssh', outcome: r.ok ? 'sent' : 'failed', agent: this.agentName, entry_id: r.entryId,
+      reason: `job: ${r.name}`, address: `ssh://${r.destination}`,
+      ...(r.detail ? { detail: r.detail.slice(0, 160) } : {}),
+      extra: { job: true, trigger: r.trigger, exit: r.exitCode, bytes: r.bytes, ms: r.ms },
+    });
+  }
+
+  /** One line in the signed activity log when a job is taken on, refused, paused, resumed or
+   *  deleted on this machine: each changes what runs here with no one watching (owner 11-23). */
+  recordJobChange(r: { entryId: string; name: string; destination: string; version: number;
+    change: 'saved' | 'not saved' | 'paused' | 'resumed' | 'deleted'; detail?: string }): void {
+    this.record({
+      kind: 'ssh', outcome: r.change === 'not saved' ? 'refused' : 'sent', agent: this.agentName, entry_id: r.entryId,
+      reason: `job ${r.change}: ${r.name}`, address: `ssh://${r.destination}`,
+      ...(r.detail ? { detail: r.detail.slice(0, 160) } : {}),
+      extra: { job_change: r.change, version: r.version },
+    });
+  }
+
   /** This agent's route to the server's copy of the log's chain. */
   /** Update now: this agent's route for the owner's update orders, and the key that opens them. */
   orderRoute(): {
@@ -192,6 +231,11 @@ export class BrokerOps {
     result(id: string, ciphertext: string, nonce: string): Promise<void>;
     due(entries: string[]): ReturnType<AgentVaultAPI['getServerChecksDue']>;
     check(requestId: string, changed: boolean, ciphertext: string, nonce: string): Promise<void>;
+    /** Vault jobs (phase 2). */
+    getJobs(): ReturnType<AgentVaultAPI['getJobs']>;
+    postJobRun(id: string, body: import('./jobs.js').JobRun): Promise<void>;
+    /** The agent this route speaks for: jobs are tied to it by name (the helper has no agent id). */
+    name: string;
     ops: BrokerOps;
   } {
     return {
@@ -201,6 +245,9 @@ export class BrokerOps {
       result: (id, c, n) => this.api.postBrokerOrderResult(id, c, n),
       due: (entries) => this.api.getServerChecksDue(entries),
       check: (r, ch, c, n) => this.api.postServerCheck(r, ch, c, n),
+      getJobs: () => this.api.getJobs(),
+      postJobRun: (id, body) => this.api.postJobRun(id, body),
+      name: this.agentName,
       ops: this,
     };
   }
@@ -1342,6 +1389,114 @@ export class BrokerOps {
   }
 
   // ── vault_save_secret (SPEC-save-from-agent) ──────────────────────────────
+
+  // ── Agent job proposals: only the owner can turn one into a job ───────────
+  async jobRequest(args: unknown): Promise<Record<string, unknown>> {
+    const { validateJobProposal, newRequestId, sealProposal } = await import('./job-request.js');
+    const checked = validateJobProposal(args);
+    const rec: ActivityRecord = {
+      kind: 'ssh', outcome: 'refused', agent: this.agentName,
+      reason: checked.ok ? `job request: ${checked.proposal.name}` : 'job request: invalid proposal',
+      ...(checked.ok ? {
+        entry_id: checked.proposal.entry_id,
+        address: `ssh://${checked.proposal.destination}`,
+      } : {}),
+      extra: { job_request: true },
+    };
+    let requestId: string | undefined;
+    try {
+      if (!checked.ok) {
+        rec.detail = checked.reason;
+        return { error: checked.reason };
+      }
+      const proposal = checked.proposal;
+      const key = await this.jobKeyCheck(proposal.entry_id);
+      if (!key.ok) {
+        rec.detail = key.reason;
+        return { error: key.reason };
+      }
+      const vaultKey = await this.api.ensureVaultKey();
+      requestId = newRequestId();
+      const sealed = sealProposal(vaultKey, requestId, proposal, this.agentName, new Date().toISOString());
+      const r = await this.api.postJobRequest({
+        request_id: requestId,
+        entry_id: proposal.entry_id,
+        ciphertext: sealed.ciphertext,
+        nonce: sealed.nonce,
+      });
+      rec.outcome = 'sent';
+      return {
+        request_id: r.id,
+        state: r.state,
+        expires_at: r.expires_at,
+        notice: 'The owner approves this on the Jobs page in their vault, with their passkey. '
+          + 'Nothing runs until they approve it. Check vault_job_status with this request_id.',
+      };
+    } catch {
+      rec.detail = 'could not confirm that the job request was received';
+      return {
+        error: requestId
+          ? 'The helper could not confirm that the job request was received. Check vault_job_status with this request_id before sending it again.'
+          : 'The job request could not be prepared. Please try again.',
+        ...(requestId ? { request_id: requestId } : {}),
+      };
+    } finally {
+      this.record(rec);
+    }
+  }
+
+  async jobRequestStatus(id: unknown): Promise<Record<string, unknown>> {
+    if (typeof id !== 'string' || !id.trim() || id.length > 128) {
+      return { error: 'Give the request_id returned by vault_job_request.' };
+    }
+    try {
+      return await this.api.getJobRequest(id);
+    } catch (e) {
+      const status = (e as { status?: number } | null)?.status;
+      return { error: status === 404
+        ? 'There is no such job request for this agent.'
+        : 'The job request status could not be read. Please try again.' };
+    }
+  }
+
+  async jobsList(): Promise<Record<string, unknown>> {
+    try {
+      return await this.api.getJobs();
+    } catch {
+      return { error: 'The jobs could not be listed. Please try again.' };
+    }
+  }
+
+  async jobRunNow(id: unknown, purpose?: string): Promise<Record<string, unknown>> {
+    if (typeof id !== 'string' || !id.trim() || id.length > 128) {
+      return { error: 'Give a job_id from vault_jobs.' };
+    }
+    const rec: ActivityRecord = {
+      kind: 'ssh', outcome: 'refused', agent: this.agentName,
+      reason: purpose ? `job run now: ${purpose.slice(0, 200)}` : 'job run now',
+      extra: { job_run_now: true, job_id: id },
+    };
+    try {
+      await this.api.postJobRunNow(id);
+      rec.outcome = 'sent';
+      return {
+        job_id: id,
+        notice: 'Asked for one run of the approved job. The helper will use its stored definition; check vault_jobs for the result.',
+      };
+    } catch (e) {
+      const status = (e as { status?: number } | null)?.status;
+      const error = status === 429 ? 'You asked less than 10 minutes ago.'
+        : status === 409 ? 'The job is paused or deleted.'
+        : status === 404 ? 'There is no such job for this agent.'
+        : 'The helper could not confirm the run request. Check vault_jobs before trying again.';
+      rec.detail = error;
+      return { error };
+    } finally {
+      this.record(rec);
+    }
+  }
+
+  // ── vault_save_secret (SPEC-save-from-agent) ──────────────────────────────
   /**
    * A value the agent's own process read (a file, a command's output, or text it was given)
    * goes into the vault as "waiting for the owner", like a made key. This op takes ONLY the
@@ -1610,6 +1765,8 @@ export class BrokerOps {
    */
   async sshAgentOpen(args: {
     entryId: string; purpose: string; op: BrokeredOp; ttlSeconds?: number;
+    /** Vault jobs: never wait for an owner's approval; refuse instead. */
+    noAsk?: boolean;
     /** Guided setup only (never from an agent): which half of an admin key to offer. */
     offer?: 'cert' | 'plain';
   }): Promise<{
@@ -1639,7 +1796,7 @@ export class BrokerOps {
   }
 
   private async sshAgentOpenInner(args: {
-    entryId: string; purpose: string; op: BrokeredOp; ttlSeconds?: number; offer?: 'cert' | 'plain';
+    entryId: string; purpose: string; op: BrokeredOp; ttlSeconds?: number; offer?: 'cert' | 'plain'; noAsk?: boolean;
   }, rec: ActivityRecord): Promise<{
     session_id: string; socket_path: string; public_key_path: string; fingerprint: string;
     audited_host: string; known_hosts_path?: string; pinned_host_key?: string;
@@ -1746,6 +1903,11 @@ export class BrokerOps {
       }
       const recipeSha = sshHostSha(target, scanned);
       const approved = matching.some((item) => item.ssh?.host_key === scanned && item.recipe_sha256 === recipeSha);
+      // A job runs with nobody there to answer: refuse at once rather than wait for an approval
+      // (vault jobs review r1 B4). The owner approves the server once; the next run goes ahead.
+      if (!approved && args.noAsk) {
+        return err('Refused: this server is not approved for this key yet. Approve it once (connect with an agent and approve it), then the job can run. No signing session was opened.', 'HOST_NOT_APPROVED');
+      }
       if (!approved) {
         rec.approval = 'asked';
         // approveStamp's existing lookup is origin-based. SSH approvals are checked above;
@@ -1924,11 +2086,12 @@ export class BrokerOps {
    */
   async serverRun(args: {
     entryId: string; destination: string; purpose: string;
-    argv: (publicKey: string) => string[]; input?: string; offer?: 'cert' | 'plain'; timeoutMs?: number;
+    argv: (publicKey: string) => string[]; input?: string; offer?: 'cert' | 'plain'; timeoutMs?: number; noAsk?: boolean;
   }): Promise<{ exitCode: number; stdout: string; stderr: string } | OpError> {
     const op = { kind: 'ssh', destination: args.destination, remoteArgv: ['true'] } as BrokeredOp;
     const opened = await this.sshAgentOpen({
       entryId: args.entryId, purpose: args.purpose, op, ttlSeconds: 600, ...(args.offer ? { offer: args.offer } : {}),
+      ...(args.noAsk ? { noAsk: true } : {}),
     });
     if ('error' in opened) return opened;
     const stop = new AbortController();

@@ -1,0 +1,79 @@
+{
+  "verdict": "revise",
+  "summary": "The excerpt updates the agent-facing Jobs-page wording, extends demo coverage to the four job tools, and adds local lifecycle logging through the existing signed writer. The normal pause/resume path is supported by tests and the reported machine run, but save-order audit completeness and replay handling remain unresolved in the excerpt. Site changes A and B were reviewed separately and cannot be verified here.",
+  "spec_check": [
+    {
+      "requirement": "every response under the embed prefix carries `sandbox allow-scripts` (never allow-same-origin), including when opened directly as a top-level page.",
+      "status": "partial",
+      "evidence": "Knowingly outside this excerpt: no site response-header implementation or tests are included, and the package says A was reviewed separately."
+    },
+    {
+      "requirement": "No other path gets the embed's looser headers (frame-ancestors 'self', XFO SAMEORIGIN, CORP cross-origin) \u2014 including encoded / dot-segment / case variants of the prefix.",
+      "status": "partial",
+      "evidence": "Knowingly outside this excerpt: routing, path normalization and header selection are not shown."
+    },
+    {
+      "requirement": "Only /newsletter/issue/* gains frame-src 'self'; nowhere gains a wider frame-src.",
+      "status": "partial",
+      "evidence": "Knowingly outside this excerpt: no site CSP configuration is included."
+    },
+    {
+      "requirement": "The embed loads nothing from other hosts and cannot send data out (default-src 'none').",
+      "status": "partial",
+      "evidence": "Knowingly outside this excerpt: neither the embed policy nor its resources are shown."
+    },
+    {
+      "requirement": "B: the refusal is computed from the same 10-minute limit the helper enforces; no run is queued when refused; a run allowed after the limit still queues.",
+      "status": "partial",
+      "evidence": "Knowingly outside this excerpt: the package says B was reviewed separately, and includes no refusal or queueing changes."
+    },
+    {
+      "requirement": "D: a log write failure never stops an order or a job run; each change logs at most once per real state change; no secret, argv or command output goes into the line.",
+      "status": "partial",
+      "evidence": "Both new logging call sites catch write failures. runDue compares the previous and resulting state, and its tests exercise repeated polls without duplicate transition logs. The save-order call is unconditional after apply/check returns, however, with no visible replay guard; exceptions before that call bypass it. No argv or command output is explicitly passed, but the contents of applied.reason and the existing record() implementation are not shown."
+    },
+    {
+      "requirement": "C: no tool, schema or behaviour change beyond text and the test.",
+      "status": "met",
+      "evidence": "The C-related production changes only replace approval-location wording in broker-ops.ts and server.ts. The demo test adds vault_job_request, vault_job_run_now, vault_job_status and vault_jobs to the expected list and demo-call coverage; no C-related tool or schema changes appear."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": 855,
+      "claim": "Save-order logging has no visible replay protection, so redelivery can produce additional audit lines without another state change unless the unseen order dispatcher or apply implementation prevents this path.",
+      "failure_scenario": "A version-1 save order is applied and logged, but its acknowledgement fails and the same order is delivered again. If the existing dispatcher permits re-entry, this branch calls recordJobChange again regardless of whether apply makes any change, producing another 'saved' or 'not saved' line for the replay.",
+      "suggested_direction": "Establish and test the existing redelivery semantics, then tie audit emission to a newly processed order or actual application result rather than merely reaching this branch. Include an acknowledgement-failure/redelivery test."
+    },
+    {
+      "id": "F2",
+      "severity": "major",
+      "file": "src/agent.ts",
+      "line": 852,
+      "claim": "A thrown jobKeyCheck or jobs.apply error bypasses the new 'not saved' logger, leaving that failed save unaudited unless the omitted outer catch independently writes the required signed change line.",
+      "failure_scenario": "Processing a save order causes route.ops.jobKeyCheck to reject, for example during an unavailable dependency, or jobs.apply throws on a local storage failure. Execution jumps to the outer catch before recordJobChange runs, so the shown implementation emits no 'job not saved' activity entry for that order.",
+      "suggested_direction": "Verify the omitted catch and ensure failed save outcomes reached through exceptions also attempt one signed 'not saved' entry, using a bounded non-sensitive reason and preserving the rule that logging failure cannot stop order handling."
+    }
+  ],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The state update and its signed audit entry are separate operations, with the state update occurring first.",
+      "why_it_matters": "If the daemon exits after store.setState persists a pause but before recordChange writes its line, the next poll sees an already-paused job and deliberately emits nothing. The transition can therefore be permanently absent from an otherwise valid signed chain. The excerpt shows no reconciliation mechanism; signing proves integrity of present entries, not completeness."
+    },
+    {
+      "id": "B2",
+      "concern": "Polling records observed local transitions, not a complete history of owner actions.",
+      "why_it_matters": "If the owner pauses and resumes a job between two polls, the helper observes active both times and writes neither transition. This is consistent with logging changes applied on this machine, but anyone using activity.log as an owner-action audit trail would incorrectly conclude that neither action happened; that distinction should be explicit."
+    }
+  ],
+  "_meta": {
+    "round": 27,
+    "at": "2026-11-24T03:08:25+00:00",
+    "package_bytes": 33031,
+    "schema_problems": []
+  }
+}

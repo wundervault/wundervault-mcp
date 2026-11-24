@@ -1,0 +1,60 @@
+{
+  "verdict": "ship",
+  "summary": "This is a dependency-only security release that raises the SDK minimum, locks the repaired dependency tree, and updates release metadata without changing src/. The supplied test and packaging results support shipping: production audit is clean, repeated full-suite runs pass, and the exercised MCP output remains byte-identical to 2.5.0.",
+  "spec_check": [
+    {
+      "requirement": "`npm audit --omit=dev` reports 0 vulnerabilities (was 10: 1 critical, 6 high, 3 moderate).",
+      "status": "met",
+      "evidence": "The build notes report zero production vulnerabilities; the changelog accurately scopes its zero-advisory statement to npm audit --omit=dev. This result cannot be independently reproduced from the excerpt."
+    },
+    {
+      "requirement": "package.json requires `@modelcontextprotocol/sdk` >= 1.32.2 (the version that clears every SDK advisory), so `npm install -g` users also get the fixed SDK.",
+      "status": "met",
+      "evidence": "package.json changes the SDK dependency from ^1.29.0 to ^1.32.2, excluding versions below the required fixed release."
+    },
+    {
+      "requirement": "The lockfile pins the fixed versions; the release package (scripts/pack-app.mjs: `npm ci --omit=dev` from the lockfile) contains SDK 1.32.2 and zod >= 4.6.6, and the closure check passes.",
+      "status": "met",
+      "evidence": "The lockfile pins SDK 1.32.2 and zod 4.6.7. pack-app.mjs copies the manifest and lockfile into a temporary directory, installs with npm ci --omit=dev, checks closure, and archives that installed tree. The notes report a passing closure check and confirmation of both versions in the archive."
+    },
+    {
+      "requirement": "No src/ file changed; `tsc` builds clean.",
+      "status": "met",
+      "evidence": "The supplied diff contains no src/ changes, and the build notes report a clean TypeScript build."
+    },
+    {
+      "requirement": "Full test suite passes.",
+      "status": "met",
+      "evidence": "Two full-suite runs each passed 2519/2519 tests. The previously failing lock test also passed 10/10 isolated runs, and its load-related failure was reproduced on unchanged v2.5.0."
+    },
+    {
+      "requirement": "MCP protocol output (initialize, tools/list including every tool's input schema, a tools/call, an unknown method) is byte-identical to 2.5.0.",
+      "status": "met",
+      "evidence": "The build notes report byte-identical stdio protocol output for the specified comparison against 2.5.0. Comparison transcripts and the comparison harness are not included, so this assessment relies on the reported result."
+    },
+    {
+      "requirement": "Version is 2.5.1 in package.json, package-lock.json, server.json; CHANGELOG has a 2.5.1 entry that states accurately what changed and why.",
+      "status": "met",
+      "evidence": "All shown version fields are updated to 2.5.1. The changelog describes the SDK and transitive security updates, the production audit improvement, and the helper's stdio-only use of the SDK."
+    },
+    {
+      "requirement": "Dev-only advisories (vitest/esbuild/tinypool, not shipped) are out of scope and stated as such.",
+      "status": "met",
+      "evidence": "The added SPEC-2.5.1-deps.md explicitly names these advisories as dev-only, not shipped, and out of scope. The release packager omits development dependencies, and the changelog limits its audit claim to production dependencies."
+    }
+  ],
+  "findings": [],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The compatibility acceptance checks do not explicitly cover malformed tool arguments or other SDK validation-error responses.",
+      "why_it_matters": "A client sending a missing required argument, an incorrect type, or an unexpected field can exercise different SDK and zod paths than a successful tools/call. Updating both dependencies could change rejection behavior or error payloads while all listed byte-comparison checks still pass; the supplied excerpt does not establish whether the full suite already covers these cases."
+    }
+  ],
+  "_meta": {
+    "round": 26,
+    "at": "2026-11-14T05:29:05+00:00",
+    "package_bytes": 44690,
+    "schema_problems": []
+  }
+}

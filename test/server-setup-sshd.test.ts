@@ -7,7 +7,8 @@ import path from 'node:path';
 import { BrokerOps } from '../src/broker-ops.js';
 import { SigningState } from '../src/wallet.js';
 import { sshHostSha } from '../src/ssh-pin.js';
-import { runSetup, runChangeCheck, runRemoveOrAccept, bundledScript, SetupRecords, validateServerOrder } from '../src/server-setup.js';
+import { runSetup, runChangeCheck, runRemoveOrAccept, runListKeys, adminDestination, bundledScript, SetupRecords, validateServerOrder } from '../src/server-setup.js';
+import { JobStore, runJob, runDue, type JobDefinition, type JobRoute } from '../src/jobs.js';
 
 /**
  * Site SPEC-admin-access checks 9, 25, 27 against a REAL sshd: the helper's own setup runner,
@@ -67,6 +68,11 @@ runIt('guided setup against a real sshd', () => {
       policy_ciphertext: policy.ct, policy_nonce: policy.nonce,
     };
   }
+  function unapproved(id: string, user: string, keyFile: string) {
+    const e = entry(id, user, keyFile, false) as Record<string, unknown>;
+    const policy = gcm(Buffer.from(JSON.stringify({ v: 1, entry_id: id, version: 1, kind: 'stamped', stamped: { approved: [] } })));
+    return { ...e, policy_ciphertext: policy.ct, policy_nonce: policy.nonce };
+  }
   const entries: Record<string, unknown> = {
     'entry-admin-1': entry('entry-admin-1', 'opc', 'admin', true),
     'entry-daily-1': entry('entry-daily-1', 'wv-agent', 'daily', false),
@@ -75,6 +81,7 @@ runIt('guided setup against a real sshd', () => {
     new SigningState(path.join(base, 'ledger.json')), {}, { pinsPath: path.join(base, 'pins.json') });
   (ops as unknown as { api: unknown }).api = {
     getSecret: async (id: string) => entries[id],
+    getSecretMeta: async (id: string) => entries[id],
     adminAccessStatus: async () => ({ admin: true, open: adminOpen, until: null }),
     ensureVaultKey: async () => VAULT_KEY,
   };
@@ -210,5 +217,75 @@ runIt('guided setup against a real sshd', () => {
     const rk = await keep;
     expect(rk.out).toContain('still-here');           // the other session was not touched
     ops.closeSsh(other.session_id);
+  }, 90_000);
+
+  // ── Vault jobs (phases 1 + 2) against the same real sshd ──────────────────
+  it('phase 1: the key list runs with the everyday key and fingerprints match removal', async () => {
+    const rec = records.get('entry-admin-1')!;
+    const r = await runListKeys(ops, rec, adminDestination(rec));
+    expect(r.ok).toBe(true);
+    expect(r.lines[0]).toMatch(/^PASS listed \d+ sign-in keys$/);
+    expect(r.lines.some((l) => /^KEY\twv-agent\t[0-9a-f]{16}\twundervault-everyday\tno$/.test(l))).toBe(true);
+    expect(r.lines.filter((l) => l.endsWith('\tyes')).length).toBe(2);
+    expect(r.lines.join('\n')).not.toMatch(/AAAA/);
+    expect((await runListKeys(ops, rec, 'opc@198.51.100.7')).ok).toBe(false);   // another server: refused, nothing run
+  }, 60_000);
+
+  const job = (patch: Partial<JobDefinition> = {}): JobDefinition => ({
+    v: 1, type: 'job-set', broker: 'fp', order_id: 'order-job-0001', issued_at: new Date().toISOString(),
+    expires_at: new Date(Date.now() + 10 * 60_000).toISOString(), job_id: 'job-real-0001', version: 1,
+    name: 'Nightly report', entry_id: 'entry-daily-1', destination: `wv-agent@127.0.0.1:${PORT}`,
+    argv: ['sh', '-c', 'echo backup-ok; id -un'], schedule: { kind: 'every', hours: 1, tz: 'UTC' }, timeout_s: 60, ...patch,
+  });
+
+  it('phase 2: a job runs on the real server with the everyday key, output kept privately', async () => {
+    const out = path.join(base, 'job-output');
+    const run = await runJob(ops, { def: job(), agent_id: 'a'.repeat(32), state: 'active', applied_at: new Date().toISOString() }, 'schedule', out);
+    expect(run).toMatchObject({ ok: true, exit_code: 0 });
+    const file = path.join(out, 'job-real-0001', `${run.run_id}.out`);
+    expect(fs.readFileSync(file, 'utf8')).toBe('backup-ok\nwv-agent\n');
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+  }, 60_000);
+
+  it('phase 2: a nonzero exit is a failed run, not an error', async () => {
+    const run = await runJob(ops, { def: job({ argv: ['sh', '-c', 'echo half; exit 3'] }), agent_id: 'a'.repeat(32), state: 'active', applied_at: new Date().toISOString() }, 'schedule', path.join(base, 'job-output'));
+    expect(run).toMatchObject({ ok: false, exit_code: 3 });
+    expect(run.error).toBeUndefined();
+  }, 60_000);
+
+  it('phase 2: the key check takes everyday keys only; an admin key is refused', async () => {
+    expect(await ops.jobKeyCheck('entry-daily-1')).toEqual({ ok: true });
+    expect(await ops.jobKeyCheck('entry-admin-1')).toMatchObject({ ok: false });
+  }, 30_000);
+
+  it('phase 2: a server not yet approved for the key refuses AT ONCE (never waits for the owner)', async () => {
+    entries['entry-new-1'] = unapproved('entry-new-1', 'wv-agent', 'daily');
+    const t0 = Date.now();
+    const run = await runJob(ops, { def: job({ entry_id: 'entry-new-1' }), agent_id: 'a'.repeat(32), state: 'active', applied_at: new Date().toISOString() }, 'schedule', path.join(base, 'job-output'));
+    expect(Date.now() - t0).toBeLessThan(15_000);
+    expect(run).toMatchObject({ ok: false, exit_code: -1 });
+    expect(run.error).toMatch(/not approved for this key yet/);
+  }, 60_000);
+
+  it('phase 2: the scheduler runs a due job once through the real ops, then not again in the same slot', async () => {
+    const store = new JobStore(path.join(base, 'state', 'jobs.json'));
+    const agentKey = 'b'.repeat(32);
+    const applied = new Date(Date.now() - 61 * 60_000);
+    expect(store.apply(job({ job_id: 'job-real-0002', order_id: 'order-job-0002', issued_at: applied.toISOString(),
+      expires_at: new Date(applied.getTime() + 10 * 60_000).toISOString() }), agentKey, applied)).toEqual({ ok: true });
+    const posted: unknown[] = []; const recorded: unknown[] = [];
+    const route: JobRoute = {
+      agent_id: agentKey, ops, outputDir: path.join(base, 'job-output'),
+      getJobs: async () => ({ jobs: [{ id: 'job-real-0002', version: 1, state: 'active', run_now: false }] }),
+      postJobRun: async (_id, body) => { posted.push(body); },
+      authorize: (def) => ops.jobKeyCheck(def.entry_id),
+      recordRun: async (_j, run) => { recorded.push(run); },
+    };
+    await runDue({ store, routes: [route], now: new Date(), running: new Set() });
+    await runDue({ store, routes: [route], now: new Date(), running: new Set() });
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toMatchObject({ ok: true, exit_code: 0, trigger: 'schedule' });
+    expect(JSON.stringify(posted[0])).not.toMatch(/backup-ok|wv-agent|127\.0\.0\.1/);   // the site never gets output or server
+    expect(recorded).toHaveLength(1);
   }, 90_000);
 });

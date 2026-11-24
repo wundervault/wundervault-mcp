@@ -97,6 +97,18 @@ export function watchAdminSession(
 
 function mockToolResult(name: string, args: Record<string, any>) {
   switch (name) {
+    case 'vault_job_request':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `Demo request demo-job-request is pending. The owner approves it on the Jobs page in their vault, with their passkey. Nothing runs until then. Check vault_job_status with request_id demo-job-request.${MOCK_NOTE}` }] });
+    case 'vault_job_status':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `Request ${args.request_id ?? 'demo-job-request'}: pending. No job has been created yet.${MOCK_NOTE}` }] });
+    case 'vault_jobs':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `Jobs (1):\n  [demo-job] Nightly backup — daily at 03:15 (UTC); active; last run: ok at 2026-11-23T03:15:00Z.${MOCK_NOTE}` }] });
+    case 'vault_job_run_now':
+      return CallToolResultSchema.parse({ content: [{ type: 'text', text:
+        `Demo: would ask for one run of job ${args.job_id ?? 'demo-job'}, using only its approved definition. Nothing was run.${MOCK_NOTE}` }] });
     case 'vault_entries_list':
       return CallToolResultSchema.parse({ content: [{ type: 'text', text:
         `Vault entries (4):\n  [demo-0001]  DEMO_API_KEY  (tier: 1, web service)\n  [demo-0002]  DEMO_SSH_KEY  (tier: 1, SSH)\n`
@@ -267,6 +279,93 @@ export function createServer(args: { url?: string } = {}) {
             purpose: { type: 'string', description: 'Why it should be in the vault (shown to the owner).' },
           },
           required: ['save_as', 'purpose'],
+        },
+      },
+      {
+        name: 'vault_job_request',
+        description: (
+          'Ask the owner for a SCHEDULED JOB the helper app runs for you on a server, with one of your SSH keys. '
+          + 'Give a name, entry_id, destination user@host[:port], exact argv (program and arguments, no shell), '
+          + 'schedule, and why it is needed. The owner approves it on the Jobs page in their vault, with a passkey '
+          + 'and sees the exact command. Nothing runs until then. The job then runs on its own, with no agent involved. '
+          + 'Jobs use everyday SSH keys that run without asking, never admin or ask-first keys. '
+          + 'Only one job runs per server at a time. Timeout defaults to 300 seconds and cannot exceed 600 seconds. '
+          + 'Output stays on the helper; this tool does not return it. Use vault_job_status to check the request.'
+        ),
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            name: { type: 'string', minLength: 1, maxLength: 80, description: 'Job name, without control characters or surrounding whitespace.' },
+            entry_id: { type: 'string', description: 'An everyday, runs-without-asking SSH key held by this agent.' },
+            destination: { type: 'string', description: 'SSH destination: user@host[:port].' },
+            argv: {
+              type: 'array', minItems: 1, maxItems: 64,
+              items: { type: 'string', minLength: 1, maxLength: 4096 },
+              description: 'Exact program and arguments. No shell; at most 16 KB total in UTF-8, without NUL characters.',
+            },
+            schedule: {
+              description: 'Daily at HH:MM, or every 1 to 24 hours, with an IANA time zone.',
+              oneOf: [
+                {
+                  type: 'object', additionalProperties: false,
+                  properties: {
+                    kind: { type: 'string', enum: ['daily'] },
+                    time: { type: 'string', pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$' },
+                    tz: { type: 'string', minLength: 1, maxLength: 64 },
+                  },
+                  required: ['kind', 'time', 'tz'],
+                },
+                {
+                  type: 'object', additionalProperties: false,
+                  properties: {
+                    kind: { type: 'string', enum: ['every'] },
+                    hours: { type: 'integer', minimum: 1, maximum: 24 },
+                    tz: { type: 'string', minLength: 1, maxLength: 64 },
+                  },
+                  required: ['kind', 'hours', 'tz'],
+                },
+              ],
+            },
+            timeout_s: { type: 'integer', minimum: 10, maximum: 600, default: 300, description: 'Maximum run time in seconds.' },
+            grace_minutes: { type: 'integer', minimum: 5, maximum: 1440, default: 30, description: 'Extra time before a missed run is reported.' },
+            why: { type: 'string', minLength: 1, maxLength: 300, description: 'Why this job is needed, shown to the owner. No control characters.' },
+          },
+          required: ['name', 'entry_id', 'destination', 'argv', 'schedule', 'why'],
+        },
+      },
+      {
+        name: 'vault_job_status',
+        description: 'Check a scheduled-job request: pending, approved, declined, or expired, and the job id once approved.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            request_id: { type: 'string', description: 'The request_id returned by vault_job_request.' },
+          },
+          required: ['request_id'],
+        },
+      },
+      {
+        name: 'vault_jobs',
+        description: 'List this agent\'s jobs: name, schedule in words, state, and whether and when the last run succeeded. Does not return commands, servers, or output.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {},
+        },
+      },
+      {
+        name: 'vault_job_run_now',
+        description: 'Ask for one run now of an approved job, using only its stored definition. Cannot change its command, server, or key. At most once per 10 minutes per job; output stays on the helper. Check vault_jobs for the result.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            job_id: { type: 'string', description: 'A job id from vault_jobs.' },
+            purpose: { type: 'string', description: 'Why this run is needed (audit log).' },
+          },
+          required: ['job_id', 'purpose'],
         },
       },
       {
@@ -600,6 +699,72 @@ export function createServer(args: { url?: string } = {}) {
           content: [{ type: 'text', text: `${r.sent} of ${rows.length} set${r.asked ? ' (the owner approved the list)' : ''}. `
             + `The values went from the vault to Cloudflare; you were not given them.\n${lines.join('\n')}` }],
           ...(Number(r.sent) === rows.length ? {} : { isError: true }),
+        });
+      }
+
+      if (['vault_job_request', 'vault_job_status', 'vault_jobs', 'vault_job_run_now'].includes(request.params.name)) {
+        const a = (request.params.arguments ?? {}) as Record<string, unknown>;
+        const fail = (text: string) => CallToolResultSchema.parse({ content: [{ type: 'text', text }], isError: true });
+        let r: Record<string, unknown> = {};
+        let text = '';
+        if (request.params.name === 'vault_job_request') {
+          if (typeof a.why !== 'string' || !a.why.trim()) return fail('vault_job_request needs why.');
+          r = await broker.send('job_request', {
+            name: a.name,
+            entry_id: a.entry_id,
+            destination: a.destination,
+            argv: a.argv,
+            schedule: a.schedule,
+            timeout_s: a.timeout_s,
+            grace_minutes: a.grace_minutes,
+            why: a.why,
+          });
+          if (!r.error) {
+            text = `Request ${r.request_id}: ${r.state}.\n${r.notice}\nExpires: ${r.expires_at}.`;
+          }
+        } else if (request.params.name === 'vault_job_status') {
+          if (typeof a.request_id !== 'string' || !a.request_id.trim()) return fail('vault_job_status needs request_id.');
+          r = await broker.send('job_request_status', { request_id: a.request_id });
+          if (!r.error) {
+            text = `Request ${r.id}: ${r.state}.`
+              + (r.job_id ? ` Job: ${r.job_id}.` : '')
+              + (r.decided_at ? ` Decided: ${r.decided_at}.` : '')
+              + (r.expires_at ? ` Expires: ${r.expires_at}.` : '');
+          }
+        } else if (request.params.name === 'vault_jobs') {
+          r = await broker.send('jobs_list', {});
+          if (!r.error) {
+            const rows = (Array.isArray(r.jobs) ? r.jobs : []) as Array<Record<string, unknown>>;
+            const lines = rows.map(row => {
+              const schedule = row.schedule_kind === 'daily'
+                ? `daily at ${row.schedule_time} (${row.tz})`
+                : row.schedule_kind === 'every'
+                  ? `every ${row.schedule_hours} hour${Number(row.schedule_hours) === 1 ? '' : 's'} (${row.tz})`
+                  : 'schedule unavailable';
+              const last = row.last_run && typeof row.last_run === 'object'
+                ? row.last_run as Record<string, unknown> : null;
+              const result = last
+                ? `${last.ok ? 'ok' : 'failed'} at ${last.started_at}`
+                  + (!last.ok && last.exit_code !== undefined ? ` (exit ${last.exit_code})` : '')
+                : 'not run yet';
+              return `  [${row.id}] ${row.name ?? row.id} — ${schedule}; ${row.state}; last run: ${result}.`;
+            });
+            text = rows.length ? `Jobs (${rows.length}):\n${lines.join('\n')}` : 'No jobs for this agent.';
+          }
+        } else {
+          if (typeof a.job_id !== 'string' || !a.job_id.trim() ||
+              typeof a.purpose !== 'string' || !a.purpose.trim()) {
+            return fail('vault_job_run_now needs job_id and purpose.');
+          }
+          r = await broker.send('job_run_now', { job_id: a.job_id, purpose: a.purpose });
+          if (!r.error) text = String(r.notice);
+        }
+        const errorText = r.error
+          ? String(r.error) + (r.request_id ? ` Request id: ${r.request_id}.` : '')
+          : '';
+        return CallToolResultSchema.parse({
+          content: [{ type: 'text', text: r.error ? errorText : text }],
+          ...(r.error ? { isError: true } : {}),
         });
       }
 

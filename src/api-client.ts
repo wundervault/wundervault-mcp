@@ -319,6 +319,31 @@ export class AgentVaultAPI {
 
   /** D14: this agent's admin accesses that have ended and still need a change check. */
   /** Only for the admin entries this computer set up (it can check nothing else). */
+  /** Vault jobs (phase 2): this agent's jobs as the server knows them (state, version, run-now). */
+  async getJobs(): Promise<{ jobs: import('./jobs.js').JobStatus[] }> {
+    return this.fetchJson('/agent/jobs');
+  }
+
+  /** A job run's public summary: never the command, server or output. */
+  async postJobRun(id: string, body: import('./jobs.js').JobRun): Promise<void> {
+    await this.postJson(`/agent/jobs/${encodeURIComponent(id)}/runs`, body);
+  }
+
+  /** Vault jobs: an agent's proposed job, sealed for the owner; only the owner can approve it. */
+  async postJobRequest(body: { request_id: string; entry_id: string; ciphertext: string; nonce: string }):
+    Promise<{ id: string; state: 'pending'; expires_at: string }> {
+    return this.postJson('/agent/job-requests', body);
+  }
+
+  async getJobRequest(id: string): Promise<{ id: string; state: 'pending' | 'approved' | 'declined' | 'expired';
+    job_id: string | null; decided_at: string | null; expires_at: string }> {
+    return this.fetchJson(`/agent/job-requests/${encodeURIComponent(id)}`);
+  }
+
+  async postJobRunNow(id: string): Promise<void> {
+    await this.postJson(`/agent/jobs/${encodeURIComponent(id)}/run-now`, {});
+  }
+
   async getServerChecksDue(entries: string[]): Promise<{ due: { request_id: string; entry_id: string; ended_at: string }[] }> {
     return this.fetchJson('/agent/server-checks/due', { entries: entries.join(',') });
   }

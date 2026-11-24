@@ -2,10 +2,12 @@
 # Wundervault change check (site SPEC-admin-access D14). Root-owned, installed by setup.
 #
 #   wv-check baseline   record the server as it is now (root only; setup and finalize run it)
-#   wv-check report     what is NEW or GONE since the baseline (the everyday account may run
-#                       this through sudo, and nothing else; it never prints a key or a secret,
-#                       only short fingerprints, names and comments)
+#   wv-check report     what is NEW or GONE since the baseline (everyday account, through sudo;
+#                       it never prints a key or a secret, only short fingerprints, names
+#                       and comments)
 #   wv-check health     up time, load, disk and memory (everyday account, through sudo)
+#   wv-check keys       every sign-in key's account, fingerprint, comment and protection
+#                       (everyday account, through sudo; never prints a key body)
 #
 # Honest limit: whoever has root can change this program and its baseline too. It catches
 # mistakes and careless agents, not a determined one.
@@ -17,12 +19,51 @@ LIB=/usr/local/lib/wundervault
 fp() { sha256sum | cut -c1-16; }
 fp_file() { [ -f "$1" ] && sha256sum "$1" | cut -c1-16 || echo none; }
 
+# Read an account's key file AS THAT ACCOUNT, never as root (vault jobs review r1 B2, r2 F1): a
+# link to /etc/shadow, made before or swapped in during the read, then simply fails to open. Only
+# a plain file is read, with a time limit, so a FIFO cannot hang the check (r3 F2). A link is also
+# skipped up front so the list can say so. A file that cannot be read is SAID, never treated as
+# empty (r3 B1).
+as_user() {
+  u=$1; shift
+  if command -v runuser >/dev/null 2>&1; then runuser -u "$u" -- "$@"
+  elif command -v setpriv >/dev/null 2>&1; then setpriv --reuid="$u" --regid="$(id -g "$u")" --init-groups -- "$@"
+  else return 1; fi
+}
+ak_link() { [ -L "$1/.ssh/authorized_keys" ] || [ -L "$1/.ssh" ]; }
+ak_read() {
+  as_user "$1" timeout 10 sh -c '[ -f "$1" ] && [ ! -L "$1" ] || exit 3; exec head -c 1048577 -- "$1"' wv-read "$2/.ssh/authorized_keys" 2>/dev/null
+}
+# A key file too big to be real is reported, not processed line by line (2.5.1 review r27 B1).
+too_big() { [ "${#1}" -gt 1048576 ] || [ "$(printf '%s\n' "$1" | wc -l)" -gt 2000 ]; }
+
+# The key body and comment of an authorized_keys line, tab-separated: the field after the key type,
+# then every field after that. Quoted option values are dropped first, so a key-type word inside
+# command="..." is never taken for the key (r2 F2). Prints NOTAKEY for a line with no key type
+# (r1 F1: the last field of a comment-less line is the key body itself).
+key_parts() {
+  sed -E 's/"([^"\\]|\\.)*"//g' | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-|sk-ssh-|sk-ecdsa-)/) {
+           c = ""; for (j = i + 2; j <= NF; j++) c = c (c == "" ? "" : " ") $j; printf "%s\t%s\n", $(i + 1), c; found = 1; exit }
+         } END { if (!found) print "NOTAKEY" }'
+}
+
+# Key bodies setup installed and protects (r2 B1, r3 F3): a line is protected because it carries
+# THAT key, whatever its comment or spacing. Servers set up before this record fall back to the
+# comment.
+PROTECTED=$STATE/protected-keys
+is_protected() {
+  if [ -f "$PROTECTED" ]; then [ -n "$1" ] && grep -qxF -- "$1" "$PROTECTED"
+  else case $2 in *wundervault-admin-ca*|*wundervault-emergency*) return 0;; esac; return 1; fi
+}
+
 snapshot() {
   # Every account that can hold SSH keys: a fingerprint and comment per authorized key line.
   getent passwd | while IFS=: read -r name _ uid _ _ home _; do
-    f="$home/.ssh/authorized_keys"
-    [ -f "$f" ] || continue
-    grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null | while IFS= read -r line; do
+    ak_link "$home" && continue
+    [ -e "$home/.ssh/authorized_keys" ] || continue
+    if ! content=$(ak_read "$name" "$home"); then printf 'key\t%s\tunreadable\t-\n' "$name"; continue; fi
+    if too_big "$content"; then printf 'key\t%s\ttoo-large\t-\n' "$name"; continue; fi
+    printf '%s\n' "$content" | grep -Ev '^[[:space:]]*(#|$)' | while IFS= read -r line; do
       comment=$(printf '%s' "$line" | awk '{print $NF}' | tr -cd 'A-Za-z0-9@._:-' | cut -c1-60)
       printf 'key\t%s\t%s\t%s\n' "$name" "$(printf '%s' "$line" | fp)" "$comment"
     done
@@ -66,7 +107,7 @@ baseline)
   ;;
 report)
   [ -f "$STATE/baseline" ] || { echo "NO-BASELINE run setup again"; exit 0; }
-  now=$(mktemp); trap 'rm -f "$now"' EXIT
+  now=$(mktemp "$STATE/.now.XXXXXX"); trap 'rm -f "$now"' EXIT
   snapshot | sort -u > "$now"
   comm -13 "$STATE/baseline" "$now" | sed 's/^/NEW\t/'
   comm -23 "$STATE/baseline" "$now" | grep -v '^process' | sed 's/^/GONE\t/' || true
@@ -78,5 +119,35 @@ health)
   df -P / | awk 'NR == 2 { print "disk\t" $5 }'
   awk '/MemTotal/ { t = $2 } /MemAvailable/ { a = $2 } END { printf "memory\t%d%%\n", (t - a) * 100 / t }' /proc/meminfo
   ;;
-*) echo "usage: wv-check baseline | report | health" >&2; exit 2;;
+keys)
+  getent passwd | while IFS=: read -r name _ uid _ _ home _; do
+    if ak_link "$home"; then printf 'NOTE\tskipped-link\t%s\n' "$name"; continue; fi
+    [ -f "$home/.ssh/authorized_keys2" ] && printf 'NOTE\tother-file\t%s\n' "$name"
+    [ -e "$home/.ssh/authorized_keys" ] || continue
+    if ! content=$(ak_read "$name" "$home"); then printf 'NOTE\tunreadable\t%s\n' "$name"; continue; fi
+    if too_big "$content"; then printf 'NOTE\ttoo-large\t%s\n' "$name"; continue; fi
+    # Keep the original line, including whitespace: remove-key hashes those exact bytes too.
+    printf '%s\n' "$content" | while IFS= read -r line; do
+      printf '%s\n' "$line" | grep -Eq '^[[:space:]]*(#|$)' && continue
+      parts=$(printf '%s' "$line" | key_parts)
+      [ "$parts" = NOTAKEY ] && continue
+      blob=${parts%%"$(printf '\t')"*}
+      comment=$(printf '%s' "${parts#*"$(printf '\t')"}" | tr -cd 'A-Za-z0-9@._:-' | cut -c1-60)
+      kfp=$(printf '%s' "$line" | fp)
+      protected=no; is_protected "$blob" "$line" && protected=yes
+      printf 'KEY\t%s\t%s\t%s\t%s\n' "$name" "$kfp" "$comment" "$protected"
+    done
+  done
+  # Sign-in keys this list cannot see (r1 B3): a key command, trusted certificate authorities, or
+  # key files other than ~/.ssh/authorized_keys.
+  if command -v sshd >/dev/null 2>&1; then
+    sshd -T 2>/dev/null | awk '
+      $1 == "authorizedkeyscommand" && $2 != "none" { print "NOTE\tother-command\t" }
+      $1 == "trustedusercakeys" && $2 != "none" { print "NOTE\tca-keys\t" }
+      $1 == "authorizedkeysfile" { for (i = 2; i <= NF; i++)
+        if ($i != ".ssh/authorized_keys" && $i != ".ssh/authorized_keys2" && $i != "%h/.ssh/authorized_keys") print "NOTE\tother-config\t" }' | sort -u
+  fi
+  echo "END"
+  ;;
+*) echo "usage: wv-check baseline | report | health | keys" >&2; exit 2;;
 esac

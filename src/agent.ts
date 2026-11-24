@@ -51,7 +51,8 @@ import {
 } from './endpoint.js';
 import { loadOrCreateIdentity, logSignerFromIdentity, brokerPublicKeyObject } from './broker-key.js';
 import { startPolling, updateSpoolDir } from './broker-update.js';
-import { SetupRecords, bundledScript, runSetup, runRemoveOrAccept, runChangeCheck, sealForOwner, resultAad, checkAad, fitLines, adminDestination } from './server-setup.js';
+import { JobStore, runDue, type JobRoute } from './jobs.js';
+import { SetupRecords, bundledScript, runSetup, runRemoveOrAccept, runListKeys, runChangeCheck, sealForOwner, resultAad, checkAad, fitLines, adminDestination } from './server-setup.js';
 import type { OrderClient } from './broker-update.js';
 import { load as loadNetworkShape } from './network-store.js';
 import { BrokerOps, type ActivitySink } from './broker-ops.js';
@@ -99,6 +100,16 @@ interface SocketRequest {
   value?: unknown;
   source?: unknown;
   service?: unknown;
+  /** vault jobs: an agent's job request and the job tools */
+  why?: unknown;
+  name?: unknown;
+  destination?: unknown;
+  argv?: unknown;
+  schedule?: unknown;
+  timeout_s?: unknown;
+  grace_minutes?: unknown;
+  request_id?: unknown;
+  job_id?: unknown;
   /** vault_send_secret: the signing key, the Cloudflare account, and the list */
   using?: unknown;
   account?: unknown;
@@ -773,6 +784,12 @@ class AgentDaemon {
       },
     };
     const records = new SetupRecords(path.join(systemRoot(), 'server-setups.json'));
+    // Vault jobs: definitions the owner approved, kept in the helper's own folder (0600).
+    const jobs = new JobStore(path.join(systemRoot(), 'jobs.json'));
+    const jobRunning = new Set<string>();
+    // Jobs are tied to the agent (route) that accepted them. The helper knows an agent by name,
+    // which may hold spaces, so the store keeps a fixed hash of it.
+    const jobKey = (name: string) => crypto.createHash('sha256').update(`wv-job-agent|${name}`).digest('hex').slice(0, 32);
     const running = new Set<string>();
     const checkFailures = new Map<string, number>();
     const log = (m: string) => console.error(`[wundervault-agent] ${m}`);
@@ -795,7 +812,9 @@ class AgentDaemon {
             const script = bundledScript();
             outcome = order.type === 'setup'
               ? await runSetup(route.ops, order, script, records)
-              : await runRemoveOrAccept(route.ops, order, script);
+              : order.type === 'list-keys'
+                ? await runListKeys(route.ops, records.get(order.entry_id), order.destination)
+                : await runRemoveOrAccept(route.ops, order, script);
           } catch (e) {
             outcome = { ok: false, lines: [`FAIL the helper app stopped: ${String((e as Error).message ?? e).split('\n')[0]!.slice(0, 160)}`] };
           }
@@ -805,7 +824,7 @@ class AgentDaemon {
           let delivered = false;
           try {
             const sealed = sealForOwner(await route.key(), resultAad(fingerprint, order.order_id),
-              { v: 1, order_id: order.order_id, type: order.type, ok: outcome.ok, lines: fitLines(outcome.lines) });
+              { v: 1, order_id: order.order_id, type: order.type, ok: outcome.ok, destination: order.destination, lines: fitLines(outcome.lines) });
             for (const wait of [0, 2_000, 10_000, 30_000]) {
               if (wait) await new Promise((r) => setTimeout(r, wait));
               try { await route.result(order.order_id, sealed.ciphertext, sealed.nonce); delivered = true; break; } catch { /* again */ }
@@ -820,7 +839,71 @@ class AgentDaemon {
           running.delete(order.order_id);
         })();
       },
+      // Vault jobs (phase 2): an owner-approved definition, opened with that agent's vault key.
+      // The key is re-checked here (everyday, runs without asking) before the job is kept.
+      jobOrder: (agentId, job) => {
+        const route = byAgent.get(agentId);
+        if (!route || running.has(job.order_id)) return;
+        running.add(job.order_id);
+        void (async () => {
+          let ok = false; let lines: string[];
+          try {
+            await route.post(job.order_id, 'working', '');
+            const check = await route.ops.jobKeyCheck(job.entry_id);
+            const applied = check.ok ? jobs.apply(job, jobKey(route.name), new Date()) : check;
+            ok = applied.ok;
+            try {
+              route.ops.recordJobChange({ entryId: job.entry_id, name: job.name, destination: job.destination,
+                version: job.version, change: ok ? 'saved' : 'not saved', ...(applied.ok ? {} : { detail: applied.reason }) });
+            } catch { /* the log write must not stop the order */ }
+            lines = applied.ok ? [`PASS job "${job.name}" saved (version ${job.version}); it runs on its schedule`]
+              : [`FAIL job "${job.name}" not saved: ${applied.reason}`];
+          } catch (e) {
+            const why = String((e as Error).message ?? e).split('\n')[0]!.slice(0, 160);
+            lines = [`FAIL the helper app stopped: ${why}`];
+            // A save that threw is still a refusal on this machine: log it (release review r27 F2), with a
+            // fixed reason: an error's own text could carry anything (r28 F1).
+            try {
+              route.ops.recordJobChange({ entryId: job.entry_id, name: job.name, destination: job.destination,
+                version: job.version, change: 'not saved', detail: 'the helper app stopped while saving it' });
+            } catch { /* the log write must not stop the order */ }
+          }
+          let delivered = false;
+          try {
+            const sealed = sealForOwner(await route.key(), resultAad(fingerprint, job.order_id),
+              { v: 1, order_id: job.order_id, type: 'job-set', job_id: job.job_id, version: job.version, ok, lines });
+            for (const wait of [0, 2_000, 10_000, 30_000]) {
+              if (wait) await new Promise((r) => setTimeout(r, wait));
+              try { await route.result(job.order_id, sealed.ciphertext, sealed.nonce); delivered = true; break; } catch { /* again */ }
+            }
+          } catch { /* sealing failed: the state says so */ }
+          for (const wait of [0, 2_000, 10_000, 30_000]) {
+            if (wait) await new Promise((r) => setTimeout(r, wait));
+            try { await route.post(job.order_id, ok ? 'done' : 'failed', ok ? `saved${delivered ? '' : ' (details not delivered)'}` : 'not saved'); break; } catch { log('Job order state not delivered'); }
+          }
+          running.delete(job.order_id);
+        })();
+      },
       afterPoll: async () => {
+        // Jobs first, every poll: the change check below returns early when no server is set up.
+        try {
+          const jobRoutes: JobRoute[] = routes().map((r) => ({
+            agent_id: jobKey(r.name), ops: r.ops, outputDir: path.join(systemRoot(), 'job-output'),
+            getJobs: () => r.getJobs(), postJobRun: (id, body) => r.postJobRun(id, body),
+            authorize: (def) => r.ops.jobKeyCheck(def.entry_id),
+            sealForOwner: async (aad, value) => sealForOwner(await r.key(), aad, value),
+            recordRun: async (job, run) => r.ops.recordJobRun({
+              entryId: job.def.entry_id, name: job.def.name, destination: job.def.destination, ok: run.ok,
+              exitCode: run.exit_code, bytes: run.bytes, trigger: run.trigger,
+              ms: Math.max(0, Date.parse(run.finished_at) - Date.parse(run.started_at)), ...(run.error ? { detail: run.error } : {}),
+            }),
+            recordChange: async (job, change) => r.ops.recordJobChange({
+              entryId: job.def.entry_id, name: job.def.name, destination: job.def.destination,
+              version: job.def.version, change,
+            }),
+          }));
+          await runDue({ store: jobs, routes: jobRoutes, now: new Date(), running: jobRunning });
+        } catch { log('Jobs could not run this poll'); }
         for (const route of routes()) {
           let due;
           const mine = records.entries();
@@ -1119,6 +1202,35 @@ class AgentDaemon {
       case 'send_secret': {
         if (!purpose()) return { error: 'send_secret needs purpose.' };
         return await ops.sendSecrets({ using: msg.using, account: msg.account, items: msg.items, purpose: purpose() }) as unknown as Record<string, unknown>;
+      }
+
+      case 'job_request': {
+        if (typeof msg.why !== 'string' || !msg.why.trim()) {
+          return { error: 'job_request needs why.' };
+        }
+        return await ops.jobRequest({
+          name: msg.name,
+          entry_id: msg.entry_id,
+          destination: msg.destination,
+          argv: msg.argv,
+          schedule: msg.schedule,
+          timeout_s: msg.timeout_s,
+          grace_minutes: msg.grace_minutes,
+          why: msg.why,
+        }) as unknown as Record<string, unknown>;
+      }
+
+      case 'job_request_status': {
+        return await ops.jobRequestStatus(msg.request_id) as unknown as Record<string, unknown>;
+      }
+
+      case 'jobs_list': {
+        return await ops.jobsList() as unknown as Record<string, unknown>;
+      }
+
+      case 'job_run_now': {
+        if (!purpose()) return { error: 'job_run_now needs purpose.' };
+        return await ops.jobRunNow(msg.job_id, purpose()) as unknown as Record<string, unknown>;
       }
 
       case 'ssh_agent_open': {

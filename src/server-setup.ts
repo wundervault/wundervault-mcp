@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeSshTarget } from './ssh-pin.js';
 
-export const SERVER_ORDER_TYPES = ['setup', 'remove-key', 'accept'] as const;
+export const SERVER_ORDER_TYPES = ['setup', 'remove-key', 'accept', 'list-keys'] as const;
 export type ServerOrderType = typeof SERVER_ORDER_TYPES[number];
 
 interface Base { order_id: string; entry_id: string; destination: string }
@@ -24,7 +24,8 @@ export type ServerOrder =
   | Base & { type: 'setup'; everyday_user: string; everyday_entry_id: string;
       everyday_pub: string; emergency_pub: string; logs: boolean }
   | Base & { type: 'remove-key'; user: string; fp: string }
-  | Base & { type: 'accept' };
+  | Base & { type: 'accept' }
+  | Base & { type: 'list-keys' };
 
 const ID = /^[A-Za-z0-9_-]{8,64}$/;
 const USER = /^[a-z_][a-z0-9_-]{0,31}$/;
@@ -36,6 +37,7 @@ const FIELDS: Record<ServerOrderType, string[]> = {
   setup: ['everyday_user', 'everyday_entry_id', 'everyday_pub', 'emergency_pub', 'logs'],
   'remove-key': ['user', 'fp'],
   accept: [],
+  'list-keys': [],
 };
 
 function isoMs(v: unknown): number {
@@ -143,7 +145,7 @@ type Run = { exitCode: number; stdout: string; stderr: string } | { error: strin
 export interface ServerRunner {
   serverRun(args: {
     entryId: string; destination: string; purpose: string;
-    argv: (publicKey: string) => string[]; input?: string; offer?: 'cert' | 'plain'; timeoutMs?: number;
+    argv: (publicKey: string) => string[]; input?: string; offer?: 'cert' | 'plain'; timeoutMs?: number; noAsk?: boolean;
   }): Promise<Run>;
 }
 
@@ -224,6 +226,7 @@ export async function runSetup(ops: ServerRunner, o: Extract<ServerOrder, { type
     'if [ -n "$h" ] && ls "$h" >/dev/null 2>&1; then echo "FAIL the everyday account can read the admin home"; else echo "PASS the admin home is closed to the everyday account"; fi',
     `if sudo -n ${SESSION_CHECK} health >/dev/null 2>&1; then echo "PASS health check works"; else echo "FAIL health check"; fi`,
     `if sudo -n ${SESSION_CHECK} report | grep -q '^END$'; then echo "PASS change check works"; else echo "FAIL change check"; fi`,
+    `if sudo -n ${SESSION_CHECK} keys | grep -q '^END$'; then echo "PASS key list works"; else echo "FAIL key list"; fi`,
   ].join('\n');
   const day = await step('everyday', () => ['sh', '-c', selftest, 'wv-selftest', admin],
     { entryId: o.everyday_entry_id, destination: everyday });
@@ -243,7 +246,7 @@ export async function runSetup(ops: ServerRunner, o: Extract<ServerOrder, { type
   return { ok, lines };
 }
 
-export async function runRemoveOrAccept(ops: ServerRunner, o: Exclude<ServerOrder, { type: 'setup' }>, script: string):
+export async function runRemoveOrAccept(ops: ServerRunner, o: Extract<ServerOrder, { type: 'remove-key' | 'accept' }>, script: string):
   Promise<{ ok: boolean; lines: string[] }> {
   const admin = canonicalDestination(o.destination)!.user;
   const sudo = admin === 'root' ? [] : ['sudo', '-n'];
@@ -275,6 +278,42 @@ export function parseReport(out: string): string[] | null {
   const lines = out.split('\n').map((l) => l.replace(/[^\x09\x20-\x7e]/g, '').trimEnd());
   if (!lines.includes('END') && !lines.some((l) => l.startsWith('NO-BASELINE'))) return null;
   return fitLines(lines.filter((l) => /^(NEW|GONE)\t/.test(l) || l.startsWith('NO-BASELINE')).map((l) => l.slice(0, 200)));
+}
+
+/** Only key summaries, never key bodies; an unfinished list is not a complete inventory. */
+export function parseKeys(out: string): string[] | null {
+  const lines = out.split('\n').map((l) => l.replace(/[^\x09\x20-\x7e]/g, '').trimEnd());
+  if (!lines.includes('END')) return null;
+  // Any account name the server has, not only names setup would make (r1 F3): the page offers
+  // Remove only for names remove-key accepts. NOTE lines say what the list cannot see (r1 B3).
+  return fitLines(lines.filter((l) =>
+    /^KEY\t[A-Za-z0-9._][A-Za-z0-9._-]{0,31}\t[0-9a-f]{16}\t[A-Za-z0-9@._:-]{0,60}\t(yes|no)$/.test(l) ||
+    /^NOTE\t(skipped-link|unreadable|too-large|other-file|other-command|ca-keys|other-config)(\t[A-Za-z0-9._-]{0,32})?$/.test(l)));
+}
+
+/** The caller looks up the record by admin entry; only its everyday key may list keys. */
+export async function runListKeys(ops: ServerRunner, rec: SetupRecord | undefined, destination: string):
+  Promise<{ ok: boolean; lines: string[] }> {
+  if (!rec) return { ok: false, lines: ['FAIL this server is not set up for everyday access yet; run Set up everyday access first'] };
+  // The record is kept per key, not per server: list only the server the owner asked about, so a
+  // list is never shown under another server's name (r1 F4).
+  if (adminDestination(rec) !== destination) {
+    return { ok: false, lines: ['FAIL this key was last set up on another server; run Set up everyday access for this one'] };
+  }
+  const r = await ops.serverRun({ entryId: rec.everyday_entry_id, destination: rec.everyday_destination,
+    purpose: 'List the sign-in keys on this server', argv: () => ['sudo', '-n', SESSION_CHECK, 'keys'] });
+  if ('error' in r) return { ok: false, lines: [failOf(r, 'list sign-in keys')] };
+  const lines = parseKeys(r.stdout);
+  if (r.exitCode !== 0 && lines === null) {
+    return { ok: false, lines: ['FAIL this server was set up before key listing existed; run Set up everyday access again (it is safe to repeat), then try again'] };
+  }
+  if (r.exitCode !== 0) return { ok: false, lines: [failOf(r, 'list sign-in keys')] };
+  if (lines === null) return { ok: false, lines: [`FAIL the key list did not finish (exit ${r.exitCode})`] };
+  // fitLines may have cut the list: say so in the count, never claim the shown part is all (r1 F2).
+  const total = (r.stdout.match(/^KEY\t/gm) ?? []).length;
+  const shown = lines.filter((l) => l.startsWith('KEY\t')).length;
+  return { ok: true, lines: [shown < total ? `PASS listed ${shown} of ${total} sign-in keys (the rest did not fit; remove some and list again)`
+    : `PASS listed ${shown} sign-in keys`, ...lines] };
 }
 
 /** The admin sign-in of a set-up server ("opc@host[:port]"): the report names its own server (round 2 F2). */

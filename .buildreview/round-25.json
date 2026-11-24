@@ -1,0 +1,65 @@
+{
+  "verdict": "ship",
+  "summary": "This is a dependency-only security release that raises the SDK requirement, updates locked dependencies, and synchronizes release metadata without changing src/. The supplied diff and reported audit, build, test, protocol-comparison, and packaging results support the acceptance checks; no concrete release-blocking defect is established by this excerpt.",
+  "spec_check": [
+    {
+      "requirement": "`npm audit --omit=dev` reports 0 vulnerabilities (was 10: 1 critical, 6 high, 3 moderate).",
+      "status": "met",
+      "evidence": "The review package reports zero production vulnerabilities after the update. The audit output itself was not supplied, so this relies on the reported test result."
+    },
+    {
+      "requirement": "package.json requires `@modelcontextprotocol/sdk` >= 1.32.2 (the version that clears every SDK advisory), so `npm install -g` users also get the fixed SDK.",
+      "status": "met",
+      "evidence": "package.json declares @modelcontextprotocol/sdk as ^1.32.2, excluding earlier SDK versions."
+    },
+    {
+      "requirement": "The lockfile pins the fixed versions; the release package (scripts/pack-app.mjs: `npm ci --omit=dev` from the lockfile) contains SDK 1.32.2 and zod >= 4.6.6, and the closure check passes.",
+      "status": "met",
+      "evidence": "The lockfile diff pins SDK 1.32.2 and zod 4.6.7. pack-app.mjs copies the manifest and lockfile, installs with npm ci --omit=dev, and invokes checkClosure before archiving. The package reports successful closure validation and confirms both versions inside the tarball."
+    },
+    {
+      "requirement": "No src/ file changed; `tsc` builds clean.",
+      "status": "met",
+      "evidence": "The supplied diff contains no src/ changes, and the review package reports a clean TypeScript build. Source files were withheld."
+    },
+    {
+      "requirement": "Full test suite passes.",
+      "status": "met",
+      "evidence": "The second reported full run passed 2519/2519 tests. The first run had one non-reproducing failure, and the third run was still in progress; neither negates the completed passing run, though the unexplained failure remains a confidence limitation."
+    },
+    {
+      "requirement": "MCP protocol output (initialize, tools/list including every tool's input schema, a tools/call, an unknown method) is byte-identical to 2.5.0.",
+      "status": "met",
+      "evidence": "The package reports a byte-identical 19194-byte comparison covering initialize, tools/list, vault_entries_list without configuration, and an unknown method. The comparison harness and captured transcripts were not supplied for independent inspection."
+    },
+    {
+      "requirement": "Version is 2.5.1 in package.json, package-lock.json, server.json; CHANGELOG has a 2.5.1 entry that states accurately what changed and why.",
+      "status": "met",
+      "evidence": "All shown release-version fields are updated to 2.5.1. The changelog identifies the SDK update and transitive updates, explains the security motivation, and distinguishes the unused HTTP/OAuth surface from the helper's stdio use."
+    },
+    {
+      "requirement": "Dev-only advisories (vitest/esbuild/tinypool, not shipped) are out of scope and stated as such.",
+      "status": "met",
+      "evidence": "The review package explicitly states that the remaining vitest/esbuild/tinypool advisories are development-only and not packaged. The packaging script installs with --omit=dev."
+    }
+  ],
+  "findings": [],
+  "blind_spots": [
+    {
+      "id": "B1",
+      "concern": "The bundled application and a fresh global npm installation do not necessarily receive the same dependency tree.",
+      "why_it_matters": "The archive uses the reviewed lockfile, whereas a later global installation can resolve newer SDK and transitive versions within permitted ranges. If one of those releases changes stdio behavior, global-install users can regress even while the tested 2.5.1 archive remains correct; the reported lockfile-based checks do not cover that later resolution."
+    },
+    {
+      "id": "B2",
+      "concern": "The initial test failure is described as flaky without identifying the test or its failure conditions.",
+      "why_it_matters": "If that failure depends on timing, machine load, or execution order, the passing rerun will not explain why another maintainer's prepublishOnly invocation fails. Retaining the failing test name and diagnostic output would make a recurrence distinguishable from a dependency regression."
+    }
+  ],
+  "_meta": {
+    "round": 25,
+    "at": "2026-11-14T05:24:24+00:00",
+    "package_bytes": 44641,
+    "schema_problems": []
+  }
+}

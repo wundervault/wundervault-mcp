@@ -1,0 +1,10 @@
+{"round": 27, "decisions": [
+ {"id": "F1", "action": "rejected", "claim": "a re-delivered save order logs 'saved' twice",
+  "reason": "a redelivery is processed again (running set only stops concurrent copies), so a second apply really happens on this machine; one line per apply is the correct record."},
+ {"id": "F2", "action": "fixed", "claim": "a save that throws (key check or store failure) writes no 'not saved' line",
+  "reason": "confirmed in src/agent.ts jobOrder: the outer catch skipped the log. It now records 'not saved' with the first error line, in its own try."},
+ {"id": "B1", "action": "deferred", "claim": "a crash between setState and the log line loses the line",
+  "reason": "real but narrow (process killed inside one synchronous step); the job state itself is right. Noted."},
+ {"id": "B2", "action": "rejected", "claim": "pause+resume between polls writes nothing",
+  "reason": "by design and in the spec: the log records changes APPLIED on this machine; the site keeps the owner's action history."}
+]}
