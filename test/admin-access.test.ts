@@ -81,7 +81,9 @@ const connectable = (p: string) => new Promise<boolean>((resolve) => {
 });
 
 beforeEach(() => {
-  base = fs.mkdtempSync(path.join(os.tmpdir(), 'wv-admin-'));
+  // /tmp on macOS: its per-user temp folder is so long the session socket path passes the
+  // 104-character limit and listen() fails (the helper's real path is ~74 characters).
+  base = fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/tmp' : os.tmpdir(), 'wv-admin-'));
   const run = path.join(base, 'run');
   fs.mkdirSync(run, { recursive: true });
   fs.chmodSync(run, 0o755);
