@@ -107,7 +107,10 @@ describe('admin SSH sessions end with admin access', () => {
     if ('error' in r) throw new Error(JSON.stringify(r));
     const until = Date.parse(r.admin_until!);
     expect(until).toBeGreaterThan(Date.now());
-    expect(await connectable(r.socket_path)).toBe(true);
+    // The socket starts listening just after open() returns; a slow runner can connect first.
+    let up = false;
+    for (let i = 0; i < 50 && !up && Date.now() < until; i++) { up = await connectable(r.socket_path); if (!up) await sleep(20); }
+    expect(up).toBe(true);
     while (ops.sshSessionOpen(r.session_id).open && Date.now() < until + 3000) await sleep(20);
     const closedAt = Date.now();
     expect(ops.sshSessionOpen(r.session_id)).toEqual({ open: false, ended_by: 'admin_access_ended' });
