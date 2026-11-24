@@ -575,6 +575,12 @@ describe('stamp approval', () => {
     expect(await run('https://evil.example.com:443')).toBeNull();
     expect(server.requests.size).toBe(2);
   });
+  it('two identical calls at once ask the owner once (review r3 F1)', async () => {
+    server.owner = 'wait';
+    const [a, b] = await Promise.all([run('https://api.example.com:443'), run('https://api.example.com:443')]);
+    expect([a?.code, b?.code]).toEqual(['WAITING', 'WAITING']);
+    expect(server.requests.size).toBe(1);
+  });
   it('a denial refuses the call', async () => {
     server.owner = 'deny';
     expect((await run('https://api.example.com:443'))?.code).toBe('NOT_APPROVED');

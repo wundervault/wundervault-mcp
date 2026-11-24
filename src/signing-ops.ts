@@ -74,56 +74,63 @@ async function ownerApproval(d: Deps, a: {
   bundle?: string[];
 }): Promise<{ ok: true; addPayee: boolean; requestId: string } | OpError> {
   const pendingKey = a.pendingKey ?? a.commit;
-  let requestId = d.state.pendingFor(pendingKey);
-  if (requestId && d.state.isUsed(requestId)) {
-    // A note that still points at a spent approval is stale (seen 2026-11-23: an agent's
-    // first call after server setup was refused "already been used" for a request it never
-    // made). Spent stays spent: drop the note and ask the owner afresh.
-    d.state.setPending(pendingKey, null);
-    requestId = null;
-  }
-  if (requestId) {
-    // An earlier call already asked. Waiting on it, rather than asking again, is what stops
-    // an agent that retries in a loop from mailing the owner once per retry.
-  } else {
-    // The agent's reason travels INSIDE the detail, which the server erases on decision —
-    // never in the request's purpose field, which outlived it (round 1, server F1).
-    let body: Parameters<AgentVaultAPI['checkOperation']>[0];
-    let generatedId: string | undefined;
-    if (a.sealed) {
-      let sealed;
-      try {
-        generatedId = newRequestId();
-        sealed = sealT2OpDetail(a.vaultKey, a.sealed.agentId, generatedId, {
-          name: a.sealed.name, kind: a.kind, detail: a.detail,
-        });
-      } catch {
-        return err('Refused: this approval request could not be sealed. Nothing was signed.', 'BAD_REQUEST');
-      }
-      if (!sealed.ok) {
-        return err('Refused: this approval request could not be sealed. Nothing was signed.', 'BAD_REQUEST');
-      }
-      body = {
-        entry_id: a.entryId, kind: a.kind, request_id: generatedId,
-        detail_ciphertext: sealed.ciphertext, detail_nonce: sealed.nonce, purpose: '',
-        ...(a.bundle?.length ? { bundle: a.bundle } : {}),
-      };
+  // One ask at a time for the same operation (review r3 F1): two calls that both found no note
+  // would otherwise each ask the owner, and the later note would hide the first request.
+  const asked = await d.state.exclusive('ask:' + pendingKey, async (): Promise<string | OpError> => {
+    let requestId = d.state.pendingFor(pendingKey);
+    if (requestId && d.state.isUsed(requestId)) {
+      // A note that still points at a spent approval is stale (seen 2026-11-23: an agent's
+      // first call after server setup was refused "already been used" for a request it never
+      // made). Spent stays spent: drop the note and ask the owner afresh.
+      d.state.setPending(pendingKey, null);
+      requestId = null;
+    }
+    if (requestId) {
+      // An earlier call already asked. Waiting on it, rather than asking again, is what stops
+      // an agent that retries in a loop from mailing the owner once per retry.
     } else {
-      body = { entry_id: a.entryId, kind: a.kind, detail: a.detail, purpose: '', ...(a.bundle?.length ? { bundle: a.bundle } : {}) };
+      // The agent's reason travels INSIDE the detail, which the server erases on decision —
+      // never in the request's purpose field, which outlived it (round 1, server F1).
+      let body: Parameters<AgentVaultAPI['checkOperation']>[0];
+      let generatedId: string | undefined;
+      if (a.sealed) {
+        let sealed;
+        try {
+          generatedId = newRequestId();
+          sealed = sealT2OpDetail(a.vaultKey, a.sealed.agentId, generatedId, {
+            name: a.sealed.name, kind: a.kind, detail: a.detail,
+          });
+        } catch {
+          return err('Refused: this approval request could not be sealed. Nothing was signed.', 'BAD_REQUEST');
+        }
+        if (!sealed.ok) {
+          return err('Refused: this approval request could not be sealed. Nothing was signed.', 'BAD_REQUEST');
+        }
+        body = {
+          entry_id: a.entryId, kind: a.kind, request_id: generatedId,
+          detail_ciphertext: sealed.ciphertext, detail_nonce: sealed.nonce, purpose: '',
+          ...(a.bundle?.length ? { bundle: a.bundle } : {}),
+        };
+      } else {
+        body = { entry_id: a.entryId, kind: a.kind, detail: a.detail, purpose: '', ...(a.bundle?.length ? { bundle: a.bundle } : {}) };
+      }
+      const v = await d.api.checkOperation(body);
+      if (generatedId !== undefined && v.request_id !== generatedId) {
+        return err('Refused: the server returned a different approval request id. Nothing was signed.', 'BAD_SERVER');
+      }
+      if (v.allowed) {
+        // The server may never allow one of these without an approval. A server that does is
+        // not one this broker will follow.
+        return err('Refused: the server allowed this without the owner\'s approval, which it never may. Nothing was signed.', 'BAD_SERVER');
+      }
+      if (!v.request_id) return err(`${v.message ?? 'The owner could not be asked.'} Nothing was signed.`, 'NOT_APPROVED');
+      requestId = v.request_id;
+      d.state.setPending(pendingKey, requestId);
     }
-    const v = await d.api.checkOperation(body);
-    if (generatedId !== undefined && v.request_id !== generatedId) {
-      return err('Refused: the server returned a different approval request id. Nothing was signed.', 'BAD_SERVER');
-    }
-    if (v.allowed) {
-      // The server may never allow one of these without an approval. A server that does is
-      // not one this broker will follow.
-      return err('Refused: the server allowed this without the owner\'s approval, which it never may. Nothing was signed.', 'BAD_SERVER');
-    }
-    if (!v.request_id) return err(`${v.message ?? 'The owner could not be asked.'} Nothing was signed.`, 'NOT_APPROVED');
-    requestId = v.request_id;
-    d.state.setPending(pendingKey, requestId);
-  }
+    return requestId;
+  });
+  if (typeof asked !== 'string') return asked;
+  const requestId = asked;
   const res = await d.api.waitForOwnerApproval(requestId, d.approvalWaitMs ?? 90_000);
   if (res.status === 'pending') {
     return err('The owner has been asked and has not answered yet. Nothing was signed. Call again with '
