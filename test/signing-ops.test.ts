@@ -581,6 +581,21 @@ describe('stamp approval', () => {
     expect([a?.code, b?.code]).toEqual(['WAITING', 'WAITING']);
     expect(server.requests.size).toBe(1);
   });
+  it('a late answer for an old request never clears a newer note (review r4 F1)', async () => {
+    server.owner = 'wait';
+    expect((await run('https://api.example.com:443'))?.code).toBe('WAITING');
+    const pending = JSON.parse(fs.readFileSync(deps.state.file, 'utf8')).pending as Record<string, { request_id: string }>;
+    const [key] = Object.keys(pending);
+    let release!: () => void;
+    server.ownerGate = new Promise<void>((r) => { release = r; });
+    server.owner = 'deny';
+    const late = run('https://api.example.com:443');        // waits on the first request
+    await new Promise((r) => setTimeout(r, 20));
+    deps.state.setPending(key!, 'req-newer');                // meanwhile another call asked again
+    release();
+    expect((await late)?.code).toBe('NOT_APPROVED');
+    expect(deps.state.pendingFor(key!)).toBe('req-newer');   // its note survives
+  });
   it('a denial refuses the call', async () => {
     server.owner = 'deny';
     expect((await run('https://api.example.com:443'))?.code).toBe('NOT_APPROVED');

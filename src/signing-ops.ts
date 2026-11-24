@@ -136,8 +136,11 @@ async function ownerApproval(d: Deps, a: {
     return err('The owner has been asked and has not answered yet. Nothing was signed. Call again with '
       + 'the same request to keep waiting — it will not ask the owner a second time.', 'WAITING');
   }
+  // Clear the note only while it is still OURS: a later call may have asked again meanwhile, and
+  // clearing its note would ask the owner a third time (review r4 F1).
+  const clearMine = () => { if (d.state.pendingFor(pendingKey) === requestId) d.state.setPending(pendingKey, null); };
   if (res.status !== 'approved') {
-    d.state.setPending(pendingKey, null);
+    clearMine();
     return err(`The owner did not approve this (${res.status}). Nothing was signed.`, 'NOT_APPROVED');
   }
   const opened = openOwnerToken(res.owner_token, a.vaultKey, {
@@ -148,7 +151,7 @@ async function ownerApproval(d: Deps, a: {
   // Burn it locally first: if the server's burn then fails, the approval is spent rather
   // than spendable twice.
   d.state.markUsed(requestId);
-  d.state.setPending(pendingKey, null);
+  clearMine();
   const second = await d.api.checkOperation({ entry_id: a.entryId, kind: a.kind, approval_id: requestId, purpose: '' });
   if (!second.allowed) return err(`${second.message ?? 'The approval could not be used.'} Nothing was signed.`, 'NOT_APPROVED');
   return { ok: true, addPayee: opened.token.addPayee, requestId };
