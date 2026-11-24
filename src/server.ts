@@ -294,7 +294,8 @@ export function createServer(args: { url?: string } = {}) {
           + 'For a job that brings back a FILE (a backup), give file: {max_bytes, keep}: the command writes the file '
           + 'to its output, and the helper keeps it in its own folder on its computer (the last `keep` copies), which '
           + 'agents cannot read. A run that passes max_bytes, or would leave the helper\'s drive too full, fails and '
-          + 'keeps nothing. The request is refused if max_bytes × keep would not fit in the free space.'
+          + 'keeps nothing. The request is refused if max_bytes × (keep + 1) would not fit in the free space. '
+          + 'A run must finish within its timeout (at most 600 seconds), so the file must transfer in that time.'
         ),
         inputSchema: {
           type: 'object',
@@ -339,9 +340,9 @@ export function createServer(args: { url?: string } = {}) {
               description: 'Only for a job whose output is a file to keep (a backup).',
               properties: {
                 max_bytes: { type: 'integer', minimum: 1, maximum: 2147483648, description: 'Largest file allowed, in bytes (at most 2 GB).' },
-                keep: { type: 'integer', minimum: 1, maximum: 14, description: 'How many copies to keep (7 is a good default).' },
+                keep: { type: 'integer', minimum: 1, maximum: 14, default: 7, description: 'How many copies to keep (default 7).' },
               },
-              required: ['max_bytes', 'keep'],
+              required: ['max_bytes'],
             },
           },
           required: ['name', 'entry_id', 'destination', 'argv', 'schedule', 'why'],

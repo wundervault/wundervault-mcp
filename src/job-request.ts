@@ -47,7 +47,9 @@ export function validateJobProposal(
     name: o.name, entry_id: o.entry_id, destination: o.destination,
     argv: o.argv, schedule: o.schedule,
     timeout_s: o.timeout_s === undefined ? 300 : o.timeout_s,
-    ...(Object.hasOwn(o, 'file') ? { file: o.file } : {}),
+    // keep defaults to 7 (review r1 F2); the order itself always carries both.
+    ...(Object.hasOwn(o, 'file') ? { file: o.file && typeof o.file === 'object' && !Array.isArray(o.file) &&
+      !Object.hasOwn(o.file, 'keep') ? { ...(o.file as object), keep: 7 } : o.file } : {}),
   }, 'proposal', 0);
   if (!checked.ok && checked.reason === 'bad file') {
     return { ok: false, reason: 'file must be { max_bytes: 1 to 2147483648, keep: 1 to 14 }' };

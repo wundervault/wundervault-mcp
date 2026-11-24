@@ -86,6 +86,8 @@ describe('file job definitions', () => {
       schedule: { kind: 'daily', time: '03:00', tz: 'UTC' }, why: 'nightly backup' };
     const ok = validateJobProposal({ ...base, file: { max_bytes: 1000, keep: 7 } });
     expect(ok.ok && ok.proposal.file).toEqual({ max_bytes: 1000, keep: 7 });
+    const dflt = validateJobProposal({ ...base, file: { max_bytes: 1000 } });
+    expect(dflt.ok && dflt.proposal.file).toEqual({ max_bytes: 1000, keep: 7 });   // review r1 F2
     const bad = validateJobProposal({ ...base, file: { max_bytes: 1000, keep: 99 } });
     expect(bad).toEqual({ ok: false, reason: expect.stringContaining('keep: 1 to 14') });
   });
@@ -147,6 +149,37 @@ describe('a file job run', () => {
     expect(run).toMatchObject({ ok: false, error: expect.stringContaining('not enough disk space') });
     expect(files(dir, 'file')).toEqual([]);
     expect(files(dir, 'part')).toEqual([]);
+  });
+
+  it('checks the space before every write, not every few MB (review r1 F3)', async () => {
+    const dir = directory();
+    let free = GB + 9 * 1024 * 1024;
+    const ops: ServerRunner = {
+      serverRun: vi.fn(async (args) => {
+        expect(args.onStdout!(Buffer.alloc(65536))).toBeUndefined();
+        free = GB + 32 * 1024;                   // another program filled the drive meanwhile
+        const stop = args.onStdout!(Buffer.alloc(65536));
+        return stop === undefined ? { exitCode: 0, stdout: '', stderr: '' } : { exitCode: 125, stdout: '', stderr: stop };
+      }),
+    };
+    const run = await runJob(ops, stored(), 'schedule', dir, () => now, () => ({ free, total: 10 * GB }));
+    expect(run).toMatchObject({ ok: false, error: expect.stringContaining('not enough disk space') });
+    expect(files(dir, 'file')).toEqual([]);
+  });
+
+  it('a failure removing OLD copies never undoes the new one (review r1 F4)', async () => {
+    const dir = directory();
+    const def = definition({ file: { max_bytes: 1024, keep: 1 } });
+    const first = await runJob(sends([Buffer.from('old')]), stored(def), 'schedule', dir, () => now, plenty);
+    fs.utimesSync(path.join(dir, 'job_12345', `${first.run_id}.file`), 1, 1);
+    const real = fs.unlinkSync;
+    vi.spyOn(fs, 'unlinkSync').mockImplementation(((p: fs.PathLike) => {
+      if (String(p).endsWith(`${first.run_id}.json`)) throw Object.assign(new Error('immutable'), { code: 'EPERM' });
+      return real(p);
+    }) as typeof fs.unlinkSync);
+    const run = await runJob(sends([Buffer.from('new')]), stored(def), 'schedule', dir, () => now, plenty);
+    expect(run.ok).toBe(true);
+    expect(fs.readFileSync(path.join(dir, 'job_12345', `${run.run_id}.file`), 'utf8')).toBe('new');
   });
 
   it('refuses to start when the drive is already at the reserve', async () => {
@@ -291,9 +324,11 @@ describe('vault_job_request checks the helper has room (check 10)', () => {
     try {
       BrokerOps.jobDiskSpace = () => ({ free: 5 * GB, total: 10 * GB });   // 4 GB above the reserve
       const no = await ops.jobRequest({ ...base, file: { max_bytes: GB, keep: 5 } });
-      expect(no.error).toMatch(/Not enough disk space.*5\.0 GB free.*1\.0 GB must stay free.*5\.0 GB/);
+      expect(no.error).toMatch(/Not enough disk space.*5\.0 GB free.*1\.0 GB must stay free.*6\.0 GB/);
       expect(posted).toEqual([]);
-      const yes = await ops.jobRequest({ ...base, file: { max_bytes: GB, keep: 4 } });
+      // keep 4 needs 5 GB (one more copy while the oldest is still kept, review r1 B1): refused.
+      expect((await ops.jobRequest({ ...base, file: { max_bytes: GB, keep: 4 } })).error).toMatch(/Not enough/);
+      const yes = await ops.jobRequest({ ...base, file: { max_bytes: GB, keep: 3 } });
       expect(yes).toMatchObject({ request_id: 'r1' });
       expect(await ops.jobRequest(base)).toMatchObject({ request_id: 'r1' });   // text jobs: no check
       expect(posted).toHaveLength(2);

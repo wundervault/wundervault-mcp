@@ -530,13 +530,11 @@ async function runFileJob(
   const part = path.join(dir, `${runId}.part`);
   let fd: number | undefined;
   let bytes = 0;
-  let sinceCheck = 0;
   let stopped: string | undefined;
   const hash = createHash('sha256');
   let stderr = '';
   let exitCode = -1;
   let error: string | undefined;
-  const CHECK_EVERY = 8 * 1024 * 1024;
   const roomFor = (n: number): boolean => {
     const { free, total } = space(dir);
     return free - n >= diskReserve(total);
@@ -560,11 +558,8 @@ async function runFileJob(
         if (bytes + chunk.length > file.max_bytes) {
           return stopped = `stopped: the file is bigger than its limit (${file.max_bytes} bytes)`;
         }
-        sinceCheck += chunk.length;
-        if (sinceCheck >= CHECK_EVERY || bytes === 0) {
-          sinceCheck = 0;
-          if (!roomFor(Math.max(chunk.length, CHECK_EVERY))) return stopped = 'stopped: not enough disk space on the helper’s computer';
-        }
+        // Before EVERY write: another program may be filling the same drive (review r1 F3).
+        if (!roomFor(chunk.length)) return stopped = 'stopped: not enough disk space on the helper’s computer';
         try {
           let off = 0;
           while (off < chunk.length) off += fs.writeSync(out, chunk, off, chunk.length - off);
@@ -601,7 +596,8 @@ async function runFileJob(
       run.sha256 = hash.digest('hex');
       fs.renameSync(part, path.join(dir, `${runId}.file`));
       atomicJson(path.join(dir, `${runId}.json`), run);
-      pruneOutput(dir, runId, 'file', file.keep);
+      // The new copy is kept: a failure removing OLD copies must never undo it (review r1 F4).
+      try { pruneOutput(dir, runId, 'file', file.keep); } catch { /* the next run tries again */ }
     }
   } catch (e) {
     run.ok = false;

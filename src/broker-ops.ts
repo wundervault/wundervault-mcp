@@ -1423,13 +1423,14 @@ export class BrokerOps {
         // reserve the helper always leaves (the helper still stops a run that would cross it).
         const { diskSpace, diskReserve } = await import('./jobs.js');
         const { free, total } = (BrokerOps.jobDiskSpace ?? diskSpace)(path.join(systemRoot(), 'job-output'));
-        const need = proposal.file.max_bytes * proposal.file.keep;
+        // keep copies, plus the one being written while the oldest is still kept (review r1 B1).
+        const need = proposal.file.max_bytes * (proposal.file.keep + 1);
         const room = Math.max(0, free - diskReserve(total));
         if (need > room) {
           const gb = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GB`;
           rec.detail = 'not enough disk space for the file job';
           return { error: `Not enough disk space on the helper's computer: ${gb(free)} free, `
-            + `${gb(diskReserve(total))} must stay free, and max_bytes × keep needs ${gb(need)}. `
+            + `${gb(diskReserve(total))} must stay free, and max_bytes × (keep + 1) needs ${gb(need)}. `
             + 'Lower max_bytes or keep, or free up space first.' };
         }
       }
