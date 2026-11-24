@@ -432,6 +432,8 @@ function privateDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const stat = fs.lstatSync(dir);
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('invalid job output directory');
+  // Someone else's folder is refused, never adopted: chmod would not take it back (review r2 F1).
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) throw new Error('job output directory has the wrong owner');
   fs.chmodSync(dir, 0o700);
 }
 

@@ -246,6 +246,20 @@ describe('a file job run', () => {
     expect(fs.readdirSync(elsewhere)).toEqual([]);
   });
 
+  it('refuses a job folder owned by another account (review r2 F1)', async () => {
+    const dir = directory();
+    fs.mkdirSync(path.join(dir, 'job_12345'), { mode: 0o700 });
+    const real = fs.lstatSync;
+    vi.spyOn(fs, 'lstatSync').mockImplementation(((p: fs.PathLike, o?: unknown) => {
+      const st = (real as (p: fs.PathLike, o?: unknown) => fs.Stats)(p, o);
+      return String(p).endsWith('job_12345') ? Object.assign(Object.create(Object.getPrototypeOf(st)), st, { uid: st.uid + 1 }) : st;
+    }) as typeof fs.lstatSync);
+    const ops = sends([Buffer.from('x')]);
+    const run = await runJob(ops, stored(), 'schedule', dir, () => now, plenty);
+    expect(run).toMatchObject({ ok: false, error: expect.stringContaining('wrong owner') });
+    expect(ops.serverRun).not.toHaveBeenCalled();
+  });
+
   it('text jobs still keep text output as before (check 13)', async () => {
     const dir = directory();
     const { file: _f, ...text } = definition();
