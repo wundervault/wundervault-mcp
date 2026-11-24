@@ -290,7 +290,11 @@ export function createServer(args: { url?: string } = {}) {
           + 'and sees the exact command. Nothing runs until then. The job then runs on its own, with no agent involved. '
           + 'Jobs use everyday SSH keys that run without asking, never admin or ask-first keys. '
           + 'Only one job runs per server at a time. Timeout defaults to 300 seconds and cannot exceed 600 seconds. '
-          + 'Output stays on the helper; this tool does not return it. Use vault_job_status to check the request.'
+          + 'Output stays on the helper; this tool does not return it. Use vault_job_status to check the request. '
+          + 'For a job that brings back a FILE (a backup), give file: {max_bytes, keep}: the command writes the file '
+          + 'to its output, and the helper keeps it in its own folder on its computer (the last `keep` copies), which '
+          + 'agents cannot read. A run that passes max_bytes, or would leave the helper\'s drive too full, fails and '
+          + 'keeps nothing. The request is refused if max_bytes × keep would not fit in the free space.'
         ),
         inputSchema: {
           type: 'object',
@@ -330,6 +334,15 @@ export function createServer(args: { url?: string } = {}) {
             timeout_s: { type: 'integer', minimum: 10, maximum: 600, default: 300, description: 'Maximum run time in seconds.' },
             grace_minutes: { type: 'integer', minimum: 5, maximum: 1440, default: 30, description: 'Extra time before a missed run is reported.' },
             why: { type: 'string', minLength: 1, maxLength: 300, description: 'Why this job is needed, shown to the owner. No control characters.' },
+            file: {
+              type: 'object', additionalProperties: false,
+              description: 'Only for a job whose output is a file to keep (a backup).',
+              properties: {
+                max_bytes: { type: 'integer', minimum: 1, maximum: 2147483648, description: 'Largest file allowed, in bytes (at most 2 GB).' },
+                keep: { type: 'integer', minimum: 1, maximum: 14, description: 'How many copies to keep (7 is a good default).' },
+              },
+              required: ['max_bytes', 'keep'],
+            },
           },
           required: ['name', 'entry_id', 'destination', 'argv', 'schedule', 'why'],
         },

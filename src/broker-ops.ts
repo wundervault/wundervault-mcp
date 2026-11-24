@@ -1391,6 +1391,9 @@ export class BrokerOps {
   // ── vault_save_secret (SPEC-save-from-agent) ──────────────────────────────
 
   // ── Agent job proposals: only the owner can turn one into a job ───────────
+  /** Tests only: the free-space reading a file-job request checks against. */
+  static jobDiskSpace: ((dir: string) => { free: number; total: number }) | null = null;
+
   async jobRequest(args: unknown): Promise<Record<string, unknown>> {
     const { validateJobProposal, newRequestId, sealProposal } = await import('./job-request.js');
     const checked = validateJobProposal(args);
@@ -1414,6 +1417,21 @@ export class BrokerOps {
       if (!key.ok) {
         rec.detail = key.reason;
         return { error: key.reason };
+      }
+      if (proposal.file) {
+        // The agent's check that the helper's drive has room for every copy kept, plus the
+        // reserve the helper always leaves (the helper still stops a run that would cross it).
+        const { diskSpace, diskReserve } = await import('./jobs.js');
+        const { free, total } = (BrokerOps.jobDiskSpace ?? diskSpace)(path.join(systemRoot(), 'job-output'));
+        const need = proposal.file.max_bytes * proposal.file.keep;
+        const room = Math.max(0, free - diskReserve(total));
+        if (need > room) {
+          const gb = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GB`;
+          rec.detail = 'not enough disk space for the file job';
+          return { error: `Not enough disk space on the helper's computer: ${gb(free)} free, `
+            + `${gb(diskReserve(total))} must stay free, and max_bytes × keep needs ${gb(need)}. `
+            + 'Lower max_bytes or keep, or free up space first.' };
+        }
       }
       const vaultKey = await this.api.ensureVaultKey();
       requestId = newRequestId();
@@ -2087,6 +2105,7 @@ export class BrokerOps {
   async serverRun(args: {
     entryId: string; destination: string; purpose: string;
     argv: (publicKey: string) => string[]; input?: string; offer?: 'cert' | 'plain'; timeoutMs?: number; noAsk?: boolean;
+    onStdout?: (chunk: Buffer) => string | undefined;
   }): Promise<{ exitCode: number; stdout: string; stderr: string } | OpError> {
     const op = { kind: 'ssh', destination: args.destination, remoteArgv: ['true'] } as BrokeredOp;
     const opened = await this.sshAgentOpen({
@@ -2106,6 +2125,7 @@ export class BrokerOps {
         socketPath: opened.socket_path, publicKeyPath: opened.public_key_path,
         ...(opened.known_hosts_path ? { knownHostsPath: opened.known_hosts_path } : {}),
         ...(args.input !== undefined ? { input: args.input } : {}),
+        ...(args.onStdout ? { onStdout: args.onStdout } : {}),
         timeoutMs: args.timeoutMs ?? 180_000, signal: stop.signal,
       });
     } finally {

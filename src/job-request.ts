@@ -7,14 +7,14 @@ import { validateJobOrder, type JobDefinition } from './jobs.js';
 import { sealForOwner } from './server-setup.js';
 
 export type JobProposal = Pick<JobDefinition,
-  'name' | 'entry_id' | 'destination' | 'argv' | 'schedule' | 'timeout_s'
+  'name' | 'entry_id' | 'destination' | 'argv' | 'schedule' | 'timeout_s' | 'file'
 > & {
   grace_minutes: number;
   why: string;
 };
 
 const FIELDS = [
-  'name', 'entry_id', 'destination', 'argv', 'schedule', 'timeout_s', 'grace_minutes', 'why',
+  'name', 'entry_id', 'destination', 'argv', 'schedule', 'timeout_s', 'grace_minutes', 'why', 'file',
 ];
 const REQUIRED = ['name', 'entry_id', 'destination', 'argv', 'schedule', 'why'];
 
@@ -47,7 +47,11 @@ export function validateJobProposal(
     name: o.name, entry_id: o.entry_id, destination: o.destination,
     argv: o.argv, schedule: o.schedule,
     timeout_s: o.timeout_s === undefined ? 300 : o.timeout_s,
+    ...(Object.hasOwn(o, 'file') ? { file: o.file } : {}),
   }, 'proposal', 0);
+  if (!checked.ok && checked.reason === 'bad file') {
+    return { ok: false, reason: 'file must be { max_bytes: 1 to 2147483648, keep: 1 to 14 }' };
+  }
   if (!checked.ok) return checked;
 
   const job = checked.job;
@@ -57,6 +61,7 @@ export function validateJobProposal(
       name: job.name, entry_id: job.entry_id, destination: job.destination,
       argv: job.argv, schedule: job.schedule, timeout_s: job.timeout_s,
       grace_minutes: grace as number, why: o.why,
+      ...(job.file ? { file: job.file } : {}),
     },
   };
 }
@@ -82,6 +87,7 @@ export function sealProposal(
     timeout_s: proposal.timeout_s,
     grace_minutes: proposal.grace_minutes,
     why: proposal.why,
+    ...(proposal.file ? { file: proposal.file } : {}),
   });
 }
 

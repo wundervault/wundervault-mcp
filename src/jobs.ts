@@ -2,7 +2,7 @@
  * Owner-approved unattended jobs. Definitions and output belong in the helper's own storage,
  * never in an agent's home. Only sealed owner orders may call JobStore.apply.
  */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { openSealed } from './broker-update.js';
@@ -29,6 +29,40 @@ export interface JobDefinition {
   argv: string[];
   schedule: JobSchedule;
   timeout_s: number;
+  /** The command's output is a FILE the helper keeps (a backup), not text. Absent = text job. */
+  file?: JobFile;
+}
+
+/** A file job: at most max_bytes per copy, the last `keep` copies kept. */
+export interface JobFile { max_bytes: number; keep: number }
+export const FILE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+export const FILE_MAX_KEEP = 14;
+
+/** Free space a file job must always leave on the helper's drive: max(1 GiB, 5% of the drive). */
+export function diskReserve(totalBytes: number): number {
+  return Math.max(1024 * 1024 * 1024, Math.floor(totalBytes * 0.05));
+}
+
+/** Free and total bytes of the drive holding `dir` (its nearest existing parent). */
+export function diskSpace(dir: string): { free: number; total: number } {
+  let d = dir;
+  for (;;) {
+    try {
+      const st = fs.statfsSync(d);
+      return { free: st.bavail * st.bsize, total: st.blocks * st.bsize };
+    } catch (e) {
+      const parent = path.dirname(d);
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT' || parent === d) throw e;
+      d = parent;
+    }
+  }
+}
+
+export function validJobFile(v: unknown): JobFile | null {
+  if (!record(v) || !exact(v, ['max_bytes', 'keep'])) return null;
+  if (!Number.isInteger(v.max_bytes) || (v.max_bytes as number) < 1 || (v.max_bytes as number) > FILE_MAX_BYTES) return null;
+  if (!Number.isInteger(v.keep) || (v.keep as number) < 1 || (v.keep as number) > FILE_MAX_KEEP) return null;
+  return { max_bytes: v.max_bytes as number, keep: v.keep as number };
 }
 
 export interface JobRun {
@@ -50,6 +84,8 @@ export interface LocalJobRun extends JobRun {
   output_truncated?: boolean;
   /** A failed run's last 20 lines (stdout + stderr, at most 4 KB): sealed before it leaves. */
   tail?: string;
+  /** File jobs: SHA-256 of the kept copy (hex). Stays on this computer. */
+  sha256?: string;
 }
 
 export interface StoredJob {
@@ -115,7 +151,7 @@ function isoMs(v: unknown): number {
 export function validateJobOrder(
   o: unknown, fingerprint: string, nowMs: number,
 ): { ok: true; job: JobDefinition } | { ok: false; reason: string } {
-  if (!record(o) || !exact(o, KEYS) || o.v !== 1 || o.type !== 'job-set') {
+  if (!record(o) || !(exact(o, KEYS) || exact(o, [...KEYS, 'file'])) || o.v !== 1 || o.type !== 'job-set') {
     return { ok: false, reason: 'malformed' };
   }
   if (o.broker !== fingerprint) return { ok: false, reason: 'wrong broker' };
@@ -157,6 +193,8 @@ export function validateJobOrder(
   if (!Number.isInteger(o.timeout_s) || (o.timeout_s as number) < 10 || (o.timeout_s as number) > 600) {
     return { ok: false, reason: 'bad timeout' };
   }
+  const file = Object.hasOwn(o, 'file') ? validJobFile(o.file) : undefined;
+  if (file === null) return { ok: false, reason: 'bad file' };
   return {
     ok: true,
     job: {
@@ -165,6 +203,7 @@ export function validateJobOrder(
       job_id: o.job_id as string, version: o.version as number, name: o.name,
       entry_id: o.entry_id as string, destination: destination.text, argv: [...o.argv] as string[],
       schedule: { ...schedule } as JobSchedule, timeout_s: o.timeout_s as number,
+      ...(file ? { file } : {}),
     },
   };
 }
@@ -396,17 +435,17 @@ function privateDir(dir: string): void {
   fs.chmodSync(dir, 0o700);
 }
 
-function pruneOutput(dir: string, current: string): void {
-  const files = fs.readdirSync(dir).filter(name => /^[A-Za-z0-9_-]{22}\.out$/.test(name));
+function pruneOutput(dir: string, current: string, ext = 'out', keep = 5): void {
+  const files = fs.readdirSync(dir).filter(name => new RegExp(`^[A-Za-z0-9_-]{22}\\.${ext}$`).test(name));
   files.sort((a, b) => {
-    if (a === `${current}.out`) return -1;
-    if (b === `${current}.out`) return 1;
+    if (a === `${current}.${ext}`) return -1;
+    if (b === `${current}.${ext}`) return 1;
     return fs.statSync(path.join(dir, b)).mtimeMs - fs.statSync(path.join(dir, a)).mtimeMs ||
       b.localeCompare(a);
   });
-  for (const name of files.slice(5)) {
+  for (const name of files.slice(keep)) {
     fs.unlinkSync(path.join(dir, name));
-    const metadata = path.join(dir, name.replace(/\.out$/, '.json'));
+    const metadata = path.join(dir, name.slice(0, -(ext.length + 1)) + '.json');
     try { fs.unlinkSync(metadata); } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
     }
@@ -420,9 +459,11 @@ function pruneOutput(dir: string, current: string): void {
 export async function runJob(
   ops: ServerRunner, job: StoredJob, trigger: JobTrigger, outputDir: string,
   nowFn: () => Date = () => new Date(),
+  space: (dir: string) => { free: number; total: number } = diskSpace,
 ): Promise<LocalJobRun> {
   const def = job.def;
   if (!ID.test(def.job_id)) throw new Error('invalid job id');
+  if (def.file) return runFileJob(ops, job, trigger, outputDir, nowFn, space);
   const runId = randomBytes(16).toString('base64url');
   const started = nowFn().toISOString();
   let stdout = '';
@@ -468,6 +509,112 @@ export async function runJob(
   } catch (e) {
     run.error = `${run.error ? run.error + '; ' : ''}output not kept: ${(e instanceof Error ? e.message : String(e)).split(/\r?\n/)[0]!.slice(0, 200)}`;
   }
+  return run;
+}
+
+/**
+ * A file job: stdout streams into ONE file this helper names (never a name the server sends),
+ * in the job's private folder, never held in memory. It stops at max_bytes or before the drive
+ * falls below the reserve; a copy counts only when the command exits 0. Not encrypted while it
+ * stays on this computer (owner 11-24): the folder is the helper's own, agents can't read it.
+ */
+async function runFileJob(
+  ops: ServerRunner, job: StoredJob, trigger: JobTrigger, outputDir: string,
+  nowFn: () => Date, space: (dir: string) => { free: number; total: number },
+): Promise<LocalJobRun> {
+  const def = job.def;
+  const file = def.file!;
+  const runId = randomBytes(16).toString('base64url');
+  const started = nowFn().toISOString();
+  const dir = path.join(outputDir, def.job_id);
+  const part = path.join(dir, `${runId}.part`);
+  let fd: number | undefined;
+  let bytes = 0;
+  let sinceCheck = 0;
+  let stopped: string | undefined;
+  const hash = createHash('sha256');
+  let stderr = '';
+  let exitCode = -1;
+  let error: string | undefined;
+  const CHECK_EVERY = 8 * 1024 * 1024;
+  const roomFor = (n: number): boolean => {
+    const { free, total } = space(dir);
+    return free - n >= diskReserve(total);
+  };
+  try {
+    privateDir(outputDir);
+    privateDir(dir);
+    // A run cut off by a crash or restart left its partial copy: one run per job at a time, so
+    // any .part here now is dead.
+    for (const name of fs.readdirSync(dir)) {
+      if (/^[A-Za-z0-9_-]{22}\.part$/.test(name)) fs.unlinkSync(path.join(dir, name));
+    }
+    if (!roomFor(0)) throw new Error('not enough disk space on the helper’s computer');
+    fd = fs.openSync(part, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
+      (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    const out = fd;
+    const result = await ops.serverRun({
+      entryId: def.entry_id, destination: def.destination, purpose: `job: ${def.name}`,
+      argv: () => [...def.argv], timeoutMs: def.timeout_s * 1000, noAsk: true,
+      onStdout: (chunk) => {
+        if (bytes + chunk.length > file.max_bytes) {
+          return stopped = `stopped: the file is bigger than its limit (${file.max_bytes} bytes)`;
+        }
+        sinceCheck += chunk.length;
+        if (sinceCheck >= CHECK_EVERY || bytes === 0) {
+          sinceCheck = 0;
+          if (!roomFor(Math.max(chunk.length, CHECK_EVERY))) return stopped = 'stopped: not enough disk space on the helper’s computer';
+        }
+        try {
+          let off = 0;
+          while (off < chunk.length) off += fs.writeSync(out, chunk, off, chunk.length - off);
+        } catch (e) {
+          const code = (e as NodeJS.ErrnoException).code;
+          return stopped = code === 'ENOSPC' || code === 'EDQUOT'
+            ? 'stopped: not enough disk space on the helper’s computer'
+            : `stopped: could not write the file (${code ?? 'error'})`;
+        }
+        hash.update(chunk);
+        bytes += chunk.length;
+        return undefined;
+      },
+    });
+    if ('error' in result) error = result.error;
+    else {
+      stderr = result.stderr ?? '';
+      if (stopped) error = stopped;
+      else if (Number.isInteger(result.exitCode) && result.exitCode >= 0 && result.exitCode <= 255) exitCode = result.exitCode;
+      else error = 'invalid exit code';
+    }
+  } catch (e) {
+    error = e instanceof Error ? e.message : String(e);
+  }
+  const run: LocalJobRun = {
+    run_id: runId, started_at: started, finished_at: nowFn().toISOString(),
+    ok: error === undefined && exitCode === 0, exit_code: error === undefined ? exitCode : -1,
+    bytes, trigger,
+    ...(error !== undefined ? { error: error.split(/\r?\n/)[0]!.slice(0, 500) } : {}),
+  };
+  try {
+    if (fd !== undefined) { if (run.ok) fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined; }
+    if (run.ok) {
+      run.sha256 = hash.digest('hex');
+      fs.renameSync(part, path.join(dir, `${runId}.file`));
+      atomicJson(path.join(dir, `${runId}.json`), run);
+      pruneOutput(dir, runId, 'file', file.keep);
+    }
+  } catch (e) {
+    run.ok = false;
+    run.exit_code = -1;
+    run.error = `${run.error ? run.error + '; ' : ''}file not kept: ${(e instanceof Error ? e.message : String(e)).split(/\r?\n/)[0]!.slice(0, 200)}`;
+    delete run.sha256;
+    try { fs.unlinkSync(path.join(dir, `${runId}.file`)); } catch { /* not there */ }
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* closed */ } }
+    if (!run.ok) { try { fs.unlinkSync(part); } catch { /* never made, or already gone */ } }
+  }
+  // Stdout is the file: the owner's error details carry only stderr and the reason.
+  if (!run.ok) run.tail = failureTail('', stderr, run.error);
   return run;
 }
 

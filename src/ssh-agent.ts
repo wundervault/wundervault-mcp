@@ -887,8 +887,13 @@ export async function runSshWithAgent(opts: {
   signal?: AbortSignal;
   /** Written to the command's stdin, then closed (guided setup sends its fixed script). */
   input?: string;
+  /**
+   * Stdout goes here, chunk by chunk, instead of into the bounded string (a job bringing back a
+   * file). Return a reason to stop: the command is killed and the run ends with exit 125.
+   */
+  onStdout?: (chunk: Buffer) => string | undefined;
 }): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const { op, socketPath, publicKeyPath, cwd, timeoutMs = 120_000, knownHostsPath, signal, input } = opts;
+  const { op, socketPath, publicKeyPath, cwd, timeoutMs = 120_000, knownHostsPath, signal, input, onStdout } = opts;
   const argv = buildSshArgv(op, socketPath, publicKeyPath, knownHostsPath);
 
   // spawn, NOT spawnSync. When this process hosts the agent listener, a synchronous
@@ -950,7 +955,13 @@ export async function runSshWithAgent(opts: {
       child.stdin?.on('error', () => { /* the remote closed early; its exit code says why */ });
       child.stdin?.end(input);
     }
-    child.stdout?.on('data', (d) => { stdout = append(stdout, d.toString()); });
+    child.stdout?.on('data', (d: Buffer) => {
+      if (settled) return;
+      if (!onStdout) { stdout = append(stdout, d.toString()); return; }
+      let stop: string | undefined;
+      try { stop = onStdout(d); } catch (e) { stop = e instanceof Error ? e.message : String(e); }
+      if (stop !== undefined) { killAll(); finish(125, `\n${stop}`); }
+    });
     child.stderr?.on('data', (d) => { stderr = append(stderr, d.toString()); });
     child.on('error', (e) => finish(1, `\nFailed to run ${argv[0]}: ${e.message}`));
     child.on('close', (code) => finish(code ?? 1));
