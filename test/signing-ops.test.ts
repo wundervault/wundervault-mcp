@@ -322,6 +322,26 @@ describe('vault_pay — EVM', () => {
     expect('error' in c ? c.error : c.inside_rules).toBe(false);
     expect(server.requests.size).toBe(1);
   });
+
+  it('a stale note pointing at a spent approval asks afresh instead of refusing for ever (2026-11-23)', async () => {
+    server.owner = 'wait';
+    server.entries.get('w')!.policy = null;
+    const a = await payW();
+    expect('error' in a && a.code).toBe('WAITING');
+    const pending = JSON.parse(fs.readFileSync(deps.state.file, 'utf8')).pending as Record<string, { request_id: string }>;
+    const [key] = Object.keys(pending);
+    const spent = pending[key!]!.request_id;
+    server.owner = 'approve';
+    const b = await payW();
+    expect('error' in b).toBe(false);
+    expect(deps.state.isUsed(spent)).toBe(true);
+    // The note comes back pointing at the spent approval (another process's stale write).
+    deps.state.setPending(key!, spent);
+    const c = await payW();
+    expect('error' in c ? c.error : 'ok').toBe('ok');
+    expect(server.requests.size).toBe(2);            // asked the owner again
+    expect(deps.state.isUsed(spent)).toBe(true);     // the spent one stays spent
+  });
 });
 
 describe('vault_pay — a server that lies about approvals gets nothing', () => {
@@ -554,6 +574,27 @@ describe('stamp approval', () => {
     expect(server.requests.size).toBe(1);
     expect(await run('https://evil.example.com:443')).toBeNull();
     expect(server.requests.size).toBe(2);
+  });
+  it('two identical calls at once ask the owner once (review r3 F1)', async () => {
+    server.owner = 'wait';
+    const [a, b] = await Promise.all([run('https://api.example.com:443'), run('https://api.example.com:443')]);
+    expect([a?.code, b?.code]).toEqual(['WAITING', 'WAITING']);
+    expect(server.requests.size).toBe(1);
+  });
+  it('a late answer for an old request never clears a newer note (review r4 F1)', async () => {
+    server.owner = 'wait';
+    expect((await run('https://api.example.com:443'))?.code).toBe('WAITING');
+    const pending = JSON.parse(fs.readFileSync(deps.state.file, 'utf8')).pending as Record<string, { request_id: string }>;
+    const [key] = Object.keys(pending);
+    let release!: () => void;
+    server.ownerGate = new Promise<void>((r) => { release = r; });
+    server.owner = 'deny';
+    const late = run('https://api.example.com:443');        // waits on the first request
+    await new Promise((r) => setTimeout(r, 20));
+    deps.state.setPending(key!, 'req-newer');                // meanwhile another call asked again
+    release();
+    expect((await late)?.code).toBe('NOT_APPROVED');
+    expect(deps.state.pendingFor(key!)).toBe('req-newer');   // its note survives
   });
   it('a denial refuses the call', async () => {
     server.owner = 'deny';
