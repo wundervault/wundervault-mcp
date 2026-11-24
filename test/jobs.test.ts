@@ -77,7 +77,7 @@ describe('job orders', () => {
     ['bad time', definition({ schedule: { kind: 'daily', time: '24:00', tz: 'UTC' } }), 'bad schedule'],
     ['bad hours', definition({ schedule: { kind: 'every', hours: 25, tz: 'UTC' } }), 'bad schedule'],
     ['fractional hours', definition({ schedule: { kind: 'every', hours: 1.5, tz: 'UTC' } }), 'bad schedule'],
-    ['timeout', definition({ timeout_s: 601 }), 'bad timeout'],
+    ['timeout', definition({ timeout_s: 21601 }), 'bad timeout'],
     ['short timeout', definition({ timeout_s: 9 }), 'bad timeout'],
     ['expired', definition({ expires_at: now.toISOString() }), 'malformed'],
     ['long expiry', definition({ expires_at: '2026-03-07T00:17:00.000Z' }), 'malformed'],
@@ -461,7 +461,7 @@ describe('job broker envelopes', () => {
     envelopes = [{ id: 'replay_123', agent_id: agentId, kind: 'job-set', ...good }];
     await pollOnce(deps);
     expect(postState).toHaveBeenCalledWith('replay_123', 'refused', 'replay');
-    const bad = seal(definition({ order_id: 'order_bad', timeout_s: 601 }));
+    const bad = seal(definition({ order_id: 'order_bad', timeout_s: 21601 }));
     envelopes = [{ id: 'order_bad', agent_id: agentId, kind: 'job-set', ...bad }];
     await pollOnce(deps);
     expect(postState).toHaveBeenCalledWith('order_bad', 'refused', 'bad timeout');

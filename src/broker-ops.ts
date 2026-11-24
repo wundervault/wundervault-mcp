@@ -2110,7 +2110,9 @@ export class BrokerOps {
   }): Promise<{ exitCode: number; stdout: string; stderr: string } | OpError> {
     const op = { kind: 'ssh', destination: args.destination, remoteArgv: ['true'] } as BrokeredOp;
     const opened = await this.sshAgentOpen({
-      entryId: args.entryId, purpose: args.purpose, op, ttlSeconds: 600, ...(args.offer ? { offer: args.offer } : {}),
+      entryId: args.entryId, purpose: args.purpose, op,
+      // The signing session must outlive the command: a job may run up to 6 hours (owner 11-24).
+      ttlSeconds: Math.max(600, Math.ceil((args.timeoutMs ?? 180_000) / 1000) + 60), ...(args.offer ? { offer: args.offer } : {}),
       ...(args.noAsk ? { noAsk: true } : {}),
     });
     if ('error' in opened) return opened;

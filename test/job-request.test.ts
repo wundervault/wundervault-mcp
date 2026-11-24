@@ -39,7 +39,7 @@ describe('validateJobProposal', () => {
 
   it('accepts every-N-hours schedules and the timeout and grace boundaries', () => {
     for (const hours of [1, 24]) {
-      for (const timeout_s of [10, 600]) {
+      for (const timeout_s of [10, 600, 21600]) {
         for (const grace_minutes of [5, 1440]) {
           expect(validateJobProposal({
             ...proposal(),
@@ -168,7 +168,7 @@ describe('validateJobProposal', () => {
     expect(validateJobProposal({ ...proposal(), schedule }).ok).toBe(false);
   });
 
-  it.each([null, '300', 9, 601, 10.5, NaN, Infinity])('rejects bad timeout %j', timeout_s => {
+  it.each([null, '300', 9, 21601, 10.5, NaN, Infinity])('rejects bad timeout %j', timeout_s => {
     expect(validateJobProposal({ ...proposal(), timeout_s }).ok).toBe(false);
   });
 
@@ -200,7 +200,7 @@ describe('validateJobProposal', () => {
       { ...proposal(), destination: '--help' },
       { ...proposal(), argv: ['bad\u0000arg'] },
       { ...proposal(), schedule: { kind: 'every', hours: 25, tz: 'UTC' } },
-      { ...proposal(), timeout_s: 601 },
+      { ...proposal(), timeout_s: 21601 },
     ];
     for (const input of variants) {
       const order = validateJobOrder({

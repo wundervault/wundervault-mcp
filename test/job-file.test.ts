@@ -351,3 +351,25 @@ describe('vault_job_request checks the helper has room (check 10)', () => {
     }
   });
 });
+
+describe('limits the agent can ask for (owner 11-24: higher limits need only approval)', () => {
+  it('a 6-hour, 1 TB file job is a valid order; beyond that is refused', () => {
+    const big = validateJobOrder(definition({ timeout_s: 6 * 3600, file: { max_bytes: 1024 ** 4, keep: 1 } }), fingerprint, now.getTime());
+    expect(big.ok).toBe(true);
+    expect(validateJobOrder(definition({ timeout_s: 6 * 3600 + 1 }), fingerprint, now.getTime()))
+      .toEqual({ ok: false, reason: 'bad timeout' });
+  });
+
+  it('the signing session outlives a long job, so it is not cut at 10 minutes', async () => {
+    const { BrokerOps } = await import('../src/broker-ops.js');
+    const ops = new BrokerOps('Tester', 'k', Buffer.alloc(32).toString('base64'), 'http://127.0.0.1:1', null);
+    let ttl = 0;
+    (ops as unknown as { sshAgentOpen: unknown }).sshAgentOpen = async (a: { ttlSeconds: number }) => {
+      ttl = a.ttlSeconds; return { error: 'stop here' };
+    };
+    await ops.serverRun({ entryId: 'e', destination: 'a@b', purpose: 'p', argv: () => ['x'], timeoutMs: 3 * 3600_000 });
+    expect(ttl).toBeGreaterThanOrEqual(3 * 3600);
+    await ops.serverRun({ entryId: 'e', destination: 'a@b', purpose: 'p', argv: () => ['x'], timeoutMs: 60_000 });
+    expect(ttl).toBe(600);
+  });
+});

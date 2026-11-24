@@ -35,7 +35,9 @@ export interface JobDefinition {
 
 /** A file job: at most max_bytes per copy, the last `keep` copies kept. */
 export interface JobFile { max_bytes: number; keep: number }
-export const FILE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+/** Ceilings only: the agent asks for what the job needs and the owner approves it (owner 11-24). */
+export const FILE_MAX_BYTES = 1024 ** 4;          // 1 TiB
+export const JOB_MAX_TIMEOUT_S = 6 * 3600;        // 6 hours
 export const FILE_MAX_KEEP = 14;
 
 /** Free space a file job must always leave on the helper's drive: max(1 GiB, 5% of the drive). */
@@ -190,7 +192,7 @@ export function validateJobOrder(
   } catch {
     return { ok: false, reason: 'bad timezone' };
   }
-  if (!Number.isInteger(o.timeout_s) || (o.timeout_s as number) < 10 || (o.timeout_s as number) > 600) {
+  if (!Number.isInteger(o.timeout_s) || (o.timeout_s as number) < 10 || (o.timeout_s as number) > JOB_MAX_TIMEOUT_S) {
     return { ok: false, reason: 'bad timeout' };
   }
   const file = Object.hasOwn(o, 'file') ? validJobFile(o.file) : undefined;

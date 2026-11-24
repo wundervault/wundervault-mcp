@@ -52,7 +52,7 @@ export function validateJobProposal(
       !Object.hasOwn(o.file, 'keep') ? { ...(o.file as object), keep: 7 } : o.file } : {}),
   }, 'proposal', 0);
   if (!checked.ok && checked.reason === 'bad file') {
-    return { ok: false, reason: 'file must be { max_bytes: 1 to 2147483648, keep: 1 to 14 }' };
+    return { ok: false, reason: 'file must be { max_bytes: 1 to 1099511627776 (1 TB), keep: 1 to 14 }' };
   }
   if (!checked.ok) return checked;
 
