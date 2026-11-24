@@ -57,12 +57,19 @@ export function validateJobProposal(
   if (!checked.ok) return checked;
 
   const job = checked.job;
+  // A run may not outlast its own repeat interval (review r3 B2).
+  if (job.schedule.kind === 'every' && job.timeout_s >= job.schedule.hours * 3600) {
+    return { ok: false, reason: 'timeout_s must be shorter than the time between runs' };
+  }
+  // The site hears of a run only when it ends: the grace must cover the longest run, or a long
+  // job is reported missed every time (review r3 B2).
+  const graceFloor = Math.ceil(job.timeout_s / 60) + 5;
   return {
     ok: true,
     proposal: {
       name: job.name, entry_id: job.entry_id, destination: job.destination,
       argv: job.argv, schedule: job.schedule, timeout_s: job.timeout_s,
-      grace_minutes: grace as number, why: o.why,
+      grace_minutes: Math.min(1440, Math.max(grace as number, graceFloor)), why: o.why,
       ...(job.file ? { file: job.file } : {}),
     },
   };

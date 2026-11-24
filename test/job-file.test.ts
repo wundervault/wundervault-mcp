@@ -373,3 +373,19 @@ describe('limits the agent can ask for (owner 11-24: higher limits need only app
     expect(ttl).toBe(600);
   });
 });
+
+describe('long runs and missed-run alerts (review r3 B2)', () => {
+  const base = { name: 'Backup', entry_id: 'entry_123', destination: 'a@b.example', argv: ['x'],
+    schedule: { kind: 'daily', time: '03:00', tz: 'UTC' }, why: 'nightly backup' };
+  it('the grace covers the longest run, so a long job is never reported missed while it runs', () => {
+    const r = validateJobProposal({ ...base, timeout_s: 3 * 3600 });
+    expect(r.ok && r.proposal.grace_minutes).toBe(185);
+    const short = validateJobProposal({ ...base, timeout_s: 300, grace_minutes: 45 });
+    expect(short.ok && short.proposal.grace_minutes).toBe(45);
+  });
+  it('a run may not outlast its repeat interval', () => {
+    expect(validateJobProposal({ ...base, schedule: { kind: 'every', hours: 1, tz: 'UTC' }, timeout_s: 3600 }))
+      .toEqual({ ok: false, reason: 'timeout_s must be shorter than the time between runs' });
+    expect(validateJobProposal({ ...base, schedule: { kind: 'every', hours: 2, tz: 'UTC' }, timeout_s: 3600 }).ok).toBe(true);
+  });
+});

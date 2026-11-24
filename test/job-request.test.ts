@@ -39,7 +39,7 @@ describe('validateJobProposal', () => {
 
   it('accepts every-N-hours schedules and the timeout and grace boundaries', () => {
     for (const hours of [1, 24]) {
-      for (const timeout_s of [10, 600, 21600]) {
+      for (const timeout_s of [10, 600, 21600].filter(t => t < hours * 3600)) {
         for (const grace_minutes of [5, 1440]) {
           expect(validateJobProposal({
             ...proposal(),
