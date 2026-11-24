@@ -322,6 +322,26 @@ describe('vault_pay — EVM', () => {
     expect('error' in c ? c.error : c.inside_rules).toBe(false);
     expect(server.requests.size).toBe(1);
   });
+
+  it('a stale note pointing at a spent approval asks afresh instead of refusing for ever (2026-11-23)', async () => {
+    server.owner = 'wait';
+    server.entries.get('w')!.policy = null;
+    const a = await payW();
+    expect('error' in a && a.code).toBe('WAITING');
+    const pending = JSON.parse(fs.readFileSync(deps.state.file, 'utf8')).pending as Record<string, { request_id: string }>;
+    const [key] = Object.keys(pending);
+    const spent = pending[key!]!.request_id;
+    server.owner = 'approve';
+    const b = await payW();
+    expect('error' in b).toBe(false);
+    expect(deps.state.isUsed(spent)).toBe(true);
+    // The note comes back pointing at the spent approval (another process's stale write).
+    deps.state.setPending(key!, spent);
+    const c = await payW();
+    expect('error' in c ? c.error : 'ok').toBe('ok');
+    expect(server.requests.size).toBe(2);            // asked the owner again
+    expect(deps.state.isUsed(spent)).toBe(true);     // the spent one stays spent
+  });
 });
 
 describe('vault_pay — a server that lies about approvals gets nothing', () => {

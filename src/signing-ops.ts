@@ -75,6 +75,13 @@ async function ownerApproval(d: Deps, a: {
 }): Promise<{ ok: true; addPayee: boolean; requestId: string } | OpError> {
   const pendingKey = a.pendingKey ?? a.commit;
   let requestId = d.state.pendingFor(pendingKey);
+  if (requestId && d.state.isUsed(requestId)) {
+    // A note that still points at a spent approval is stale (seen 2026-11-23: an agent's
+    // first call after server setup was refused "already been used" for a request it never
+    // made). Spent stays spent: drop the note and ask the owner afresh.
+    d.state.setPending(pendingKey, null);
+    requestId = null;
+  }
   if (requestId) {
     // An earlier call already asked. Waiting on it, rather than asking again, is what stops
     // an agent that retries in a loop from mailing the owner once per retry.
