@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -37,8 +38,10 @@ type Fixture = {
   env: NodeJS.ProcessEnv;
 };
 
+// realpath: on macOS the temp folder is under /var, a link to /private/var, and the script
+// (rightly) refuses a link above the folder it installs into.
 function withFixture(run: (fixture: Fixture) => void): void {
-  const dir = mkdtempSync(join(tmpdir(), 'wv-admin-key-test-'));
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'wv-admin-key-test-'));
   const sshDir = join(dir, 'root-ssh');
   const tempDir = join(dir, 'tmp');
   mkdirSync(tempDir);

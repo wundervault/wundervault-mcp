@@ -100,16 +100,19 @@ afterEach(() => {
 
 describe('admin SSH sessions end with admin access', () => {
   it('closes at admin_until, not at its own ttl (measured)', async () => {
-    const ops = broker({ secret: { admin_access: true, admin_until: inMs(800) } });
+    // 2.5 s of admin access: room for a slow CI runner (macOS) to open and connect first. The
+    // close is measured against admin_until itself, so the bound stays tight (ttl is 300 s).
+    const ops = broker({ secret: { admin_access: true, admin_until: inMs(2500) } });
     const r = await open(ops, 300);
     if ('error' in r) throw new Error(JSON.stringify(r));
-    expect(Date.parse(r.admin_until!)).toBeGreaterThan(Date.now());
+    const until = Date.parse(r.admin_until!);
+    expect(until).toBeGreaterThan(Date.now());
     expect(await connectable(r.socket_path)).toBe(true);
-    const t0 = Date.now();
-    while (ops.sshSessionOpen(r.session_id).open && Date.now() - t0 < 3000) await sleep(20);
-    const took = Date.now() - t0;
+    while (ops.sshSessionOpen(r.session_id).open && Date.now() < until + 3000) await sleep(20);
+    const closedAt = Date.now();
     expect(ops.sshSessionOpen(r.session_id)).toEqual({ open: false, ended_by: 'admin_access_ended' });
-    expect(took).toBeLessThan(1200);
+    expect(closedAt).toBeGreaterThanOrEqual(until - 50);
+    expect(closedAt - until).toBeLessThan(1000);
     // No signature after expiry: the socket is gone.
     expect(await connectable(r.socket_path)).toBe(false);
   });
