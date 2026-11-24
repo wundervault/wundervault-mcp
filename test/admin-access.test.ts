@@ -81,7 +81,9 @@ const connectable = (p: string) => new Promise<boolean>((resolve) => {
 });
 
 beforeEach(() => {
-  base = fs.mkdtempSync(path.join(os.tmpdir(), 'wv-admin-'));
+  // /tmp on macOS: its per-user temp folder is so long the session socket path passes the
+  // 104-character limit and listen() fails (the helper's real path is ~74 characters).
+  base = fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/tmp' : os.tmpdir(), 'wv-admin-'));
   const run = path.join(base, 'run');
   fs.mkdirSync(run, { recursive: true });
   fs.chmodSync(run, 0o755);
@@ -100,16 +102,22 @@ afterEach(() => {
 
 describe('admin SSH sessions end with admin access', () => {
   it('closes at admin_until, not at its own ttl (measured)', async () => {
-    const ops = broker({ secret: { admin_access: true, admin_until: inMs(800) } });
+    // 2.5 s of admin access: room for a slow CI runner (macOS) to open and connect first. The
+    // close is measured against admin_until itself, so the bound stays tight (ttl is 300 s).
+    const ops = broker({ secret: { admin_access: true, admin_until: inMs(2500) } });
     const r = await open(ops, 300);
     if ('error' in r) throw new Error(JSON.stringify(r));
-    expect(Date.parse(r.admin_until!)).toBeGreaterThan(Date.now());
-    expect(await connectable(r.socket_path)).toBe(true);
-    const t0 = Date.now();
-    while (ops.sshSessionOpen(r.session_id).open && Date.now() - t0 < 3000) await sleep(20);
-    const took = Date.now() - t0;
+    const until = Date.parse(r.admin_until!);
+    expect(until).toBeGreaterThan(Date.now());
+    // The socket starts listening just after open() returns; a slow runner can connect first.
+    let up = false;
+    for (let i = 0; i < 50 && !up && Date.now() < until; i++) { up = await connectable(r.socket_path); if (!up) await sleep(20); }
+    expect(up).toBe(true);
+    while (ops.sshSessionOpen(r.session_id).open && Date.now() < until + 3000) await sleep(20);
+    const closedAt = Date.now();
     expect(ops.sshSessionOpen(r.session_id)).toEqual({ open: false, ended_by: 'admin_access_ended' });
-    expect(took).toBeLessThan(1200);
+    expect(closedAt).toBeGreaterThanOrEqual(until - 50);
+    expect(closedAt - until).toBeLessThan(1000);
     // No signature after expiry: the socket is gone.
     expect(await connectable(r.socket_path)).toBe(false);
   });
