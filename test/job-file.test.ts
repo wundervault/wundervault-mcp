@@ -389,3 +389,25 @@ describe('long runs and missed-run alerts (review r3 B2)', () => {
     expect(validateJobProposal({ ...base, schedule: { kind: 'every', hours: 2, tz: 'UTC' }, timeout_s: 3600 }).ok).toBe(true);
   });
 });
+
+describe('deleting a file job keeps its copies (owner 11-24)', () => {
+  it('the copies stay after the job is forgotten', async () => {
+    const { JobStore } = await import('../src/jobs.js');
+    const dir = directory();
+    const store = new JobStore(path.join(dir, 'jobs.json'));
+    expect(store.apply(definition(), 'agent_123', now)).toEqual({ ok: true });
+    const run = await runJob(sends([Buffer.from('backup')]), store.get('job_12345')!, 'schedule', path.join(dir, 'out'), () => now, plenty);
+    store.remove('job_12345');
+    expect(store.get('job_12345')).toBeUndefined();
+    expect(fs.readFileSync(path.join(dir, 'out', 'job_12345', `${run.run_id}.file`), 'utf8')).toBe('backup');
+  });
+});
+
+describe('a saved file job survives a restart', () => {
+  it('the store reloads the file block', async () => {
+    const { JobStore } = await import('../src/jobs.js');
+    const dir = directory();
+    new JobStore(path.join(dir, 'jobs.json')).apply(definition(), 'agent_123', now);
+    expect(new JobStore(path.join(dir, 'jobs.json')).get('job_12345')!.def.file).toEqual({ max_bytes: 64 * 1024 * 1024, keep: 3 });
+  });
+});
