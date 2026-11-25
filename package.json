@@ -2,7 +2,7 @@
   "name": "@wundervault/mcp-server",
   "mcpName": "io.github.wundervault/wundervault-mcp",
   "version": "2.7.1",
-  "description": "AI agents use your API keys, SSH keys and wallets through a local broker, never holding them",
+  "description": "AI agents use your API keys, SSH keys and wallets through a local helper app, never holding them",
   "files": [
     "dist",
     "bin",

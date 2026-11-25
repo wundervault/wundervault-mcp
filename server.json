@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.wundervault/wundervault-mcp",
-  "description": "AI agents use your API keys, SSH keys and wallets through a local broker, never holding them",
+  "description": "AI agents use your API keys, SSH keys and wallets through a local helper app, never holding them",
   "repository": {
     "url": "https://github.com/wundervault/wundervault-mcp",
     "source": "github"
