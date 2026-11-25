@@ -146,6 +146,7 @@ export interface ServerRunner {
   serverRun(args: {
     entryId: string; destination: string; purpose: string;
     argv: (publicKey: string) => string[]; input?: string; offer?: 'cert' | 'plain'; timeoutMs?: number; noAsk?: boolean;
+    onStdout?: (chunk: Buffer) => string | undefined;
   }): Promise<Run>;
 }
 

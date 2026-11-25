@@ -4,6 +4,34 @@ Changes to `@wundervault/mcp-server`: the MCP server, the broker (`wundervault-a
 installers. The full history, with the website's changes beside it, is at
 <https://wundervault.com/changelog>.
 
+## [2.7.0] — unreleased
+
+Update from the vault: Computers › Update now.
+
+### New: jobs that bring back a file (backups)
+
+- `vault_job_request` takes `file: { max_bytes, keep }`. The job's command writes the file to its
+  output; the helper app streams it into one file in its own folder on its computer (a name it
+  chooses, never one the server sends), keeping the last `keep` copies (default 7). Agents can't read
+  that folder. Files are not encrypted there; turn on disk encryption on that computer.
+- A copy is kept only when the whole run worked. A run that passes `max_bytes`, runs out of time,
+  fails, or would leave the drive below its reserve (1 GB or 5%, whichever is more) keeps nothing new;
+  earlier copies stay, and the run is reported as failed.
+- The request is refused when the computer hasn't room for `keep` + 1 copies above the reserve.
+- Deleting a job keeps its copies until you remove them.
+
+### Changed
+
+- A job may ask for up to 6 hours (was 600 seconds) and up to 1 TB per file; you see both before you
+  approve. A run must be shorter than the time between runs, and the missed-run grace is raised to
+  cover the longest run. The signing session lasts as long as the run.
+- A job's output folder owned by another account is refused, never taken over.
+
+### Fixed
+
+- An approval that was already used no longer leaves an agent waiting on it: the owner is asked again.
+  Two identical calls at once ask once.
+
 ## [2.6.0] — 2026-11-24
 
 Update from the vault: Computers › Update now. This release includes the security fixes that were

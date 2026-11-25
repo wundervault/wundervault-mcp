@@ -7,14 +7,14 @@ import { validateJobOrder, type JobDefinition } from './jobs.js';
 import { sealForOwner } from './server-setup.js';
 
 export type JobProposal = Pick<JobDefinition,
-  'name' | 'entry_id' | 'destination' | 'argv' | 'schedule' | 'timeout_s'
+  'name' | 'entry_id' | 'destination' | 'argv' | 'schedule' | 'timeout_s' | 'file'
 > & {
   grace_minutes: number;
   why: string;
 };
 
 const FIELDS = [
-  'name', 'entry_id', 'destination', 'argv', 'schedule', 'timeout_s', 'grace_minutes', 'why',
+  'name', 'entry_id', 'destination', 'argv', 'schedule', 'timeout_s', 'grace_minutes', 'why', 'file',
 ];
 const REQUIRED = ['name', 'entry_id', 'destination', 'argv', 'schedule', 'why'];
 
@@ -47,16 +47,30 @@ export function validateJobProposal(
     name: o.name, entry_id: o.entry_id, destination: o.destination,
     argv: o.argv, schedule: o.schedule,
     timeout_s: o.timeout_s === undefined ? 300 : o.timeout_s,
+    // keep defaults to 7 (review r1 F2); the order itself always carries both.
+    ...(Object.hasOwn(o, 'file') ? { file: o.file && typeof o.file === 'object' && !Array.isArray(o.file) &&
+      !Object.hasOwn(o.file, 'keep') ? { ...(o.file as object), keep: 7 } : o.file } : {}),
   }, 'proposal', 0);
+  if (!checked.ok && checked.reason === 'bad file') {
+    return { ok: false, reason: 'file must be { max_bytes: 1 to 1099511627776 (1 TB), keep: 1 to 14 }' };
+  }
   if (!checked.ok) return checked;
 
   const job = checked.job;
+  // A run may not outlast its own repeat interval (review r3 B2).
+  if (job.schedule.kind === 'every' && job.timeout_s >= job.schedule.hours * 3600) {
+    return { ok: false, reason: 'timeout_s must be shorter than the time between runs' };
+  }
+  // The site hears of a run only when it ends: the grace must cover the longest run, or a long
+  // job is reported missed every time (review r3 B2).
+  const graceFloor = Math.ceil(job.timeout_s / 60) + 5;
   return {
     ok: true,
     proposal: {
       name: job.name, entry_id: job.entry_id, destination: job.destination,
       argv: job.argv, schedule: job.schedule, timeout_s: job.timeout_s,
-      grace_minutes: grace as number, why: o.why,
+      grace_minutes: Math.min(1440, Math.max(grace as number, graceFloor)), why: o.why,
+      ...(job.file ? { file: job.file } : {}),
     },
   };
 }
@@ -82,6 +96,7 @@ export function sealProposal(
     timeout_s: proposal.timeout_s,
     grace_minutes: proposal.grace_minutes,
     why: proposal.why,
+    ...(proposal.file ? { file: proposal.file } : {}),
   });
 }
 
