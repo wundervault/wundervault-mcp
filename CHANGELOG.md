@@ -4,6 +4,17 @@ Changes to `@wundervault/mcp-server`: the MCP server, the broker (`wundervault-a
 installers. The full history, with the website's changes beside it, is at
 <https://wundervault.com/changelog>.
 
+## [2.7.1] — 2026-11-24
+
+Update from the vault: Computers › Update now.
+
+### Fixed
+
+- In 2.7.0, `vault_job_request` dropped its `file` setting on the way to the helper, so a backup job was
+  saved as an ordinary job: its output was cut at 1 MB and the run still reported as working. Every
+  setting the tool takes is now passed on, and a test checks each one. If you asked for a file job on
+  2.7.0, delete it and ask again.
+
 ## [2.7.0] — unreleased
 
 Update from the vault: Computers › Update now.

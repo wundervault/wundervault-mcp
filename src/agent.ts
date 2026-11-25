@@ -108,6 +108,7 @@ interface SocketRequest {
   schedule?: unknown;
   timeout_s?: unknown;
   grace_minutes?: unknown;
+  file?: unknown;
   request_id?: unknown;
   job_id?: unknown;
   /** vault_send_secret: the signing key, the Cloudflare account, and the list */
@@ -1217,6 +1218,8 @@ class AgentDaemon {
           timeout_s: msg.timeout_s,
           grace_minutes: msg.grace_minutes,
           why: msg.why,
+          // 2.7.1: 2.7.0 dropped file here, so every file job became a text job.
+          ...(msg.file !== undefined ? { file: msg.file } : {}),
         }) as unknown as Record<string, unknown>;
       }
 

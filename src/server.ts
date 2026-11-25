@@ -732,6 +732,8 @@ export function createServer(args: { url?: string } = {}) {
             timeout_s: a.timeout_s,
             grace_minutes: a.grace_minutes,
             why: a.why,
+            // 2.7.1: every field the tool takes must pass through here, or it is silently dropped.
+            ...(a.file !== undefined ? { file: a.file } : {}),
           });
           if (!r.error) {
             text = `Request ${r.request_id}: ${r.state}.\n${r.notice}\nExpires: ${r.expires_at}.`;
