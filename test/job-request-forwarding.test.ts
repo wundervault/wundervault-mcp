@@ -8,6 +8,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const src = (f: string) => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8');
+// Comments removed: a field named only in a comment is not forwarded (review r1 F1).
+const code = (text: string) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+// The field passed on as a property: `name: a.name` or `{ file: a.file }`.
+const forwards = (block: string, f: string) => new RegExp(`(^|[\\s{,])${f}:\\s*(a|msg)\\.${f}\\b`, 'm').test(code(block));
 
 function toolFields(server: string): string[] {
   const at = server.indexOf("name: 'vault_job_request'");
@@ -31,13 +35,13 @@ describe('vault_job_request passes every field it accepts to the broker', () => 
   it('the MCP server forwards each of them', () => {
     const at = server.indexOf("broker.send('job_request', {");
     const block = server.slice(at, server.indexOf('});', at));
-    for (const f of fields) expect(block, f).toMatch(new RegExp(`\\b${f}\\b`));
+    for (const f of fields) expect(forwards(block, f), f).toBe(true);
   });
 
   it("the broker's socket handler forwards each of them", () => {
     const agent = src('agent.ts');
     const at = agent.indexOf("case 'job_request': {");
     const block = agent.slice(at, agent.indexOf('}) as unknown as Record<string, unknown>;', at));
-    for (const f of fields) expect(block, f).toMatch(new RegExp(`\\b${f}\\b`));
+    for (const f of fields) expect(forwards(block, f), f).toBe(true);
   });
 });
