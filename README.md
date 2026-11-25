@@ -291,8 +291,10 @@ entry_id: string         an everyday SSH key this agent holds that runs without 
 destination: string      user@host[:port]
 argv: string[]           the exact program and arguments; no shell; 16 KB total at most
 schedule: { kind: "daily", time: "HH:MM", tz } | { kind: "every", hours: 1-24, tz }
-timeout_s?: number       10-600, default 300
+timeout_s?: number       10 s to 6 h, default 300; shorter than the time between runs
 grace_minutes?: number   5-1440, default 30: how late a run may be before it counts as missed
+                         (raised to the run time + 5 minutes when shorter)
+file?: { max_bytes, keep }  the output is a FILE to keep (a backup): up to 1 TB, keep 1-14 copies (default 7)
 why: string              shown to the owner (300 characters)
 ```
 
@@ -301,7 +303,10 @@ card shows the exact server, command, key and schedule. After that the helper ap
 itself on its schedule, with no agent involved, and writes each run to its signed activity log as
 "job: <name>". Admin and ask-first keys are refused. One job runs per server at a time. A run's output
 stays with the helper; when a run fails, its last 20 lines are sealed so only the owner's browser can
-read them. The site tells the owner when a job fails or misses a run (on the Jobs page, and in at most
+read them. With `file`, the command writes the file to its output and the helper keeps it in its own
+folder (agents can't read it), the last `keep` copies; a run that passes `max_bytes`, times out, fails
+or would leave the disk too full keeps nothing new, and the request is refused if the computer hasn't
+room for `keep` + 1 copies. Deleting a job keeps its copies. The site tells the owner when a job fails or misses a run (on the Jobs page, and in at most
 one combined email an hour). Changing a job's command, server, key or schedule is a new request.
 `vault_job_status { request_id }` follows the request; `vault_jobs` lists the agent's jobs;
 `vault_job_run_now { job_id, purpose }` asks for one run of the stored definition (at most once per 10
