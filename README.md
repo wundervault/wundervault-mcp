@@ -10,15 +10,15 @@
 A secret you paste into a chat with an AI agent, or leave in a settings file it can read, gets
 copied into its memory, its transcripts and its logs. With Wundervault the agent never receives
 the secret at all. A small
-program on your own computer, the **broker**, keeps your secrets in an account of its own. Your
+program on your own computer, the **helper app**, keeps your secrets in an account of its own. Your
 agent asks it to call a web service, run a command on a server, pay for something or sign
-something; the broker does it with the secret and hands back the result, with the secret removed.
+something; the helper app does it with the secret and hands back the result, with the secret removed.
 
 Your vault is encrypted in your browser, so our server stores it but can't read it. Secrets
 you mark **"ask me first"** wait for your approval, with your passkey, on your phone or
 computer.
 
-This package is the MCP server your agent talks to, and the broker beside it. It works with
+This package is the MCP server your agent talks to, and the helper app beside it. It works with
 any [Model Context Protocol](https://modelcontextprotocol.io) client: Claude Code, Codex,
 Cursor, Cline, OpenClaw and others.
 
@@ -33,7 +33,7 @@ the installer, at [wundervault.com/verify](https://wundervault.com/verify).
 | `vault_new_key` | Makes a new key at a service and puts it straight into your vault, where it waits for you. The agent never sees it. |
 | `vault_save_secret` | Saves a secret the agent already has (a file, a command's output) into your vault without reading it into the chat. It waits for you. |
 | `vault_send_secret` | Puts secrets from your vault into a Cloudflare Worker's settings (encrypted Worker secrets). You approve the list once; the agent never sees the values. |
-| `vault_ssh_exec` | Runs a command on a server you approved, or rsyncs files to it. The broker signs the SSH login; the key never leaves it. |
+| `vault_ssh_exec` | Runs a command on a server you approved, or rsyncs files to it. The helper app signs the SSH login; the key never leaves it. |
 | `vault_git` | Runs git push, pull, fetch, clone or ls-remote over SSH with a vaulted key. Linux and macOS. |
 | `vault_2fa_code` | Gives the current authenticator-app code for a sign-in. Never the setup key. |
 | `vault_pay` | Pays an x402 "402 Payment Required" in USDC on Base or Solana, inside the limits you set. |
@@ -57,7 +57,7 @@ No tool returns a secret's value. Version 1's hand-over tools (`vault_exec`, `va
                  (secret removed)        │ local socket
                                          ▼
                               ┌──────────────────────┐  HTTPS / SSH  ┌─────────────┐
-                              │ broker               │──────────────▶│ the service │
+                              │ helper app           │──────────────▶│ the service │
                               │ its own OS account,  │◀──────────────│             │
                               │ holds the secrets,   │               └─────────────┘
                               │ each call on this box│
@@ -71,36 +71,36 @@ No tool returns a secret's value. Version 1's hand-over tools (`vault_exec`, `va
 ```
 
 1. Your agent asks for work: "call this API", "deploy to this server".
-2. The MCP server passes the request to the broker over a local socket. It holds no secrets.
-3. For an "ask me first" secret, the broker waits for you to approve that call.
-4. The broker makes the call with the secret, records it in a log on your computer, and returns
+2. The MCP server passes the request to the helper app over a local socket. It holds no secrets.
+3. For an "ask me first" secret, the helper app waits for you to approve that call.
+4. The helper app makes the call with the secret, records it in a log on your computer, and returns
    the result. For web calls the secret goes to the service it belongs to, as it must; for SSH it
-   never leaves the broker at all.
+   never leaves the helper app at all.
 
 ## Install
 
-You need Node.js 22.23.4, 24.22.1 or 26.12.1 or newer (the October 21, 2026 security release: the broker
+You need Node.js 22.23.4, 24.22.1 or 26.12.1 or newer (the October 21, 2026 security release: the helper app
 refuses to start on an older Node), and administrator rights on the computer your agents run on.
 Every step: [wundervault.com/help/computer](https://wundervault.com/help/computer).
 
 **1. Create a vault** at [wundervault.com](https://wundervault.com). It's free.
 
-**2. Install the package and the broker** on the computer your agents use:
+**2. Install the package and the helper app** on the computer your agents use:
 
 ```bash
 sudo npm install -g @wundervault/mcp-server@2
 sudo sh "$(npm root -g)/@wundervault/mcp-server/packaging/install-daemon.sh"
 ```
 
-That is Linux: `sudo`, because the broker only runs a copy installed in a system folder, never
+That is Linux: `sudo`, because the helper app only runs a copy installed in a system folder, never
 one inside your home folder.
 
 Windows and macOS have their own installers; see
 [wundervault.com/install](https://wundervault.com/install). The installer downloads nothing
 and is short enough to read first.
 
-**3. Pair the broker with your account.** Run the pairing command the installer printed last. It
-names node and the broker by their full paths, for example:
+**3. Pair the helper app with your account.** Run the pairing command the installer printed last. It
+names node and the helper app by their full paths, for example:
 
 ```bash
 sudo /opt/wundervault/current/node /opt/wundervault/current/app/bin/wundervault-agent --pair
@@ -108,7 +108,7 @@ sudo /opt/wundervault/current/node /opt/wundervault/current/app/bin/wundervault-
 
 Use full paths with `sudo`, not bare names: `sudo` may look a name up on your own PATH, and a folder
 on it that you (and so your agents) can write could hold another program by that name. That goes for
-node too, because the broker's launcher starts with `#!/usr/bin/env node`.
+node too, because the helper app's launcher starts with `#!/usr/bin/env node`.
 
 Check that the fingerprint it shows matches the one in your vault, then confirm.
 
@@ -138,11 +138,11 @@ someone: [llms-install.md](llms-install.md).
 
 ## Upgrading from version 1
 
-Version 2 moves your secrets into the broker. Your account, vault and passkeys carry over.
+Version 2 moves your secrets into the helper app. Your account, vault and passkeys carry over.
 Agents still on version 1 can't use your secrets, so move each one:
 
 1. `npm install -g @wundervault/mcp-server@2`
-2. Install the broker and pair it (steps 2 and 3 above).
+2. Install the helper app and pair it (steps 2 and 3 above).
 3. For each agent: open **Agents** in your vault, choose **Repair**, choose this computer,
    then run `wundervault-agent --enrol` and enter the claim code.
 4. When every agent has moved: `wundervault-agent --migrate --finish` removes the old
@@ -155,25 +155,25 @@ vault, by design. Details: [wundervault.com/install#upgrade-to-2](https://wunder
 
 ## Supported platforms
 
-| | Broker's own account | Status |
+| | Helper app's own account | Status |
 |---|---|---|
 | Linux | `wundervault` system user, systemd unit with extra sandboxing | Supported |
 | Windows | `wundervault` local account, scheduled task | Supported |
 | macOS | `_wundervault` system account, LaunchDaemon | Supported |
 
-On all three the broker runs under its own account, with its secrets in a folder your agents
+On all three the helper app runs under its own account, with its secrets in a folder your agents
 can't open. What differs is what surrounds that boundary:
 
 - **Linux** adds `ProtectSystem=strict`, `ProtectHome`, `ProtectProc`, a system-call filter
   and an empty capability set. The store key is sealed with `systemd-creds`, to a TPM where
   there is one; without a TPM it is sealed to a host key on the same disk.
 - **macOS** has no launchd equivalent of that sandboxing, so the account split is very nearly
-  the whole defence. The store key is a random key in a file only the broker's account can
+  the whole defence. The store key is a random key in a file only the helper app's account can
   read: not sealed. FileVault is what protects a stolen disk.
 - **Windows** has the same account split and none of the extra sandboxing. An **elevated**
-  administrator process can read the broker's files, as root can on Linux, and Windows
+  administrator process can read the helper app's files, as root can on Linux, and Windows
   OpenSSH gives an administrator an elevated session. The store key is a random key in a file
-  only the broker's account can read; BitLocker protects a stolen disk.
+  only the helper app's account can read; BitLocker protects a stolen disk.
   `packaging\verify-windows.ps1` checks the boundary on your own machine.
 
 If something on Windows or macOS fails, tell us what it printed:
@@ -181,25 +181,25 @@ If something on Windows or macOS fails, tell us what it printed:
 
 ## Security model
 
-- **The agent never gets a secret.** No tool returns a value. The broker attaches the secret to the
+- **The agent never gets a secret.** No tool returns a value. The helper app attaches the secret to the
   request itself, the way you set for that secret (a header, a query parameter, a username and
   password, or part of the web address), and removes it from the answer. Secrets marked
-  "stamped" (AWS, X and other OAuth 1.0a services, exchanges) never travel: the broker signs each
+  "stamped" (AWS, X and other OAuth 1.0a services, exchanges) never travel: the helper app signs each
   request with them.
-- **A separate account.** Your agents run as you; the broker doesn't. They can't read its
+- **A separate account.** Your agents run as you; the helper app doesn't. They can't read its
   files or its memory.
 - **End-to-end encrypted vault.** Secrets are encrypted in your browser with AES-256-GCM. The
   vault key comes from your passphrase, mixed with an Account Key that never leaves your
   device, through Argon2id (PBKDF2 for a vault made where WebAssembly is off, such as iPhone
   Lockdown Mode). We store ciphertext only.
-- **Signed requests.** The broker is paired to your account with a P-256 key whose fingerprint
-  you confirm. The server serves a secret's ciphertext only to requests that broker signed, so a
+- **Signed requests.** The helper app is paired to your account with a P-256 key whose fingerprint
+  you confirm. The server serves a secret's ciphertext only to requests that helper app signed, so a
   copied credential alone gets nothing.
 - **Approvals with your passkey.** An "ask me first" web call waits until you approve that
   exact destination, method and path, once or for a short window. Every payment outside your
   rules and every signature is sealed by your browser to exactly what you saw, so a server
   that only says "approved" can't spend your money.
-- **A log on your computer.** Every call is recorded by the broker, signed, and checked
+- **A log on your computer.** Every call is recorded by the helper app, signed, and checked
   against a copy of its chain we hold, so a changed log is detected. For "run without asking"
   secrets, where the secret went and why stays on your computer; we never see it.
   `sudo /opt/wundervault/current/node /opt/wundervault/current/app/bin/wundervault-agent --destinations` opens it (full paths, as for pairing).
@@ -250,12 +250,12 @@ can get round all of this.
   choose "ask me first".
 - "Ask me first" approves a destination, method and path, not what the request says. Within an
   approval window, calls to the same place go ahead whatever they contain.
-- The broker removes your secret from the answer as it was sent. A service that sends it back in
+- The helper app removes your secret from the answer as it was sent. A service that sends it back in
   another form, such as encoded, could get it past; and anything the call creates, such as a
   new API token, is your agent's.
-- Agents that run under the same user account can use each other's access to the broker. Run
+- Agents that run under the same user account can use each other's access to the helper app. Run
   an agent you trust less under another account.
-- The broker must run on the same computer as the agent; fully air-gapped setups don't fit.
+- The helper app must run on the same computer as the agent; fully air-gapped setups don't fit.
 - The platform is **open-core**: this package and the
   [browser crypto](https://github.com/wundervault/wundervault-crypto) are AGPL-3.0, so you can
   audit everything that touches your secrets; the hosted service is not open source.
@@ -270,7 +270,7 @@ The full reference, with every argument: [wundervault.com/mcp](https://wundervau
 
 ```
 entry_id: string       which secret
-purpose: string        why; kept in the broker's log on the owner's computer
+purpose: string        why; kept in the helper app's log on the owner's computer
 request?: {            describe the call (or operation_id + args instead)
   origin: { scheme: "https", host, port }, method, path,
   query?, body?, headers?,   # your own headers; never the one carrying the secret
@@ -325,8 +325,8 @@ purpose: string
 ```
 
 Exactly one of `from_file`, `from_command`, `value`. The agent-side MCP process reads the file or
-runs the command as the agent's user (never the broker's account); only the value goes to the
-broker, which locks it so only the owner's browser can read it and puts it under Needs you,
+runs the command as the agent's user (never the helper app's account); only the value goes to the
+helper app, which locks it so only the owner's browser can read it and puts it under Needs you,
 marked "Saved by an agent". The agent gets the name, the source and the length: never the value,
 never any of the file or output, also not in errors. A failing or slow command saves nothing; its
 standard error is never read. Same limits and outbox as `vault_new_key`.
@@ -341,16 +341,16 @@ replaces_entry_id?: string   rotating: the secret this key replaces (one this ag
 purpose: string
 ```
 
-Makes a new key at a service and puts it straight into the owner's vault. The broker takes
+Makes a new key at a service and puts it straight into the owner's vault. The helper app takes
 the new key out of the service's answer, encrypts it so only the owner's browser can read it,
 and the agent gets the key's id and name at the service: never the key, never the rest of the
 answer. The key waits under Needs you; no agent can use it until the owner saves it with a
 passkey and chooses which agents may.
 
-Works only at the key-making addresses the broker knows (Resend, Cloudflare user and account
+Works only at the key-making addresses the helper app knows (Resend, Cloudflare user and account
 tokens, SendGrid, OpenAI admin keys and project service accounts, Twilio, OpenRouter; the list
 and where each was checked is in `RECIPES-new-key.md`). `vault_call` refuses those addresses.
-If the vault cannot be reached after the key is made, the broker keeps it, locked, and hands it
+If the vault cannot be reached after the key is made, the helper app keeps it, locked, and hands it
 over on the agent's next vault call; it makes no other key meanwhile. If no answer comes back
 from the service, the agent is told it is not known whether a key was made.
 
@@ -437,7 +437,7 @@ and any operations the owner defined. Never a value.
 
 ## Sandbox / demo mode
 
-Set `WUNDERVAULT_MOCK=1` to run the server **without** a broker or any credentials. Every
+Set `WUNDERVAULT_MOCK=1` to run the server **without** a helper app or any credentials. Every
 tool call then returns a representative response clearly labelled `[DEMO MODE]` instead of
 contacting the vault — **no real secret is ever involved**. It exists so you can try the tool
 surface without an account, and so MCP directory scanners and CI (e.g.
@@ -468,6 +468,6 @@ Full release history: [wundervault.com/changelog](https://wundervault.com/change
 Licensed under the **GNU Affero General Public License v3.0 or later** (`AGPL-3.0-or-later`).
 See [LICENSE](LICENSE).
 
-Wundervault is **open-core**: this MCP server, the broker and the browser crypto are open
+Wundervault is **open-core**: this MCP server, the helper app and the browser crypto are open
 source; the hosted service at [wundervault.com](https://wundervault.com) is a commercial
 offering. For commercial or hosting inquiries: [wundervault.com/contact](https://wundervault.com/contact).

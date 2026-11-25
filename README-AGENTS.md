@@ -76,15 +76,15 @@ asyncio.run(main())
 ## Where the secrets actually come from
 
 There is no credentials file and no secret in your MCP config. `wundervault-agent --enrol`
-(with the claim code from the owner's vault) enrols the agent with the broker, and the
-broker, running under its own account, holds the agent's secrets. The MCP server talks to it
+(with the claim code from the owner's vault) enrols the agent with the helper app, and the
+helper app, running under its own account, holds the agent's secrets. The MCP server talks to it
 over a local socket (`/run/wundervault/<name>.sock` on Linux,
 `/var/lib/wundervault/run/<name>.sock` on macOS, a loopback port on Windows), authenticated
 with the agent token in `~/.wundervault/agents/<name>.token`. The token stays in your own
-home on purpose: it is the agent's identity, and moving it into the broker's directory would
+home on purpose: it is the agent's identity, and moving it into the helper app's directory would
 make it unreadable by the only party that needs it.
 
-**The socket serves operations, not credentials.** The broker does not hand the secrets over:
+**The socket serves operations, not credentials.** The helper app does not hand the secrets over:
 it lists entries, makes a web call, signs an SSH login, a payment or a signature. What
 crosses the socket is the result, not the secret.
 
@@ -126,16 +126,16 @@ by API, the owner rotates by hand.
 
 ## What the server checks
 
-Every request a broker makes to Wundervault is signed with a private key that lives in the
-broker's own directory, which the agents cannot read; the owner confirmed its fingerprint
-when pairing. The server refuses an unsigned request from an agent enrolled on a broker, and
-serves a secret's ciphertext only to the broker that signed for it. A copy of the credential on
+Every request a helper app makes to Wundervault is signed with a private key that lives in the
+helper app's own directory, which the agents cannot read; the owner confirmed its fingerprint
+when pairing. The server refuses an unsigned request from an agent enrolled on a helper app, and
+serves a secret's ciphertext only to the helper app that signed for it. A copy of the credential on
 its own is not enough.
 
-Version 2 is brokered only. The MCP server refuses to run without a broker, and version 1's
+Version 2 is brokered only. The MCP server refuses to run without a helper app, and version 1's
 hand-over mode, where the agent was given the secret, is gone from the server too.
 
-On all three platforms the broker has an account of its own. On Windows the boundary is an
+On all three platforms the helper app has an account of its own. On Windows the boundary is an
 NTFS access list rather than a file mode, an elevated administrator is inside it exactly as
 root is on Linux, and `packaging\verify-windows.ps1` proves it from a throwaway unprivileged
 account rather than reading the permissions back.
@@ -151,5 +151,5 @@ account rather than reading the permissions back.
 ## CLI Options
 
 `--help` prints usage. `--url` is accepted and ignored: the vault's address comes from the
-broker, so a config cannot point the agent somewhere else. There are no `--api-key`,
+helper app, so a config cannot point the agent somewhere else. There are no `--api-key`,
 `--enc-key`, or `--credentials` flags — unknown options are rejected.
