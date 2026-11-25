@@ -42,6 +42,7 @@ the installer, at [wundervault.com/verify](https://wundervault.com/verify).
 | `vault_job_status` | Says whether a job request is waiting, approved, declined or expired. |
 | `vault_jobs` | Lists the agent's jobs: name, schedule, state and how the last run went. Never commands, servers or output. |
 | `vault_job_run_now` | Asks for one run of an approved job now, exactly as approved. At most once per 10 minutes per job. |
+| `vault_done` | Says the agent has finished, so admin access it was given can end now. |
 | `vault_entries_list` | Lists the secrets this agent may use, and what kind each is. Never their values. |
 
 No tool returns a secret's value. Version 1's hand-over tools (`vault_exec`, `vault_entry_get`,
